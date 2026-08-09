@@ -1,0 +1,3 @@
+# Esecuzione sulla stessa macchina che contiene il repository.
+[managed]
+localhost ansible_connection=local

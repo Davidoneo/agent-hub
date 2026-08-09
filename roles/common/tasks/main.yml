@@ -1,29 +1,18 @@
 ---
 # Ruolo: common - task principali
-# Supporto dichiarato: Debian 13 (trixie) e Ubuntu (24.04/22.04)
+# Supporto dichiarato: Debian 13+ e Ubuntu 24.04+
 
 # ------------------------------------------------------------
 # Preflight: verifica il supporto dichiarato della distro.
 # Se un utente usa il repository su una distro diversa deve
 # adattare i ruoli (vedi README -> "Fork e adattamento distro").
 # ------------------------------------------------------------
-- name: Preflight | sistema operativo supportato
+- name: Preflight | profilo supportato
   ansible.builtin.assert:
     that:
-      - ansible_facts.os_family == "Debian"
+      - common_profile in ["laptop", "server"]
     fail_msg: >-
-      Ruolo 'common' supporta solo Debian e Ubuntu (famiglia Debian).
-      Rilevato: {{ ansible_facts.distribution }}
-      {{ ansible_facts.distribution_version }} su {{ ansible_facts.os_family }}.
-
-- name: Preflight | distribuzione dichiarata
-  ansible.builtin.assert:
-    that:
-      - ansible_facts.distribution in ["Debian", "Ubuntu"]
-    fail_msg: >-
-      Ruolo 'common' supporta solo Debian 13 e Ubuntu.
-      Rilevato: {{ ansible_facts.distribution }}
-      {{ ansible_facts.distribution_version }}.
+      Profilo non valido: {{ common_profile }}. Usa laptop o server.
 
 # ------------------------------------------------------------
 # Repository e pacchetti
@@ -50,12 +39,13 @@
 - name: Imposta il fuso orario
   community.general.timezone:
     name: "{{ common_timezone }}"
+  when: common_manage_timezone | bool
 
 - name: Configura il locale di sistema
   community.general.locale_gen:
     name: "{{ common_locale }}"
     state: present
-  when: common_locale_present | bool
+  when: common_manage_locale | bool
 
 - name: Imposta l'hostname
   ansible.builtin.hostname:

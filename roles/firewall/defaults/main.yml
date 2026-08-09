@@ -9,9 +9,11 @@
 firewall_enabled: false
 firewall_confirm: false
 
-# Consente la porta SSH in ingresso (default: 22/tcp).
-firewall_allow_ssh: true
+# Accesso SSH: nessuna sorgente è autorizzata implicitamente.
+firewall_allow_ssh_from_anywhere: false
 firewall_ssh_port: 22
+firewall_ssh_sources: []
+firewall_allow_tailscale_ssh: false
 
 # Porte extra in ingresso, formato "porta/proto", es. ["8080/tcp"].
 firewall_allow_ports: []

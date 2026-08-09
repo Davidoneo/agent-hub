@@ -1,0 +1,18 @@
+---
+- name: Preflight | porta SSH consentita dal firewall
+  ansible.builtin.assert:
+    that:
+      - >-
+        (
+          firewall_ssh_port | default(22) | int == ssh_hardening_port | int
+          and (
+            firewall_allow_ssh_from_anywhere | default(false) | bool
+            or firewall_ssh_sources | default([]) | length > 0
+            or firewall_allow_tailscale_ssh | default(false) | bool
+          )
+        )
+        or ((ssh_hardening_port | string) ~ '/tcp')
+           in (firewall_allow_ports | default([]))
+    fail_msg: >-
+      La porta SSH configurata ({{ ssh_hardening_port }}) non è consentita
+      dal firewall. Allinea porta e percorso fidato prima di procedere.

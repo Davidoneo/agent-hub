@@ -3,8 +3,8 @@
 #
 # Copia questo file in `inventory/group_vars/all.yml` e
 # personalizza. I default seguenti sono tutti "safe":
-# - le azioni che possono interrompere SSH/rete (firewall,
-#   ssh_hardening, tailscale up) sono DISABILITATE;
+# - le azioni che possono interrompere SSH/rete (firewall e
+#   ssh_hardening) sono DISABILITATE;
 # - per attivarle servono SEMPRE due variabili: quella di
 #   abilitazione E quella di conferma (vedi sotto).
 #
@@ -13,10 +13,15 @@
 # ============================================================
 
 # ------------------------------------------------------------
+# profilo: laptop oppure server
+# ------------------------------------------------------------
+blueprint_profile: laptop
+
+# ------------------------------------------------------------
 # common
 # ------------------------------------------------------------
 # Pacchetti base installati (lista espandibile).
-common_packages:
+common_base_packages:
   - ca-certificates
   - curl
   - gnupg
@@ -29,8 +34,10 @@ common_packages:
 
 common_apt_update_cache: true   # aggiorna la cache apt prima di installare
 common_apt_autoremove: false    # rimuove i pacchetti orfani
-common_timezone: "Etc/UTC"      # fuso orario
-common_locale: "C.UTF-8"        # locale di sistema
+common_manage_timezone: false   # true per modificare il fuso orario
+common_timezone: "Etc/UTC"
+common_manage_locale: false     # true per generare il locale indicato
+common_locale: "C.UTF-8"
 common_hostname: ""             # hostname da impostare (vuoto = non toccare)
 
 # OPT-IN: aggiornamenti di sicurezza automatici
@@ -53,6 +60,15 @@ docker_users: []                # utenti da aggiungere al gruppo `docker`
 docker_daemon_config: {}        # dict -> genera /etc/docker/daemon.json (vuoto = nessun file)
 
 # ------------------------------------------------------------
+# accesso SSH da macchine fidate - STRICT OPT-IN
+# ------------------------------------------------------------
+ssh_access_enabled: false
+ssh_access_user: ""              # utente gia esistente sul target
+ssh_access_install_server: true  # installa/avvia openssh-server se abilitato
+ssh_access_public_keys: []       # SOLO chiavi pubbliche ed25519/FIDO
+ssh_access_exclusive: false      # true rimuove le chiavi non elencate
+
+# ------------------------------------------------------------
 # firewall (ufw) - STRICT OPT-IN
 # ------------------------------------------------------------
 # Per abilitare servono ENTRAMBE:
@@ -60,8 +76,10 @@ docker_daemon_config: {}        # dict -> genera /etc/docker/daemon.json (vuoto 
 #   firewall_confirm: true
 firewall_enabled: false
 firewall_confirm: false
-firewall_allow_ssh: true        # consente la porta SSH in ingresso
+firewall_allow_ssh_from_anywhere: false
 firewall_ssh_port: 22
+firewall_ssh_sources: []        # CIDR fidati, es. ["192.0.2.0/24"]
+firewall_allow_tailscale_ssh: false
 firewall_allow_ports: []        # porte extra in ingresso, formato "porta/proto"
                                 # es. ["2375/tcp", "8080/tcp"]
 firewall_default_incoming: deny
@@ -75,6 +93,7 @@ firewall_default_outgoing: allow
 #   ssh_hardening_confirm: true
 ssh_hardening_enabled: false
 ssh_hardening_confirm: false
+ssh_hardening_admin_user: "{{ ssh_access_user }}"
 ssh_hardening_port: 22
 ssh_hardening_permit_root_login: "no"
 ssh_hardening_password_auth: false
@@ -94,18 +113,6 @@ ssh_hardening_allow_users: []
 ssh_hardening_service_action: reloaded   # "reloaded" (sicuro) o "restarted"
 
 # ------------------------------------------------------------
-# tailscale - installazione base + OPT-IN `up`
+# tailscale - installazione base; autenticazione manuale
 # ------------------------------------------------------------
 tailscale_install: false
-tailscale_up: false             # STRICT OPT-IN: unisce il nodo alla rete
-tailscale_confirm: false        # conferma esplicita richiesta per `up`
-# Authkey: SEGRETO. MAI nel repository. Passala a runtime, es.:
-#   ansible-playbook site.yml --tags tailscale \
-#     -e tailscale_up=true -e tailscale_confirm=true \
-#     -e tailscale_authkey=$(cat ~/.ssh/tailscale-authkey) -e @vault.yml
-tailscale_authkey: ""
-tailscale_hostname: ""          # vuoto = hostname di default
-tailscale_ssh: false            # OPT-IN: abilita SSH via tailscale
-tailscale_accept_routes: false  # OPT-IN: accetta rotte annunciate
-tailscale_advertise_routes: []  # OPT-IN: subnet router, es. ["10.0.0.0/24"]
-tailscale_exit_node: false      # OPT-IN: usa un exit node remoto

@@ -30,6 +30,7 @@
       - ca-certificates
       - curl
       - gnupg
+      - python3-debian
     state: present
   when: docker_install | bool
 
@@ -46,6 +47,37 @@
     dest: "{{ docker_keyring_path }}"
     mode: "0644"
   when: docker_install | bool
+
+- name: Controlla la presenza della chiave Docker
+  ansible.builtin.stat:
+    path: "{{ docker_keyring_path }}"
+  register: docker_keyring_file
+  when: docker_install | bool
+
+- name: Verifica il fingerprint della chiave Docker
+  ansible.builtin.command:
+    argv:
+      - gpg
+      - --batch
+      - --show-keys
+      - --with-colons
+      - "{{ docker_keyring_path }}"
+  register: docker_key_inspection
+  changed_when: false
+  check_mode: false
+  when:
+    - docker_install | bool
+    - docker_keyring_file.stat.exists | bool
+
+- name: Rifiuta una chiave Docker inattesa
+  ansible.builtin.assert:
+    that:
+      - docker_key_fingerprint in docker_key_inspection.stdout
+    fail_msg: >-
+      Fingerprint della chiave Docker inatteso: repository non configurato.
+  when:
+    - docker_install | bool
+    - docker_keyring_file.stat.exists | bool
 
 - name: Aggiunge il repository apt di Docker
   ansible.builtin.deb822_repository:

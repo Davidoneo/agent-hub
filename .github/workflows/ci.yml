@@ -10,21 +10,22 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: ansible-lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Installa Ansible e ansible-lint
-        run: |
-          python -m pip install --upgrade pip
-          pip install "ansible-core>=2.16,<2.18" ansible-lint
+        run: pip install -r requirements-dev.txt
       - name: Installa le collection
         run: ansible-galaxy collection install -r requirements.yml
       - name: Esegue ansible-lint
@@ -35,16 +36,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Installa Ansible
-        run: |
-          python -m pip install --upgrade pip
-          pip install "ansible-core>=2.16,<2.18"
+        run: pip install -r requirements-dev.txt
       - name: Installa le collection
         run: ansible-galaxy collection install -r requirements.yml
       - name: Syntax check del playbook e dell'inventario
         run: ansible-playbook --syntax-check -i inventory/hosts.example site.yml
+      - name: Safety regression tests
+        run: ansible-playbook -i localhost, -c local tests/safety.yml

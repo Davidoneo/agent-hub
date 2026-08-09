@@ -1,24 +1,6 @@
 ---
-# Ruolo: tailscale - installazione + OPT-IN `up`
+# Ruolo: tailscale - sola installazione; autenticazione interattiva separata
 # Documentation in roles/tailscale/README.md
 
-# Installazione del pacchetto tailscale (repository ufficiale).
 tailscale_install: false
-
-# STRICT OPT-IN: unisce il nodo alla rete Tailscale.
-# Richiede SEMPRE anche:
-#   tailscale_confirm: true
-#   tailscale_authkey: "<segreto passato a runtime>"
-tailscale_up: false
-tailscale_confirm: false
-
-# SEGRETO: MAI nel repository. Passare a runtime con extra-vars,
-# vault o variabile d'ambiente. Il task usa no_log=true.
-tailscale_authkey: ""
-
-# Opzioni di `tailscale up` (tutte OPT-IN).
-tailscale_hostname: ""          # vuoto = hostname di default
-tailscale_ssh: false            # abilita SSH via tailscale
-tailscale_accept_routes: false  # accetta rotte annunciate dalla rete
-tailscale_advertise_routes: []  # subnet router, es. ["10.0.0.0/24"]
-tailscale_exit_node: false      # usa un exit node (nome o IP)
+tailscale_key_fingerprint: 2596A99EAAB33821893C0A79458CA832957F5868

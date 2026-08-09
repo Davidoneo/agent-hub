@@ -14,8 +14,8 @@ firewall_confirm: true
 
 Le preflight si rifiutano di procedere se:
 - `firewall_enabled=true` senza `firewall_confirm=true`;
-- la porta SSH non è consentita (`firewall_allow_ssh=false` senza la porta
-  in `firewall_allow_ports`).
+- non esiste un percorso SSH tramite CIDR fidato, Tailscale, accesso globale o
+  una porta aggiuntiva esplicita.
 
 ## Variabili principali
 
@@ -23,8 +23,10 @@ Le preflight si rifiutano di procedere se:
 |---|---|---|
 | `firewall_enabled` | `false` | **opt-in** principale |
 | `firewall_confirm` | `false` | conferma esplicita (richiesta) |
-| `firewall_allow_ssh` | `true` | consente la porta SSH |
+| `firewall_allow_ssh_from_anywhere` | `false` | consente SSH globalmente |
 | `firewall_ssh_port` | `22` | porta SSH da consentire |
+| `firewall_ssh_sources` | `[]` | CIDR sorgente fidati |
+| `firewall_allow_tailscale_ssh` | `false` | consente SSH su `tailscale0` |
 | `firewall_allow_ports` | `[]` | porte extra, formato `"porta/proto"` |
 | `firewall_default_incoming` | `deny` | policy di default in ingresso |
 | `firewall_default_outgoing` | `allow` | policy di default in uscita |

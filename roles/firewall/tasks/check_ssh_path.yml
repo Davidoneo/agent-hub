@@ -1,0 +1,15 @@
+---
+- name: Preflight | accesso SSH garantito
+  ansible.builtin.assert:
+    that:
+      - firewall_ssh_port | int > 0
+      - firewall_ssh_port | int < 65536
+      - >-
+        firewall_allow_ssh_from_anywhere | bool or
+        firewall_ssh_sources | length > 0 or
+        firewall_allow_tailscale_ssh | bool or
+        ((firewall_ssh_port | string) ~ '/tcp') in firewall_allow_ports
+    fail_msg: >-
+      Prima di abilitare UFW configura almeno un percorso SSH: CIDR fidati,
+      interfaccia Tailscale, accesso esplicito da ovunque oppure la porta
+      "{{ firewall_ssh_port }}/tcp" fra le porte aggiuntive.

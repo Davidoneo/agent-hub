@@ -8,6 +8,7 @@
 # Una configurazione SSH sbagliata può chiuderti fuori dalla macchina.
 ssh_hardening_enabled: false
 ssh_hardening_confirm: false
+ssh_hardening_admin_user: ""
 
 # Drop-in generato in /etc/ssh/sshd_config.d/ (ha precedenza su sshd_config
 # perché la Include di Debian/Ubuntu viene letta per prima).

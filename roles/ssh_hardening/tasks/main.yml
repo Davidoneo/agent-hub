@@ -16,32 +16,67 @@
   ansible.builtin.assert:
     that:
       - ssh_hardening_confirm | bool
+      - ssh_hardening_admin_user is match('^[a-z_][a-z0-9_-]{0,31}$')
+      - ssh_hardening_port | int > 0
+      - ssh_hardening_port | int < 65536
+      - ssh_hardening_service_action in ["reloaded", "restarted"]
     fail_msg: >-
       Applicare l'hardening SSH richiede ANCHE ssh_hardening_confirm=true.
       Una configurazione errata può impedire l'accesso SSH alla macchina.
   when: ssh_hardening_enabled | bool
 
-- name: Preflight | protezione contro il lock-out
-  ansible.builtin.assert:
-    that:
-      - ssh_hardening_password_auth | bool or ssh_hardening_allow_users | length > 0
-    fail_msg: >-
-      Con ssh_hardening_password_auth=false devi elencare in
-      ssh_hardening_allow_users gli utenti autorizzati ad accedere,
-      altrimenti rischi di chiuderti fuori dalla macchina.
-  when: ssh_hardening_enabled | bool
-
-- name: Preflight | porta SSH consentita dal firewall (se presente)
+- name: Preflight | utenti SSH validi
   ansible.builtin.assert:
     that:
       - >-
-        not firewall_enabled | default(false) | bool
-        or firewall_allow_ssh | default(true) | bool
-        or firewall_ssh_port | default(22) == ssh_hardening_port
-        or ssh_hardening_port | string in firewall_allow_ports | default([])
+        ssh_hardening_allow_users |
+        reject('match', '^[a-z_][a-z0-9_-]{0,31}$') |
+        list | length == 0
+      - >-
+        ssh_hardening_password_auth | bool or
+        ssh_hardening_admin_user in ssh_hardening_allow_users
     fail_msg: >-
-      La porta SSH configurata ({{ ssh_hardening_port }}) non è consentita
-      dal ruolo firewall. Allinea le due variabili prima di procedere.
+      Con login a password disabilitato, ssh_hardening_allow_users deve
+      contenere l'utente amministrativo e soltanto nomi utente validi.
+  when: ssh_hardening_enabled | bool
+
+- name: Preflight | legge l'utente amministrativo
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ ssh_hardening_admin_user }}"
+    fail_key: false
+  when: ssh_hardening_enabled | bool
+
+- name: Preflight | richiede un utente amministrativo esistente
+  ansible.builtin.assert:
+    that:
+      - ssh_hardening_admin_user in (ansible_facts.getent_passwd | default({}))
+    fail_msg: "Utente SSH inesistente: {{ ssh_hardening_admin_user }}."
+  when: ssh_hardening_enabled | bool
+
+- name: Preflight | controlla authorized_keys dell'amministratore
+  ansible.builtin.stat:
+    path: >-
+      {{ ansible_facts.getent_passwd[ssh_hardening_admin_user][4] }}/.ssh/authorized_keys
+  register: ssh_hardening_authorized_keys
+  when:
+    - ssh_hardening_enabled | bool
+    - not ssh_hardening_password_auth | bool
+
+- name: Preflight | richiede almeno una chiave autorizzata reale
+  ansible.builtin.assert:
+    that:
+      - ssh_hardening_authorized_keys.stat.isreg | default(false)
+      - ssh_hardening_authorized_keys.stat.size | default(0) | int > 0
+    fail_msg: >-
+      Non disabilitare la password finché authorized_keys dell'utente
+      amministrativo non esiste, non contiene una chiave e non è stata provata.
+  when:
+    - ssh_hardening_enabled | bool
+    - not ssh_hardening_password_auth | bool
+
+- name: Preflight | verifica il percorso SSH nel firewall
+  ansible.builtin.include_tasks: check_firewall.yml
   when:
     - ssh_hardening_enabled | bool
     - firewall_enabled | default(false) | bool

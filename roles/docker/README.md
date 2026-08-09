@@ -2,13 +2,14 @@
 
 Installa Docker Engine dal repository ufficiale (`download.docker.com`),
 senza ricorrere a `curl | sh`: la chiave GPG viene scaricata via `get_url`
-e il repository apt viene aggiunto con `apt_repository`.
+e il repository apt viene aggiunto con `deb822_repository`. Il fingerprint
+della chiave viene verificato prima di fidarsi del repository.
 
 ## Variabili principali
 
 | Variabile | Default | Note |
 |---|---|---|
-| `docker_install` | `true` | installa Docker Engine |
+| `docker_install` | `false` | opt-in: installa Docker Engine |
 | `docker_repo_channel` | `stable` | canale del repository |
 | `docker_packages` | docker-ce, cli, containerd, buildx, compose | pacchetti installati |
 | `docker_users` | `[]` | utenti da aggiungere al gruppo `docker` (**opt-in**) |

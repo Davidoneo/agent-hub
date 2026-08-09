@@ -1,0 +1,64 @@
+---
+- name: SSH access | skip - disabilitato
+  ansible.builtin.debug:
+    msg: >-
+      ssh_access_enabled=false: nessuna chiave o servizio SSH viene modificato.
+  when: not ssh_access_enabled | bool
+
+- name: SSH access | valida configurazione richiesta
+  ansible.builtin.assert:
+    that:
+      - ssh_access_user is match('^[a-z_][a-z0-9_-]{0,31}$')
+      - ssh_access_public_keys | length > 0
+      - >-
+        ssh_access_public_keys |
+        reject('match', '^(ssh-ed25519|sk-ssh-ed25519@openssh.com) [A-Za-z0-9+/]+={0,3}( .*)?$') |
+        list | length == 0
+    fail_msg: >-
+      Specifica un utente esistente e almeno una chiave pubblica ed25519/FIDO
+      valida. Non inserire mai chiavi private nel repository o nelle variabili.
+  when: ssh_access_enabled | bool
+  no_log: true
+
+- name: SSH access | legge l'utente target
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ ssh_access_user }}"
+    fail_key: false
+  when: ssh_access_enabled | bool
+
+- name: SSH access | richiede un utente target esistente
+  ansible.builtin.assert:
+    that:
+      - ssh_access_user in (ansible_facts.getent_passwd | default({}))
+    fail_msg: >-
+      L'utente {{ ssh_access_user }} non esiste. Crealo esplicitamente prima
+      del bootstrap SSH; questo ruolo non crea account amministrativi.
+  when: ssh_access_enabled | bool
+
+- name: SSH access | installa OpenSSH server
+  ansible.builtin.apt:
+    name: openssh-server
+    state: present
+  when:
+    - ssh_access_enabled | bool
+    - ssh_access_install_server | bool
+
+- name: SSH access | installa le chiavi pubbliche fidate
+  ansible.posix.authorized_key:
+    user: "{{ ssh_access_user }}"
+    key: "{{ ssh_access_public_keys | join('\n') }}"
+    state: present
+    manage_dir: true
+    exclusive: "{{ ssh_access_exclusive | bool }}"
+  when: ssh_access_enabled | bool
+  no_log: true
+
+- name: SSH access | abilita il servizio SSH
+  ansible.builtin.systemd:
+    name: ssh
+    enabled: true
+    state: started
+  when:
+    - ssh_access_enabled | bool
+    - ssh_access_install_server | bool

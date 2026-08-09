@@ -1,0 +1,53 @@
+---
+- name: Regression tests for SSH and firewall preflight
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    firewall_allow_ssh_from_anywhere: false
+    firewall_ssh_sources: []
+    firewall_allow_tailscale_ssh: false
+  tasks:
+    - name: Accept documented additional SSH port syntax
+      ansible.builtin.include_role:
+        name: firewall
+        tasks_from: check_ssh_path
+      vars:
+        firewall_ssh_port: 22
+        firewall_allow_ports: ["22/tcp"]
+
+    - name: Accept matching trusted-source SSH path  # noqa var-naming[no-role-prefix]
+      ansible.builtin.include_role:
+        name: ssh_hardening
+        tasks_from: check_firewall
+      vars:
+        ssh_hardening_port: 2222
+        firewall_ssh_port: 2222
+        firewall_ssh_sources: ["192.0.2.0/24"]
+        firewall_allow_ports: []
+
+    - name: Initialize mismatch result
+      ansible.builtin.set_fact:
+        ssh_firewall_mismatch_rejected: false
+
+    - name: A mismatched SSH and firewall port must be rejected
+      block:
+        - name: Exercise mismatched configuration  # noqa var-naming[no-role-prefix]
+          ansible.builtin.include_role:
+            name: ssh_hardening
+            tasks_from: check_firewall
+          vars:
+            ssh_hardening_port: 2222
+            firewall_ssh_port: 22
+            firewall_allow_ssh_from_anywhere: true
+            firewall_allow_ports: []
+      rescue:
+        - name: Record expected rejection
+          ansible.builtin.set_fact:
+            ssh_firewall_mismatch_rejected: true
+
+    - name: Confirm mismatch was rejected
+      ansible.builtin.assert:
+        that:
+          - ssh_firewall_mismatch_rejected | bool
+        fail_msg: Mismatched SSH/firewall ports were incorrectly accepted.

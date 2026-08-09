@@ -1,8 +1,7 @@
 ---
 # Ruolo: tailscale - task principali
 # Installazione da repository ufficiale (pkgs.tailscale.com).
-# `tailscale up` è STRICT OPT-IN: di default la macchina viene solo
-# preparata, MAI unita alla rete.
+# Il ruolo non accetta auth key e non esegue `tailscale up`.
 
 # ------------------------------------------------------------
 # Preflight
@@ -31,12 +30,52 @@
     mode: "0755"
   when: tailscale_install | bool
 
+- name: Installa dipendenze per repository e verifica chiave
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - gnupg
+      - python3-debian
+    state: present
+  when: tailscale_install | bool
+
 - name: Scarica la chiave GPG ufficiale di Tailscale
   ansible.builtin.get_url:
     url: "https://pkgs.tailscale.com/stable/{{ tailscale_distro_slug }}/{{ ansible_facts.distribution_release }}.gpg"
     dest: "{{ tailscale_keyring_path }}"
     mode: "0644"
   when: tailscale_install | bool
+
+- name: Controlla la presenza della chiave Tailscale
+  ansible.builtin.stat:
+    path: "{{ tailscale_keyring_path }}"
+  register: tailscale_keyring_file
+  when: tailscale_install | bool
+
+- name: Verifica il fingerprint della chiave Tailscale
+  ansible.builtin.command:
+    argv:
+      - gpg
+      - --batch
+      - --show-keys
+      - --with-colons
+      - "{{ tailscale_keyring_path }}"
+  register: tailscale_key_inspection
+  changed_when: false
+  check_mode: false
+  when:
+    - tailscale_install | bool
+    - tailscale_keyring_file.stat.exists | bool
+
+- name: Rifiuta una chiave Tailscale inattesa
+  ansible.builtin.assert:
+    that:
+      - tailscale_key_fingerprint in tailscale_key_inspection.stdout
+    fail_msg: >-
+      Fingerprint della chiave Tailscale inatteso: repository non configurato.
+  when:
+    - tailscale_install | bool
+    - tailscale_keyring_file.stat.exists | bool
 
 - name: Aggiunge il repository apt di Tailscale
   ansible.builtin.deb822_repository:
@@ -62,49 +101,10 @@
     state: started
   when: tailscale_install | bool
 
-# ------------------------------------------------------------
-# OPT-IN: `tailscale up` (unione alla rete)
-# ------------------------------------------------------------
-- name: Tailscale up | skip - non richiesto
+- name: Indica il passaggio di autenticazione separato
   ansible.builtin.debug:
     msg: >-
-      tailscale_up=false: il nodo NON viene unito alla rete Tailscale.
-      Imposta tailscale_up=true, tailscale_confirm=true e passa una
-      tailscale_authkey a runtime per abilitare.
-  when: not tailscale_up | bool
-
-- name: Preflight | conferma, authkey e installazione richiesti
-  ansible.builtin.assert:
-    that:
-      - tailscale_confirm | bool
-      - tailscale_authkey | length > 0
-      - tailscale_install | bool
-    fail_msg: >-
-      `tailscale up` richiede: tailscale_confirm=true,
-      tailscale_authkey (non vuota, passata a runtime) e
-      tailscale_install=true. L'authkey è un segreto: non metterla
-      nel repository.
-  when: tailscale_up | bool
-
-- name: Preflight | rotte annunciate richiedono conferma
-  ansible.builtin.assert:
-    that:
-      - tailscale_advertise_routes | length == 0 or tailscale_confirm | bool
-    fail_msg: >-
-      Annunciare rotte (tailscale_advertise_routes) modifica il routing
-      della rete Tailscale: richiede anche tailscale_confirm=true.
-  when: tailscale_up | bool
-
-- name: Unisci il nodo alla rete Tailscale
-  ansible.builtin.command: >-
-    tailscale up
-    --authkey={{ tailscale_authkey }}
-    {{ '--hostname=' ~ tailscale_hostname if tailscale_hostname | length > 0 else '' }}
-    {{ '--ssh' if tailscale_ssh | bool else '' }}
-    {{ '--accept-routes' if tailscale_accept_routes | bool else '' }}
-    {{ '--advertise-routes=' ~ (tailscale_advertise_routes | join(',')) if tailscale_advertise_routes | length > 0 else '' }}
-    {{ '--exit-node=' ~ tailscale_exit_node if tailscale_exit_node else '' }}
-  no_log: true
-  register: tailscale_up_result
-  changed_when: true
-  when: tailscale_up | bool
+      Tailscale installato. Autentica il nodo fuori dal playbook con
+      'sudo tailscale up' oppure con la procedura approvata dalla tua rete.
+      Non salvare auth key nell'inventory o nella shell history.
+  when: tailscale_install | bool

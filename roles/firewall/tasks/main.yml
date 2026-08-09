@@ -22,16 +22,18 @@
       verifica di avere un canale di accesso fuori banda (console/IPMI).
   when: firewall_enabled | bool
 
-- name: Preflight | accesso SSH garantito
+- name: Preflight | verifica un percorso SSH
+  ansible.builtin.include_tasks: check_ssh_path.yml
+  when: firewall_enabled | bool
+
+- name: Preflight | formato delle porte aggiuntive
   ansible.builtin.assert:
     that:
-      - firewall_allow_ssh | bool or firewall_ssh_port | string in firewall_allow_ports
-    fail_msg: >-
-      Con firewall_enabled=true la porta SSH ({{
-      firewall_ssh_port }}) deve essere consentita: lascia
-      firewall_allow_ssh=true oppure aggiungi
-      "{{ firewall_ssh_port }}/tcp" a firewall_allow_ports.
-      In caso contrario l'host diventa irraggiungibile via SSH.
+      - item is match('^[0-9]{1,5}/(tcp|udp)$')
+      - item.split('/')[0] | int > 0
+      - item.split('/')[0] | int < 65536
+    fail_msg: "Porta non valida: {{ item }}. Usa il formato 443/tcp o 53/udp."
+  loop: "{{ firewall_allow_ports }}"
   when: firewall_enabled | bool
 
 - name: Preflight | distro supportata
@@ -64,14 +66,34 @@
     policy: "{{ firewall_default_outgoing }}"
   when: firewall_enabled | bool
 
-- name: Consenti porta SSH in ingresso
+- name: Consenti SSH da qualsiasi sorgente
   community.general.ufw:
     rule: allow
     port: "{{ firewall_ssh_port }}"
     proto: tcp
   when:
     - firewall_enabled | bool
-    - firewall_allow_ssh | bool
+    - firewall_allow_ssh_from_anywhere | bool
+
+- name: Consenti SSH soltanto dai CIDR fidati
+  community.general.ufw:
+    rule: allow
+    from_ip: "{{ item }}"
+    to_port: "{{ firewall_ssh_port }}"
+    proto: tcp
+  loop: "{{ firewall_ssh_sources }}"
+  when: firewall_enabled | bool
+
+- name: Consenti SSH tramite interfaccia Tailscale
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: tailscale0
+    port: "{{ firewall_ssh_port }}"
+    proto: tcp
+  when:
+    - firewall_enabled | bool
+    - firewall_allow_tailscale_ssh | bool
 
 - name: Consenti porte aggiuntive in ingresso
   community.general.ufw:

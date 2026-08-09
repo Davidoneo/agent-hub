@@ -9,9 +9,9 @@
 #   ansible-playbook site.yml --tags common
 # ============================================================
 
-[baseline]
+[managed]
 # server1.example.com ansible_host=10.0.0.10 ansible_user=deploy
 
-[baseline:vars]
+[managed:vars]
 # ansible_python_interpreter=/usr/bin/python3
 # ansible_ssh_private_key_file=~/.ssh/deploy_key

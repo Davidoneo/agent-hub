@@ -2,8 +2,11 @@
 # Ruolo: common - baseline di base per Debian 13 / Ubuntu
 # Documentation in roles/common/README.md
 
+# Profilo effettivo; blueprint_profile è la variabile pubblica globale.
+common_profile: "{{ blueprint_profile | default('laptop') }}"
+
 # --- pacchetti base ---
-common_packages:
+common_base_packages:
   - ca-certificates
   - curl
   - gnupg
@@ -14,13 +17,26 @@ common_packages:
   - unzip
   - vim
 
+common_profile_packages:
+  laptop:
+    - openssh-client
+    - rsync
+  server:
+    - openssh-client
+    - rsync
+    - smartmontools
+
+common_packages: >-
+  {{ common_base_packages + common_profile_packages[common_profile] }}
+
 common_apt_update_cache: true
 common_apt_autoremove: false
 
 # --- sistema ---
+common_manage_timezone: false
 common_timezone: "Etc/UTC"
+common_manage_locale: false
 common_locale: "C.UTF-8"
-common_locale_present: true
 common_hostname: ""
 
 # --- OPT-IN: aggiornamenti automatici ---

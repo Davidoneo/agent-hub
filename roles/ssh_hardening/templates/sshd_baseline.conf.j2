@@ -7,6 +7,8 @@
 Port {{ ssh_hardening_port }}
 PermitRootLogin {{ ssh_hardening_permit_root_login }}
 PasswordAuthentication {{ 'yes' if ssh_hardening_password_auth | bool else 'no' }}
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
 PubkeyAuthentication {{ 'yes' if ssh_hardening_pubkey_auth | bool else 'no' }}
 PermitEmptyPasswords {{ 'yes' if ssh_hardening_empty_passwords | bool else 'no' }}
 MaxAuthTries {{ ssh_hardening_max_auth_tries }}

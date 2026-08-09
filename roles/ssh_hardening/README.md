@@ -10,6 +10,7 @@ Hardening di OpenSSH tramite drop-in in `/etc/ssh/sshd_config.d/`.
 ```yaml
 ssh_hardening_enabled: true
 ssh_hardening_confirm: true
+ssh_hardening_admin_user: tuo_utente
 ssh_hardening_allow_users: [tuo_utente]   # richiesto se password_auth=false
 ```
 
@@ -17,6 +18,7 @@ Le preflight si rifiutano di procedere se:
 - `ssh_hardening_enabled=true` senza `ssh_hardening_confirm=true`;
 - `ssh_hardening_password_auth=false` con `ssh_hardening_allow_users` vuota
   (protezione contro il lock-out);
+- l'utente amministrativo non esiste o non ha un `authorized_keys` non vuoto;
 - la porta SSH scelta non è consentita dal ruolo `firewall` (se attivo).
 
 ## Come funziona la sicurezza
@@ -37,6 +39,7 @@ Le preflight si rifiutano di procedere se:
 |---|---|---|
 | `ssh_hardening_enabled` | `false` | **opt-in** principale |
 | `ssh_hardening_confirm` | `false` | conferma esplicita |
+| `ssh_hardening_admin_user` | `""` | utente con chiave già verificata |
 | `ssh_hardening_port` | `22` | porta SSH |
 | `ssh_hardening_permit_root_login` | `"no"` | login root |
 | `ssh_hardening_password_auth` | `false` | autenticazione a password |
