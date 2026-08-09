@@ -1,0 +1,22 @@
+---
+# Ruolo: docker - installazione Docker Engine da repository ufficiale
+# Documentation in roles/docker/README.md
+
+docker_install: false
+docker_repo_channel: stable
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# Utenti da aggiungere al gruppo `docker` (il gruppo viene creato dal pacchetto).
+docker_users: []
+
+# Configurazione del demone: dict -> /etc/docker/daemon.json.
+# Vuoto = non gestisce il file (lasciato come sta sul target).
+docker_daemon_config: {}
+
+# Path del keyring GPG del repository Docker.
+docker_keyring_path: /etc/apt/keyrings/docker.asc

@@ -1,0 +1,110 @@
+---
+# Ruolo: tailscale - task principali
+# Installazione da repository ufficiale (pkgs.tailscale.com).
+# `tailscale up` è STRICT OPT-IN: di default la macchina viene solo
+# preparata, MAI unita alla rete.
+
+# ------------------------------------------------------------
+# Preflight
+# ------------------------------------------------------------
+- name: Tailscale | skip installazione richiesta
+  ansible.builtin.debug:
+    msg: "tailscale_install=false: il ruolo non modifica nulla."
+  when: not tailscale_install | bool
+
+- name: Preflight | distro supportata
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution in ["Debian", "Ubuntu"]
+    fail_msg: >-
+      Ruolo 'tailscale' supporta solo Debian e Ubuntu.
+      Rilevato: {{ ansible_facts.distribution }}
+      {{ ansible_facts.distribution_version }}.
+
+# ------------------------------------------------------------
+# Installazione (repository ufficiale)
+# ------------------------------------------------------------
+- name: Crea directory dei keyring
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+  when: tailscale_install | bool
+
+- name: Scarica la chiave GPG ufficiale di Tailscale
+  ansible.builtin.get_url:
+    url: "https://pkgs.tailscale.com/stable/{{ tailscale_distro_slug }}/{{ ansible_facts.distribution_release }}.gpg"
+    dest: "{{ tailscale_keyring_path }}"
+    mode: "0644"
+  when: tailscale_install | bool
+
+- name: Aggiunge il repository apt di Tailscale
+  ansible.builtin.deb822_repository:
+    name: tailscale
+    types: [deb]
+    uris: "https://pkgs.tailscale.com/stable/{{ tailscale_distro_slug }}"
+    suites: ["{{ ansible_facts.distribution_release }}"]
+    components: [main]
+    signed_by: "{{ tailscale_keyring_path }}"
+    state: present
+  when: tailscale_install | bool
+
+- name: Installa il pacchetto tailscale
+  ansible.builtin.apt:
+    name: tailscale
+    state: present
+  when: tailscale_install | bool
+
+- name: Avvia e abilita il servizio tailscaled
+  ansible.builtin.systemd:
+    name: tailscaled
+    enabled: true
+    state: started
+  when: tailscale_install | bool
+
+# ------------------------------------------------------------
+# OPT-IN: `tailscale up` (unione alla rete)
+# ------------------------------------------------------------
+- name: Tailscale up | skip - non richiesto
+  ansible.builtin.debug:
+    msg: >-
+      tailscale_up=false: il nodo NON viene unito alla rete Tailscale.
+      Imposta tailscale_up=true, tailscale_confirm=true e passa una
+      tailscale_authkey a runtime per abilitare.
+  when: not tailscale_up | bool
+
+- name: Preflight | conferma, authkey e installazione richiesti
+  ansible.builtin.assert:
+    that:
+      - tailscale_confirm | bool
+      - tailscale_authkey | length > 0
+      - tailscale_install | bool
+    fail_msg: >-
+      `tailscale up` richiede: tailscale_confirm=true,
+      tailscale_authkey (non vuota, passata a runtime) e
+      tailscale_install=true. L'authkey è un segreto: non metterla
+      nel repository.
+  when: tailscale_up | bool
+
+- name: Preflight | rotte annunciate richiedono conferma
+  ansible.builtin.assert:
+    that:
+      - tailscale_advertise_routes | length == 0 or tailscale_confirm | bool
+    fail_msg: >-
+      Annunciare rotte (tailscale_advertise_routes) modifica il routing
+      della rete Tailscale: richiede anche tailscale_confirm=true.
+  when: tailscale_up | bool
+
+- name: Unisci il nodo alla rete Tailscale
+  ansible.builtin.command: >-
+    tailscale up
+    --authkey={{ tailscale_authkey }}
+    {{ '--hostname=' ~ tailscale_hostname if tailscale_hostname | length > 0 else '' }}
+    {{ '--ssh' if tailscale_ssh | bool else '' }}
+    {{ '--accept-routes' if tailscale_accept_routes | bool else '' }}
+    {{ '--advertise-routes=' ~ (tailscale_advertise_routes | join(',')) if tailscale_advertise_routes | length > 0 else '' }}
+    {{ '--exit-node=' ~ tailscale_exit_node if tailscale_exit_node else '' }}
+  no_log: true
+  register: tailscale_up_result
+  changed_when: true
+  when: tailscale_up | bool

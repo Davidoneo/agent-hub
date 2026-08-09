@@ -1,0 +1,94 @@
+---
+# Ruolo: firewall (ufw) - task principali
+# STRICT OPT-IN: senza firewall_enabled=true il ruolo non tocca nulla.
+
+# ------------------------------------------------------------
+# Preflight
+# ------------------------------------------------------------
+- name: Firewall | skip - disabilitato
+  ansible.builtin.debug:
+    msg: >-
+      Ruolo 'firewall' NON attivo: imposta firewall_enabled=true e
+      firewall_confirm=true per abilitare ufw.
+  when: not firewall_enabled | bool
+
+- name: Preflight | conferma obbligatoria
+  ansible.builtin.assert:
+    that:
+      - firewall_confirm | bool
+    fail_msg: >-
+      Abilitare il firewall richiede ANCHE firewall_confirm=true.
+      Un firewall mal configurato può interrompere SSH e la rete:
+      verifica di avere un canale di accesso fuori banda (console/IPMI).
+  when: firewall_enabled | bool
+
+- name: Preflight | accesso SSH garantito
+  ansible.builtin.assert:
+    that:
+      - firewall_allow_ssh | bool or firewall_ssh_port | string in firewall_allow_ports
+    fail_msg: >-
+      Con firewall_enabled=true la porta SSH ({{
+      firewall_ssh_port }}) deve essere consentita: lascia
+      firewall_allow_ssh=true oppure aggiungi
+      "{{ firewall_ssh_port }}/tcp" a firewall_allow_ports.
+      In caso contrario l'host diventa irraggiungibile via SSH.
+  when: firewall_enabled | bool
+
+- name: Preflight | distro supportata
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution in ["Debian", "Ubuntu"]
+    fail_msg: >-
+      Ruolo 'firewall' supporta solo Debian e Ubuntu (ufw).
+      Rilevato: {{ ansible_facts.distribution }}
+      {{ ansible_facts.distribution_version }}.
+
+# ------------------------------------------------------------
+# Applicazione (solo se firewall_enabled)
+# ------------------------------------------------------------
+- name: Installa ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+  when: firewall_enabled | bool
+
+- name: Policy default - ingresso
+  community.general.ufw:
+    direction: incoming
+    policy: "{{ firewall_default_incoming }}"
+  when: firewall_enabled | bool
+
+- name: Policy default - uscita
+  community.general.ufw:
+    direction: outgoing
+    policy: "{{ firewall_default_outgoing }}"
+  when: firewall_enabled | bool
+
+- name: Consenti porta SSH in ingresso
+  community.general.ufw:
+    rule: allow
+    port: "{{ firewall_ssh_port }}"
+    proto: tcp
+  when:
+    - firewall_enabled | bool
+    - firewall_allow_ssh | bool
+
+- name: Consenti porte aggiuntive in ingresso
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.split('/')[0] }}"
+    proto: "{{ item.split('/')[1] | default('tcp') }}"
+  loop: "{{ firewall_allow_ports }}"
+  when: firewall_enabled | bool
+
+- name: Abilita ufw
+  community.general.ufw:
+    state: enabled
+  when: firewall_enabled | bool
+
+- name: Abilita il servizio ufw al boot
+  ansible.builtin.systemd:
+    name: ufw
+    enabled: true
+    state: started
+  when: firewall_enabled | bool

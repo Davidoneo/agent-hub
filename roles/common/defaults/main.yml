@@ -1,0 +1,29 @@
+---
+# Ruolo: common - baseline di base per Debian 13 / Ubuntu
+# Documentation in roles/common/README.md
+
+# --- pacchetti base ---
+common_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - htop
+  - jq
+  - tmux
+  - unzip
+  - vim
+
+common_apt_update_cache: true
+common_apt_autoremove: false
+
+# --- sistema ---
+common_timezone: "Etc/UTC"
+common_locale: "C.UTF-8"
+common_locale_present: true
+common_hostname: ""
+
+# --- OPT-IN: aggiornamenti automatici ---
+common_unattended_upgrades: false
+common_unattended_upgrades_reboot: false
+common_unattended_upgrades_auto_reboot_time: "02:00"

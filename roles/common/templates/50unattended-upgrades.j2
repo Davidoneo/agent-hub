@@ -1,0 +1,12 @@
+---
+# Template per /etc/apt/apt.conf.d/50unattended-upgrades
+# Generato dal ruolo 'common' - le modifiche manuali verranno sovrascritte.
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}";
+        "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Automatic-Reboot "{{ 'true' if common_unattended_upgrades_reboot | bool else 'false' }}";
+Unattended-Upgrade::Automatic-Reboot-Time "{{ common_unattended_upgrades_auto_reboot_time }}";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";

@@ -1,0 +1,5 @@
+---
+# Ruolo: docker - variabili derivate
+
+# Slug della distribuzione usato negli URL del repository Docker.
+docker_distro_slug: "{{ 'debian' if ansible_facts.distribution == 'Debian' else 'ubuntu' }}"

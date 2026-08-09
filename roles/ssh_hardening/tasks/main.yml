@@ -1,0 +1,77 @@
+---
+# Ruolo: ssh_hardening - task principali
+# STRICT OPT-IN: senza ssh_hardening_enabled=true il ruolo non tocca nulla.
+
+# ------------------------------------------------------------
+# Preflight
+# ------------------------------------------------------------
+- name: SSH hardening | skip - disabilitato
+  ansible.builtin.debug:
+    msg: >-
+      Ruolo 'ssh_hardening' NON attivo: imposta ssh_hardening_enabled=true
+      e ssh_hardening_confirm=true per applicare la configurazione.
+  when: not ssh_hardening_enabled | bool
+
+- name: Preflight | conferma obbligatoria
+  ansible.builtin.assert:
+    that:
+      - ssh_hardening_confirm | bool
+    fail_msg: >-
+      Applicare l'hardening SSH richiede ANCHE ssh_hardening_confirm=true.
+      Una configurazione errata può impedire l'accesso SSH alla macchina.
+  when: ssh_hardening_enabled | bool
+
+- name: Preflight | protezione contro il lock-out
+  ansible.builtin.assert:
+    that:
+      - ssh_hardening_password_auth | bool or ssh_hardening_allow_users | length > 0
+    fail_msg: >-
+      Con ssh_hardening_password_auth=false devi elencare in
+      ssh_hardening_allow_users gli utenti autorizzati ad accedere,
+      altrimenti rischi di chiuderti fuori dalla macchina.
+  when: ssh_hardening_enabled | bool
+
+- name: Preflight | porta SSH consentita dal firewall (se presente)
+  ansible.builtin.assert:
+    that:
+      - >-
+        not firewall_enabled | default(false) | bool
+        or firewall_allow_ssh | default(true) | bool
+        or firewall_ssh_port | default(22) == ssh_hardening_port
+        or ssh_hardening_port | string in firewall_allow_ports | default([])
+    fail_msg: >-
+      La porta SSH configurata ({{ ssh_hardening_port }}) non è consentita
+      dal ruolo firewall. Allinea le due variabili prima di procedere.
+  when:
+    - ssh_hardening_enabled | bool
+    - firewall_enabled | default(false) | bool
+  tags: [ssh_hardening, preflight]
+
+# ------------------------------------------------------------
+# Applicazione (solo se ssh_hardening_enabled)
+# ------------------------------------------------------------
+- name: Assicura la directory dei drop-in sshd
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: ssh_hardening_enabled | bool
+
+- name: Genera il drop-in di hardening SSH
+  ansible.builtin.template:
+    src: sshd_baseline.conf.j2
+    dest: "{{ ssh_hardening_dropin_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+    validate: "/usr/sbin/sshd -t -f %s"
+  when: ssh_hardening_enabled | bool
+  notify: Ricarica sshd
+
+- name: Valida la configurazione sshd completa (drop-in incluso)
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false
+  check_mode: false
+  when: ssh_hardening_enabled | bool

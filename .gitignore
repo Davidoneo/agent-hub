@@ -1,0 +1,15 @@
+inventory/hosts
+inventory/group_vars/*.yml
+!inventory/group_vars/*.example.yml
+.ansible/
+.venv/
+*.retry
+.env
+.env.*
+*.key
+*.pem
+*.vault
+vault-password*
+secrets/
+.idea/
+.vscode/

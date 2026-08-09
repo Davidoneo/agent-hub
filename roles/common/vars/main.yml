@@ -1,0 +1,4 @@
+---
+# Ruolo: common - preflight e variabili derivate
+# (nessuna variabile derivata per ora: la mappatura distro->repo
+#  vive nei ruoli che la usano, es. docker/tailscale)

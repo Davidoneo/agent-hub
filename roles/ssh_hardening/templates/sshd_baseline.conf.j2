@@ -1,0 +1,21 @@
+# Drop-in di hardening SSH generato dal ruolo 'ssh_hardening'.
+# Modifiche manuali verranno sovrascritte al prossimo run.
+# Il primo valore letto da sshd ha precedenza: su Debian/Ubuntu la
+# "Include /etc/ssh/sshd_config.d/*.conf" è in cima a /etc/ssh/sshd_config,
+# quindi questo file prevale sulle direttive successive.
+
+Port {{ ssh_hardening_port }}
+PermitRootLogin {{ ssh_hardening_permit_root_login }}
+PasswordAuthentication {{ 'yes' if ssh_hardening_password_auth | bool else 'no' }}
+PubkeyAuthentication {{ 'yes' if ssh_hardening_pubkey_auth | bool else 'no' }}
+PermitEmptyPasswords {{ 'yes' if ssh_hardening_empty_passwords | bool else 'no' }}
+MaxAuthTries {{ ssh_hardening_max_auth_tries }}
+LoginGraceTime {{ ssh_hardening_login_grace_time }}
+X11Forwarding {{ 'yes' if ssh_hardening_x11_forwarding | bool else 'no' }}
+AllowAgentForwarding {{ 'yes' if ssh_hardening_allow_agent_forwarding | bool else 'no' }}
+AllowTcpForwarding {{ ssh_hardening_allow_tcp_forwarding }}
+ClientAliveInterval {{ ssh_hardening_client_alive_interval }}
+ClientAliveCountMax {{ ssh_hardening_client_alive_count_max }}
+{% if ssh_hardening_allow_users | length > 0 %}
+AllowUsers {{ ssh_hardening_allow_users | join(' ') }}
+{% endif %}

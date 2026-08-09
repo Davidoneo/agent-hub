@@ -1,0 +1,28 @@
+---
+# ============================================================
+# site.yml - Baseline server per Debian 13 / Ubuntu
+#
+# Uso sicuro:
+#   ansible-playbook site.yml --check --diff            # prova a secco
+#   ansible-playbook site.yml --tags common             # solo un ruolo
+#
+# Azioni "pericolose" (firewall, ssh_hardening, tailscale up)
+# sono STRETTAMENTE OPT-IN: restano disabilitate finché non
+# attivi le variabili relative (vedi group_vars di esempio e README).
+# ============================================================
+
+- name: Baseline server - Debian 13 / Ubuntu
+  hosts: all
+  gather_facts: true
+  become: true
+  roles:
+    - role: common
+      tags: [common, baseline]
+    - role: docker
+      tags: [docker, baseline]
+    - role: firewall
+      tags: [firewall, baseline]
+    - role: ssh_hardening
+      tags: [ssh_hardening, baseline]
+    - role: tailscale
+      tags: [tailscale, baseline]

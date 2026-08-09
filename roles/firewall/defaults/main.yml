@@ -1,0 +1,21 @@
+---
+# Ruolo: firewall (ufw) - STRICT OPT-IN
+# Documentation in roles/firewall/README.md
+
+# L'abilitazione richiede SEMPRE entrambe le variabili:
+#   firewall_enabled: true
+#   firewall_confirm: true
+# Questo per evitare di interrompere SSH/rete inavvertitamente.
+firewall_enabled: false
+firewall_confirm: false
+
+# Consente la porta SSH in ingresso (default: 22/tcp).
+firewall_allow_ssh: true
+firewall_ssh_port: 22
+
+# Porte extra in ingresso, formato "porta/proto", es. ["8080/tcp"].
+firewall_allow_ports: []
+
+# Policy di default.
+firewall_default_incoming: deny
+firewall_default_outgoing: allow

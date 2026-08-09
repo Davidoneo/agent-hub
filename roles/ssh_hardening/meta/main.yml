@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  role_name: ssh_hardening
+  namespace: baseline
+  author: debian-server-blueprint contributors
+  description: Hardening OpenSSH per Debian 13 / Ubuntu tramite drop-in - STRICT OPT-IN con preflight e validazione sshd -t
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+dependencies: []

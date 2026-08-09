@@ -1,0 +1,111 @@
+# ============================================================
+# group_vars/all.example.yml - Variabili di esempio (SICURE).
+#
+# Copia questo file in `inventory/group_vars/all.yml` e
+# personalizza. I default seguenti sono tutti "safe":
+# - le azioni che possono interrompere SSH/rete (firewall,
+#   ssh_hardening, tailscale up) sono DISABILITATE;
+# - per attivarle servono SEMPRE due variabili: quella di
+#   abilitazione E quella di conferma (vedi sotto).
+#
+# Nessun dato reale o segreto: le chiavi/authkey vanno passate
+# a runtime (extra-vars, vault o ambiente), mai nel repository.
+# ============================================================
+
+# ------------------------------------------------------------
+# common
+# ------------------------------------------------------------
+# Pacchetti base installati (lista espandibile).
+common_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - htop
+  - jq
+  - tmux
+  - unzip
+  - vim
+
+common_apt_update_cache: true   # aggiorna la cache apt prima di installare
+common_apt_autoremove: false    # rimuove i pacchetti orfani
+common_timezone: "Etc/UTC"      # fuso orario
+common_locale: "C.UTF-8"        # locale di sistema
+common_hostname: ""             # hostname da impostare (vuoto = non toccare)
+
+# OPT-IN: aggiornamenti di sicurezza automatici
+common_unattended_upgrades: false
+common_unattended_upgrades_reboot: false
+common_unattended_upgrades_auto_reboot_time: "02:00"
+
+# ------------------------------------------------------------
+# docker
+# ------------------------------------------------------------
+docker_install: false           # opt-in: installa Docker Engine dal repo ufficiale
+docker_repo_channel: stable
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+docker_users: []                # utenti da aggiungere al gruppo `docker`
+docker_daemon_config: {}        # dict -> genera /etc/docker/daemon.json (vuoto = nessun file)
+
+# ------------------------------------------------------------
+# firewall (ufw) - STRICT OPT-IN
+# ------------------------------------------------------------
+# Per abilitare servono ENTRAMBE:
+#   firewall_enabled: true
+#   firewall_confirm: true
+firewall_enabled: false
+firewall_confirm: false
+firewall_allow_ssh: true        # consente la porta SSH in ingresso
+firewall_ssh_port: 22
+firewall_allow_ports: []        # porte extra in ingresso, formato "porta/proto"
+                                # es. ["2375/tcp", "8080/tcp"]
+firewall_default_incoming: deny
+firewall_default_outgoing: allow
+
+# ------------------------------------------------------------
+# ssh_hardening - STRICT OPT-IN
+# ------------------------------------------------------------
+# Per abilitare servono ENTRAMBE:
+#   ssh_hardening_enabled: true
+#   ssh_hardening_confirm: true
+ssh_hardening_enabled: false
+ssh_hardening_confirm: false
+ssh_hardening_port: 22
+ssh_hardening_permit_root_login: "no"
+ssh_hardening_password_auth: false
+ssh_hardening_pubkey_auth: true
+ssh_hardening_empty_passwords: false
+ssh_hardening_max_auth_tries: 3
+ssh_hardening_login_grace_time: 30
+ssh_hardening_x11_forwarding: false
+ssh_hardening_allow_agent_forwarding: false
+ssh_hardening_allow_tcp_forwarding: "no"
+ssh_hardening_client_alive_interval: 300
+ssh_hardening_client_alive_count_max: 3
+ssh_hardening_allow_users: []
+# IMPORTANTE: con ssh_hardening_password_auth=false la variabile
+# ssh_hardening_allow_users DEVE elencare gli utenti abilitati,
+# per evitare di chiudersi fuori dalla macchina.
+ssh_hardening_service_action: reloaded   # "reloaded" (sicuro) o "restarted"
+
+# ------------------------------------------------------------
+# tailscale - installazione base + OPT-IN `up`
+# ------------------------------------------------------------
+tailscale_install: false
+tailscale_up: false             # STRICT OPT-IN: unisce il nodo alla rete
+tailscale_confirm: false        # conferma esplicita richiesta per `up`
+# Authkey: SEGRETO. MAI nel repository. Passala a runtime, es.:
+#   ansible-playbook site.yml --tags tailscale \
+#     -e tailscale_up=true -e tailscale_confirm=true \
+#     -e tailscale_authkey=$(cat ~/.ssh/tailscale-authkey) -e @vault.yml
+tailscale_authkey: ""
+tailscale_hostname: ""          # vuoto = hostname di default
+tailscale_ssh: false            # OPT-IN: abilita SSH via tailscale
+tailscale_accept_routes: false  # OPT-IN: accetta rotte annunciate
+tailscale_advertise_routes: []  # OPT-IN: subnet router, es. ["10.0.0.0/24"]
+tailscale_exit_node: false      # OPT-IN: usa un exit node remoto

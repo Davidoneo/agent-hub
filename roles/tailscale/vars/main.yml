@@ -1,0 +1,8 @@
+---
+# Ruolo: tailscale - variabili derivate
+
+# Slug della distribuzione usato negli URL del repository Tailscale.
+tailscale_distro_slug: "{{ 'debian' if ansible_facts.distribution == 'Debian' else 'ubuntu' }}"
+
+# Path del keyring GPG del repository Tailscale.
+tailscale_keyring_path: /etc/apt/keyrings/tailscale.asc

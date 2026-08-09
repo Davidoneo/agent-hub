@@ -1,0 +1,17 @@
+# ============================================================
+# Inventario di esempio - NON contiene dati reali.
+#
+# Copia questo file in `inventory/hosts` e personalizzalo,
+# oppure punta ansible.cfg su un inventario tuo.
+#
+# Uso:
+#   ansible-playbook site.yml --check
+#   ansible-playbook site.yml --tags common
+# ============================================================
+
+[baseline]
+# server1.example.com ansible_host=10.0.0.10 ansible_user=deploy
+
+[baseline:vars]
+# ansible_python_interpreter=/usr/bin/python3
+# ansible_ssh_private_key_file=~/.ssh/deploy_key
