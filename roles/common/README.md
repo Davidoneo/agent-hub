@@ -1,31 +1,31 @@
-# Ruolo `common`
+# Role `common`
 
-Baseline di base per laptop o server Debian 13 / Ubuntu 24.04+:
+Base system setup for Debian 13 / Ubuntu 24.04+ laptops and servers:
 
-- preflight: verifica che la distro target sia supportata (Debian/Ubuntu);
-- pacchetti di base (lista in `common_packages`);
-- fuso orario opzionale (`common_manage_timezone`);
-- locale di sistema opzionale (`common_manage_locale`);
-- hostname opzionale (`common_hostname`, vuoto = non toccato);
-- **opt-in**: aggiornamenti di sicurezza automatici con unattended-upgrades.
+- preflight: verifies the target distro is supported (Debian/Ubuntu);
+- base packages (list in `common_packages`);
+- optional timezone (`common_manage_timezone`);
+- optional system locale (`common_manage_locale`);
+- optional hostname (`common_hostname`, empty = untouched);
+- **opt-in**: automatic security updates with unattended-upgrades.
 
-## Variabili principali
+## Main variables
 
-| Variabile | Default | Note |
+| Variable | Default | Notes |
 |---|---|---|
-| `common_packages` | elenco base | pacchetti da installare |
-| `common_apt_update_cache` | `true` | aggiorna cache apt |
-| `common_apt_autoremove` | `false` | rimuove pacchetti orfani |
-| `common_manage_timezone` | `false` | abilita la modifica del fuso orario |
-| `common_timezone` | `Etc/UTC` | fuso orario |
-| `common_manage_locale` | `false` | abilita la generazione del locale |
-| `common_locale` | `C.UTF-8` | locale di sistema |
-| `common_hostname` | `""` | vuoto = nessuna modifica |
-| `common_unattended_upgrades` | `false` | **opt-in** aggiornamenti automatici |
-| `common_unattended_upgrades_reboot` | `false` | reboot automatico dopo gli aggiornamenti |
+| `common_packages` | base list | packages to install |
+| `common_apt_update_cache` | `true` | refresh apt cache |
+| `common_apt_autoremove` | `false` | remove orphan packages |
+| `common_manage_timezone` | `false` | enable timezone change |
+| `common_timezone` | `Etc/UTC` | timezone |
+| `common_manage_locale` | `false` | enable locale generation |
+| `common_locale` | `C.UTF-8` | system locale |
+| `common_hostname` | `""` | empty = no change |
+| `common_unattended_upgrades` | `false` | **opt-in** automatic updates |
+| `common_unattended_upgrades_reboot` | `false` | automatic reboot after updates |
 
-## Sicurezza
+## Security
 
-Fuso orario, locale e `common_unattended_upgrades` sono opt-in: il profilo
-predefinito non sostituisce le preferenze locali di un laptop. Attivando gli
-aggiornamenti automatici, il reboot resta disattivo salvo esplicita richiesta.
+Timezone, locale, and `common_unattended_upgrades` are opt-in: the default
+profile does not override a laptop's local preferences. When enabling
+automatic updates, reboot stays off unless explicitly requested.

@@ -1,13 +1,13 @@
-# Sicurezza
+# Security
 
-Non aprire issue pubbliche con indirizzi reali, inventory, log di accesso o
-credenziali. Per segnalazioni relative al codice usare una security advisory
-privata di GitHub.
+Do not open public issues with real addresses, inventory, access logs, or
+credentials. For code-related reports, use a private GitHub security advisory.
 
-Prima di una pull request verificare che diff e history non contengano `.env`,
-inventory reale, chiavi, token, password, hostname o domini personali.
+Before opening a pull request, verify that the diff and history contain no
+`.env`, real inventory, keys, tokens, passwords, hostnames, or personal
+domains.
 
-Il playbook modifica sistemi con privilegi root. Usare prima `--check --diff`,
-revisionare le dipendenze e mantenere una console alternativa durante modifiche
-a SSH o firewall. Le versioni scaricate da repository esterni vanno rivalutate
-periodicamente; questo progetto non sostituisce gli aggiornamenti di sicurezza.
+The playbook modifies systems with root privileges. Always use
+`--check --diff` first, review dependencies, and keep an alternate console
+open while changing SSH or the firewall. Review external repositories and
+their signing keys periodically.

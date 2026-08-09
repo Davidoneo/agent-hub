@@ -3,7 +3,7 @@ galaxy_info:
   role_name: common
   namespace: baseline
   author: debian-server-blueprint contributors
-  description: Baseline di base per server Debian 13 e Ubuntu (pacchetti, fuso orario, locale, unattended-upgrades opt-in)
+  description: Base packages and system settings for Debian and Ubuntu
   license: MIT
   min_ansible_version: "2.16"
   platforms:

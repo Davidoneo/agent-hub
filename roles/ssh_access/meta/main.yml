@@ -3,7 +3,7 @@ galaxy_info:
   role_name: ssh_access
   namespace: blueprint
   author: debian-server-blueprint contributors
-  description: Bootstrap opt-in di OpenSSH con chiavi pubbliche fidate
+  description: Opt-in OpenSSH bootstrap with trusted public keys
   license: MIT
   min_ansible_version: "2.16"
   platforms:

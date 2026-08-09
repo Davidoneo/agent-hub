@@ -1,18 +1,18 @@
 ---
-# Ruolo: ssh_hardening - task principali
-# STRICT OPT-IN: senza ssh_hardening_enabled=true il ruolo non tocca nulla.
+# Role: ssh_hardening - main tasks
+# STRICT OPT-IN: without ssh_hardening_enabled=true the role touches nothing.
 
 # ------------------------------------------------------------
 # Preflight
 # ------------------------------------------------------------
-- name: SSH hardening | skip - disabilitato
+- name: SSH hardening | skip - disabled
   ansible.builtin.debug:
     msg: >-
-      Ruolo 'ssh_hardening' NON attivo: imposta ssh_hardening_enabled=true
-      e ssh_hardening_confirm=true per applicare la configurazione.
+      Role 'ssh_hardening' NOT active: set ssh_hardening_enabled=true
+      and ssh_hardening_confirm=true to apply the configuration.
   when: not ssh_hardening_enabled | bool
 
-- name: Preflight | conferma obbligatoria
+- name: Preflight | mandatory confirmation
   ansible.builtin.assert:
     that:
       - ssh_hardening_confirm | bool
@@ -21,11 +21,11 @@
       - ssh_hardening_port | int < 65536
       - ssh_hardening_service_action in ["reloaded", "restarted"]
     fail_msg: >-
-      Applicare l'hardening SSH richiede ANCHE ssh_hardening_confirm=true.
-      Una configurazione errata può impedire l'accesso SSH alla macchina.
+      Applying SSH hardening also requires ssh_hardening_confirm=true.
+      A misconfigured setup can prevent SSH access to the machine.
   when: ssh_hardening_enabled | bool
 
-- name: Preflight | utenti SSH validi
+- name: Preflight | valid SSH users
   ansible.builtin.assert:
     that:
       - >-
@@ -36,25 +36,25 @@
         ssh_hardening_password_auth | bool or
         ssh_hardening_admin_user in ssh_hardening_allow_users
     fail_msg: >-
-      Con login a password disabilitato, ssh_hardening_allow_users deve
-      contenere l'utente amministrativo e soltanto nomi utente validi.
+      With password login disabled, ssh_hardening_allow_users must contain
+      the admin user and only valid usernames.
   when: ssh_hardening_enabled | bool
 
-- name: Preflight | legge l'utente amministrativo
+- name: Preflight | read the admin user
   ansible.builtin.getent:
     database: passwd
     key: "{{ ssh_hardening_admin_user }}"
     fail_key: false
   when: ssh_hardening_enabled | bool
 
-- name: Preflight | richiede un utente amministrativo esistente
+- name: Preflight | require an existing admin user
   ansible.builtin.assert:
     that:
       - ssh_hardening_admin_user in (ansible_facts.getent_passwd | default({}))
-    fail_msg: "Utente SSH inesistente: {{ ssh_hardening_admin_user }}."
+    fail_msg: "SSH user does not exist: {{ ssh_hardening_admin_user }}."
   when: ssh_hardening_enabled | bool
 
-- name: Preflight | controlla authorized_keys dell'amministratore
+- name: Preflight | check the admin's authorized_keys
   ansible.builtin.stat:
     path: >-
       {{ ansible_facts.getent_passwd[ssh_hardening_admin_user][4] }}/.ssh/authorized_keys
@@ -63,19 +63,19 @@
     - ssh_hardening_enabled | bool
     - not ssh_hardening_password_auth | bool
 
-- name: Preflight | richiede almeno una chiave autorizzata reale
+- name: Preflight | require at least one real authorized key
   ansible.builtin.assert:
     that:
       - ssh_hardening_authorized_keys.stat.isreg | default(false)
       - ssh_hardening_authorized_keys.stat.size | default(0) | int > 0
     fail_msg: >-
-      Non disabilitare la password finché authorized_keys dell'utente
-      amministrativo non esiste, non contiene una chiave e non è stata provata.
+      Do not disable the password until the admin user's authorized_keys
+      exists, contains a key, and has been tested.
   when:
     - ssh_hardening_enabled | bool
     - not ssh_hardening_password_auth | bool
 
-- name: Preflight | verifica il percorso SSH nel firewall
+- name: Preflight | verify the SSH path in the firewall
   ansible.builtin.include_tasks: check_firewall.yml
   when:
     - ssh_hardening_enabled | bool
@@ -83,9 +83,9 @@
   tags: [ssh_hardening, preflight]
 
 # ------------------------------------------------------------
-# Applicazione (solo se ssh_hardening_enabled)
+# Application (only if ssh_hardening_enabled)
 # ------------------------------------------------------------
-- name: Assicura la directory dei drop-in sshd
+- name: Ensure the sshd drop-in directory
   ansible.builtin.file:
     path: /etc/ssh/sshd_config.d
     state: directory
@@ -94,7 +94,7 @@
     mode: "0755"
   when: ssh_hardening_enabled | bool
 
-- name: Genera il drop-in di hardening SSH
+- name: Generate the SSH hardening drop-in
   ansible.builtin.template:
     src: sshd_baseline.conf.j2
     dest: "{{ ssh_hardening_dropin_path }}"
@@ -103,9 +103,9 @@
     mode: "0600"
     validate: "/usr/sbin/sshd -t -f %s"
   when: ssh_hardening_enabled | bool
-  notify: Ricarica sshd
+  notify: Reload sshd
 
-- name: Valida la configurazione sshd completa (drop-in incluso)
+- name: Validate the full sshd configuration (drop-in included)
   ansible.builtin.command: /usr/sbin/sshd -t
   changed_when: false
   check_mode: false

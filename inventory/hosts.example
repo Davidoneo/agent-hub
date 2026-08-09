@@ -1,16 +1,16 @@
 # ============================================================
-# Inventario di esempio - NON contiene dati reali.
+# Example inventory - contains NO real data.
 #
-# Copia questo file in `inventory/hosts` e personalizzalo,
-# oppure punta ansible.cfg su un inventario tuo.
+# Copy this file to `inventory/hosts` and customize it,
+# or point ansible.cfg at your own inventory.
 #
-# Uso:
+# Usage:
 #   ansible-playbook site.yml --check
 #   ansible-playbook site.yml --tags common
 # ============================================================
 
 [managed]
-# server1.example.com ansible_host=10.0.0.10 ansible_user=deploy
+# server1.example.invalid ansible_host=192.0.2.10 ansible_user=deploy
 
 [managed:vars]
 # ansible_python_interpreter=/usr/bin/python3

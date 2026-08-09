@@ -1,17 +1,17 @@
 ---
-# Ruolo: ssh_hardening - STRICT OPT-IN
+# Role: ssh_hardening - STRICT OPT-IN
 # Documentation in roles/ssh_hardening/README.md
 
-# L'abilitazione richiede SEMPRE entrambe le variabili:
+# Enabling ALWAYS requires both variables:
 #   ssh_hardening_enabled: true
 #   ssh_hardening_confirm: true
-# Una configurazione SSH sbagliata può chiuderti fuori dalla macchina.
+# A wrong SSH configuration can lock you out of the machine.
 ssh_hardening_enabled: false
 ssh_hardening_confirm: false
 ssh_hardening_admin_user: ""
 
-# Drop-in generato in /etc/ssh/sshd_config.d/ (ha precedenza su sshd_config
-# perché la Include di Debian/Ubuntu viene letta per prima).
+# Generated drop-in in /etc/ssh/sshd_config.d/ (takes precedence over
+# sshd_config because Debian/Ubuntu read the Include first).
 ssh_hardening_dropin_path: /etc/ssh/sshd_config.d/99-baseline-hardening.conf
 
 ssh_hardening_port: 22
@@ -27,10 +27,10 @@ ssh_hardening_allow_tcp_forwarding: "no"
 ssh_hardening_client_alive_interval: 300
 ssh_hardening_client_alive_count_max: 3
 
-# Utenti autorizzati ad accedere (AllowUsers).
-# Con password_auth=false questa lista DEVE essere compilata:
-# è la protezione contro il lock-out.
+# Users allowed to log in (AllowUsers).
+# With password_auth=false this list MUST be filled in:
+# it is the lock-out protection.
 ssh_hardening_allow_users: []
 
-# "reloaded" (default, non interrompe le sessioni attive) oppure "restarted".
+# "reloaded" (default, does not interrupt active sessions) or "restarted".
 ssh_hardening_service_action: reloaded

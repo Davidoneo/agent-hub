@@ -1,14 +1,14 @@
 ---
 # ============================================================
-# site.yml - Baseline laptop/server per Debian 13 / Ubuntu 24.04+
+# site.yml - laptop/server baseline for Debian 13 / Ubuntu 24.04+
 #
-# Uso sicuro:
-#   ansible-playbook site.yml --check --diff            # prova a secco
-#   ansible-playbook site.yml --tags common             # solo un ruolo
+# Safe usage:
+#   ansible-playbook site.yml --check --diff            # dry run
+#   ansible-playbook site.yml --tags common             # single role
 #
-# Azioni "pericolose" (firewall, ssh_hardening, tailscale up)
-# sono STRETTAMENTE OPT-IN: restano disabilitate finché non
-# attivi le variabili relative (vedi group_vars di esempio e README).
+# "Dangerous" actions (firewall, ssh_hardening, tailscale up)
+# are STRICTLY OPT-IN: they stay disabled until you activate
+# the related variables (see the example group_vars and README).
 # ============================================================
 
 - name: Baseline laptop or server - Debian 13 / Ubuntu
@@ -16,15 +16,15 @@
   gather_facts: true
   become: true
   pre_tasks:
-    - name: Preflight | profilo macchina valido
+    - name: Preflight | valid machine profile
       ansible.builtin.assert:
         that:
           - (blueprint_profile | default('laptop')) in ["laptop", "server"]
         fail_msg: >-
-          blueprint_profile deve essere 'laptop' oppure 'server'.
+          blueprint_profile must be 'laptop' or 'server'.
       tags: [always, preflight]
 
-    - name: Preflight | release supportata
+    - name: Preflight | supported release
       ansible.builtin.assert:
         that:
           - ansible_facts.os_family == "Debian"
@@ -34,8 +34,8 @@
             (ansible_facts.distribution == "Ubuntu" and
              ansible_facts.distribution_version is version('24.04', '>='))
         fail_msg: >-
-          Supporto iniziale: Debian 13+ e Ubuntu 24.04+. Per altre
-          distribuzioni o release crea una fork e adatta package/service/path.
+          Initial support: Debian 13+ and Ubuntu 24.04+. For other
+          distributions or releases, fork and adapt package/service/path.
       tags: [always, preflight]
   roles:
     - role: common

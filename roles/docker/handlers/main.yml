@@ -1,6 +1,6 @@
 ---
-# Ruolo: docker - handler
-- name: Riavvia Docker
+# Role: docker - handlers
+- name: Restart Docker
   ansible.builtin.systemd:
     name: docker
     state: restarted

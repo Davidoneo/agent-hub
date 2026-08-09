@@ -1,5 +1,5 @@
 ---
-# Ruolo: docker - installazione Docker Engine da repository ufficiale
+# Role: docker - install Docker Engine from the official repository
 # Documentation in roles/docker/README.md
 
 docker_install: false
@@ -11,13 +11,13 @@ docker_packages:
   - docker-buildx-plugin
   - docker-compose-plugin
 
-# Utenti da aggiungere al gruppo `docker` (il gruppo viene creato dal pacchetto).
+# Users to add to the `docker` group (the group is created by the package).
 docker_users: []
 
-# Configurazione del demone: dict -> /etc/docker/daemon.json.
-# Vuoto = non gestisce il file (lasciato come sta sul target).
+# Daemon configuration: dict -> /etc/docker/daemon.json.
+# Empty = does not manage the file (left as-is on the target).
 docker_daemon_config: {}
 
-# Path del keyring GPG del repository Docker.
+# Path of the Docker repository GPG keyring.
 docker_keyring_path: /etc/apt/keyrings/docker.asc
 docker_key_fingerprint: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88

@@ -1,36 +1,36 @@
 ---
-# Ruolo: tailscale - task principali
-# Installazione da repository ufficiale (pkgs.tailscale.com).
-# Il ruolo non accetta auth key e non esegue `tailscale up`.
+# Role: tailscale - main tasks
+# Installation from the official repository (pkgs.tailscale.com).
+# The role does not accept auth keys and does not run `tailscale up`.
 
 # ------------------------------------------------------------
 # Preflight
 # ------------------------------------------------------------
-- name: Tailscale | skip installazione richiesta
+- name: Tailscale | installation not requested
   ansible.builtin.debug:
-    msg: "tailscale_install=false: il ruolo non modifica nulla."
+    msg: "tailscale_install=false: the role changes nothing."
   when: not tailscale_install | bool
 
-- name: Preflight | distro supportata
+- name: Preflight | supported distro
   ansible.builtin.assert:
     that:
       - ansible_facts.distribution in ["Debian", "Ubuntu"]
     fail_msg: >-
-      Ruolo 'tailscale' supporta solo Debian e Ubuntu.
-      Rilevato: {{ ansible_facts.distribution }}
+      Role 'tailscale' supports only Debian and Ubuntu.
+      Detected: {{ ansible_facts.distribution }}
       {{ ansible_facts.distribution_version }}.
 
 # ------------------------------------------------------------
-# Installazione (repository ufficiale)
+# Installation (official repository)
 # ------------------------------------------------------------
-- name: Crea directory dei keyring
+- name: Create the keyrings directory
   ansible.builtin.file:
     path: /etc/apt/keyrings
     state: directory
     mode: "0755"
   when: tailscale_install | bool
 
-- name: Installa dipendenze per repository e verifica chiave
+- name: Install repository and key verification dependencies
   ansible.builtin.apt:
     name:
       - ca-certificates
@@ -39,20 +39,20 @@
     state: present
   when: tailscale_install | bool
 
-- name: Scarica la chiave GPG ufficiale di Tailscale
+- name: Download the official Tailscale GPG key
   ansible.builtin.get_url:
     url: "https://pkgs.tailscale.com/stable/{{ tailscale_distro_slug }}/{{ ansible_facts.distribution_release }}.gpg"
     dest: "{{ tailscale_keyring_path }}"
     mode: "0644"
   when: tailscale_install | bool
 
-- name: Controlla la presenza della chiave Tailscale
+- name: Check for the presence of the Tailscale key
   ansible.builtin.stat:
     path: "{{ tailscale_keyring_path }}"
   register: tailscale_keyring_file
   when: tailscale_install | bool
 
-- name: Verifica il fingerprint della chiave Tailscale
+- name: Verify the Tailscale key fingerprint
   ansible.builtin.command:
     argv:
       - gpg
@@ -67,17 +67,17 @@
     - tailscale_install | bool
     - tailscale_keyring_file.stat.exists | bool
 
-- name: Rifiuta una chiave Tailscale inattesa
+- name: Reject an unexpected Tailscale key
   ansible.builtin.assert:
     that:
       - tailscale_key_fingerprint in tailscale_key_inspection.stdout
     fail_msg: >-
-      Fingerprint della chiave Tailscale inatteso: repository non configurato.
+      Unexpected Tailscale key fingerprint: repository not configured.
   when:
     - tailscale_install | bool
     - tailscale_keyring_file.stat.exists | bool
 
-- name: Aggiunge il repository apt di Tailscale
+- name: Add the Tailscale apt repository
   ansible.builtin.deb822_repository:
     name: tailscale
     types: [deb]
@@ -88,23 +88,23 @@
     state: present
   when: tailscale_install | bool
 
-- name: Installa il pacchetto tailscale
+- name: Install the tailscale package
   ansible.builtin.apt:
     name: tailscale
     state: present
   when: tailscale_install | bool
 
-- name: Avvia e abilita il servizio tailscaled
+- name: Start and enable the tailscaled service
   ansible.builtin.systemd:
     name: tailscaled
     enabled: true
     state: started
   when: tailscale_install | bool
 
-- name: Indica il passaggio di autenticazione separato
+- name: Point out the separate authentication step
   ansible.builtin.debug:
     msg: >-
-      Tailscale installato. Autentica il nodo fuori dal playbook con
-      'sudo tailscale up' oppure con la procedura approvata dalla tua rete.
-      Non salvare auth key nell'inventory o nella shell history.
+      Tailscale installed. Authenticate the node outside the playbook with
+      'sudo tailscale up' or with the procedure approved by your network.
+      Do not store auth keys in the inventory or in shell history.
   when: tailscale_install | bool

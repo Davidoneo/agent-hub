@@ -3,7 +3,7 @@ galaxy_info:
   role_name: tailscale
   namespace: baseline
   author: debian-server-blueprint contributors
-  description: Installazione Tailscale da repository ufficiale (Debian 13 / Ubuntu) con `tailscale up` STRICT OPT-IN
+  description: Install Tailscale from its official Debian or Ubuntu repository
   license: MIT
   min_ansible_version: "2.16"
   platforms:

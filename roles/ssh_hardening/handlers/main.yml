@@ -1,6 +1,6 @@
 ---
-# Ruolo: ssh_hardening - handler
-- name: Ricarica sshd
+# Role: ssh_hardening - handlers
+- name: Reload sshd
   ansible.builtin.systemd:
     name: ssh
     state: "{{ ssh_hardening_service_action }}"

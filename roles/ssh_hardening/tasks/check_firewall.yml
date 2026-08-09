@@ -1,5 +1,5 @@
 ---
-- name: Preflight | porta SSH consentita dal firewall
+- name: Preflight | SSH port allowed by the firewall
   ansible.builtin.assert:
     that:
       - >-
@@ -14,5 +14,5 @@
         or ((ssh_hardening_port | string) ~ '/tcp')
            in (firewall_allow_ports | default([]))
     fail_msg: >-
-      La porta SSH configurata ({{ ssh_hardening_port }}) non è consentita
-      dal firewall. Allinea porta e percorso fidato prima di procedere.
+      The configured SSH port ({{ ssh_hardening_port }}) is not allowed
+      by the firewall. Align the port and the trusted path before proceeding.

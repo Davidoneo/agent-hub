@@ -1,14 +1,12 @@
-# Debian Machine Blueprint
+# Home Server Agent Setup
 
-Baseline Ansible prudente e forkabile per preparare un **laptop** o un
-**server** Debian 13+ / Ubuntu 24.04+. Può essere eseguita localmente oppure da
-un computer di controllo via SSH.
+Ansible playbook for preparing a Debian or Ubuntu home server to run agents
+and manage them remotely over SSH or Tailscale. It can also configure a laptop
+or a local development machine.
 
-Il repository non contiene dati del server da cui è nato. Il ruolo `common`
-applica la baseline scelta; Docker, OpenSSH server, chiavi fidate, hardening,
-UFW e Tailscale sono tutti opt-in.
+Supported targets: Debian 13+ and Ubuntu 24.04+.
 
-## Avvio rapido
+## Install
 
 ```bash
 git clone https://github.com/Davidoneo/debian-server-blueprint.git
@@ -20,7 +18,7 @@ ansible-galaxy collection install -r requirements.yml
 cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
 ```
 
-Per configurare lo stesso laptop:
+For the local machine:
 
 ```bash
 cp inventory/local.example inventory/hosts
@@ -28,62 +26,39 @@ ansible-playbook -i inventory/hosts site.yml --check --diff -K
 ansible-playbook -i inventory/hosts site.yml -K
 ```
 
-Per un host remoto:
+For a remote server:
 
 ```bash
 cp inventory/hosts.example inventory/hosts
-$EDITOR inventory/hosts
+$EDITOR inventory/hosts inventory/group_vars/all.yml
 ansible-playbook -i inventory/hosts site.yml --check --diff
 ansible-playbook -i inventory/hosts site.yml
 ```
 
-Personalizzare prima `inventory/group_vars/all.yml`, incluso
-`blueprint_profile: laptop` oppure `server`. Inventory e variabili reali sono
-ignorati da Git.
+Set `blueprint_profile` to `laptop` or `server`. Real inventory files are
+ignored by Git.
 
-## Accesso remoto da macchine fidate
+## Remote access
 
-Il flusso sicuro è deliberatamente a due fasi:
+SSH setup is opt-in. Add public keys from trusted clients, test access in a
+second terminal, then enable SSH hardening and UFW. SSH can be limited to
+trusted CIDRs or the Tailscale interface. The playbook checks the admin key,
+`AllowUsers`, and firewall port before disabling password access.
 
-1. generare una chiave ed25519 distinta su ogni client fidato;
-2. abilitare `ssh_access` e installare soltanto le chiavi pubbliche;
-3. provare il nuovo login da un secondo terminale;
-4. soltanto dopo abilitare hardening e firewall;
-5. limitare UFW ai CIDR fidati oppure all'interfaccia Tailscale.
+## Roles
 
-Il playbook rifiuta di disabilitare le password se l'utente amministrativo non
-esiste, non è incluso in `AllowUsers` o non possiede un `authorized_keys` non
-vuoto. Rifiuta anche porte SSH non allineate al firewall.
+| Role | Default |
+|---|---|
+| Base packages and system settings | enabled |
+| OpenSSH server and trusted keys | disabled |
+| Docker Engine | disabled |
+| Tailscale installation | disabled |
+| SSH hardening | disabled, confirmation required |
+| UFW firewall | disabled, confirmation required |
 
-## Guide
+See [installation](docs/INSTALL.md), [SSH setup and recovery](docs/SSH.md),
+and [security](SECURITY.md). Other distributions require a fork with adjusted
+packages, services, paths, and tests.
 
-- [Installazione locale e remota](docs/INSTALL.md)
-- [Bootstrap SSH, client fidati e recovery](docs/SSH.md)
-- [Policy di sicurezza](SECURITY.md)
-- Documentazione specifica sotto `roles/*/README.md`
-
-## Moduli
-
-| Tag | Funzione | Default |
-|---|---|---|
-| `common` | pacchetti, timezone, locale, hostname | attivo |
-| `ssh_access` | OpenSSH server e chiavi pubbliche fidate | disattivo |
-| `docker` | Docker Engine dal repository ufficiale | disattivo |
-| `tailscale` | installazione verificata; autenticazione manuale | disattivo |
-| `ssh_hardening` | drop-in OpenSSH validato | disattivo + conferma |
-| `firewall` | UFW applicato per ultimo | disattivo + conferma |
-
-Eseguire sempre prima `--check --diff` e mantenere una console o una sessione
-SSH alternativa durante modifiche a rete e accesso remoto.
-
-## Altre distribuzioni
-
-Le altre distro richiedono una fork: adattare package manager, nomi dei
-pacchetti, servizi e percorsi, quindi aggiungere test CI specifici. Il
-playbook principale blocca intenzionalmente release fuori dal supporto
-dichiarato.
-
-## Licenza
-
-MIT. Revisionare codice, dipendenze e diff prima di eseguirli con privilegi
-root; il progetto è una base personalizzabile, non una garanzia universale.
+MIT licensed. Run `--check --diff` before applying changes and keep another
+console open when changing SSH or firewall rules.

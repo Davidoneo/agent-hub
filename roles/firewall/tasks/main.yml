@@ -1,72 +1,72 @@
 ---
-# Ruolo: firewall (ufw) - task principali
-# STRICT OPT-IN: senza firewall_enabled=true il ruolo non tocca nulla.
+# Role: firewall (ufw) - main tasks
+# STRICT OPT-IN: without firewall_enabled=true the role touches nothing.
 
 # ------------------------------------------------------------
 # Preflight
 # ------------------------------------------------------------
-- name: Firewall | skip - disabilitato
+- name: Firewall | skip - disabled
   ansible.builtin.debug:
     msg: >-
-      Ruolo 'firewall' NON attivo: imposta firewall_enabled=true e
-      firewall_confirm=true per abilitare ufw.
+      Role 'firewall' NOT active: set firewall_enabled=true and
+      firewall_confirm=true to enable ufw.
   when: not firewall_enabled | bool
 
-- name: Preflight | conferma obbligatoria
+- name: Preflight | mandatory confirmation
   ansible.builtin.assert:
     that:
       - firewall_confirm | bool
     fail_msg: >-
-      Abilitare il firewall richiede ANCHE firewall_confirm=true.
-      Un firewall mal configurato può interrompere SSH e la rete:
-      verifica di avere un canale di accesso fuori banda (console/IPMI).
+      Enabling the firewall also requires firewall_confirm=true.
+      A misconfigured firewall can break SSH and networking:
+      make sure you have an out-of-band access channel (console/IPMI).
   when: firewall_enabled | bool
 
-- name: Preflight | verifica un percorso SSH
+- name: Preflight | verify an SSH path
   ansible.builtin.include_tasks: check_ssh_path.yml
   when: firewall_enabled | bool
 
-- name: Preflight | formato delle porte aggiuntive
+- name: Preflight | extra port format
   ansible.builtin.assert:
     that:
       - item is match('^[0-9]{1,5}/(tcp|udp)$')
       - item.split('/')[0] | int > 0
       - item.split('/')[0] | int < 65536
-    fail_msg: "Porta non valida: {{ item }}. Usa il formato 443/tcp o 53/udp."
+    fail_msg: "Invalid port: {{ item }}. Use the format 443/tcp or 53/udp."
   loop: "{{ firewall_allow_ports }}"
   when: firewall_enabled | bool
 
-- name: Preflight | distro supportata
+- name: Preflight | supported distro
   ansible.builtin.assert:
     that:
       - ansible_facts.distribution in ["Debian", "Ubuntu"]
     fail_msg: >-
-      Ruolo 'firewall' supporta solo Debian e Ubuntu (ufw).
-      Rilevato: {{ ansible_facts.distribution }}
+      Role 'firewall' supports only Debian and Ubuntu (ufw).
+      Detected: {{ ansible_facts.distribution }}
       {{ ansible_facts.distribution_version }}.
 
 # ------------------------------------------------------------
-# Applicazione (solo se firewall_enabled)
+# Application (only if firewall_enabled)
 # ------------------------------------------------------------
-- name: Installa ufw
+- name: Install ufw
   ansible.builtin.apt:
     name: ufw
     state: present
   when: firewall_enabled | bool
 
-- name: Policy default - ingresso
+- name: Default policy - incoming
   community.general.ufw:
     direction: incoming
     policy: "{{ firewall_default_incoming }}"
   when: firewall_enabled | bool
 
-- name: Policy default - uscita
+- name: Default policy - outgoing
   community.general.ufw:
     direction: outgoing
     policy: "{{ firewall_default_outgoing }}"
   when: firewall_enabled | bool
 
-- name: Consenti SSH da qualsiasi sorgente
+- name: Allow SSH from any source
   community.general.ufw:
     rule: allow
     port: "{{ firewall_ssh_port }}"
@@ -75,7 +75,7 @@
     - firewall_enabled | bool
     - firewall_allow_ssh_from_anywhere | bool
 
-- name: Consenti SSH soltanto dai CIDR fidati
+- name: Allow SSH only from trusted CIDRs
   community.general.ufw:
     rule: allow
     from_ip: "{{ item }}"
@@ -84,7 +84,7 @@
   loop: "{{ firewall_ssh_sources }}"
   when: firewall_enabled | bool
 
-- name: Consenti SSH tramite interfaccia Tailscale
+- name: Allow SSH via the Tailscale interface
   community.general.ufw:
     rule: allow
     direction: in
@@ -95,7 +95,7 @@
     - firewall_enabled | bool
     - firewall_allow_tailscale_ssh | bool
 
-- name: Consenti porte aggiuntive in ingresso
+- name: Allow extra incoming ports
   community.general.ufw:
     rule: allow
     port: "{{ item.split('/')[0] }}"
@@ -103,12 +103,12 @@
   loop: "{{ firewall_allow_ports }}"
   when: firewall_enabled | bool
 
-- name: Abilita ufw
+- name: Enable ufw
   community.general.ufw:
     state: enabled
   when: firewall_enabled | bool
 
-- name: Abilita il servizio ufw al boot
+- name: Enable the ufw service at boot
   ansible.builtin.systemd:
     name: ufw
     enabled: true

@@ -1,22 +1,20 @@
-# Installazione e primo utilizzo
+# Installation and first use
 
-Istruzioni pratiche per preparare con questo blueprint una macchina
-**Debian 13** o **Ubuntu 24.04**, sia un server (gestito da remoto via SSH)
-sia un laptop (eseguito in locale). I passi sono identici: cambia solo
-l'inventario.
+Practical steps for preparing a **Debian 13** or **Ubuntu 24.04** machine with
+this blueprint, either a server (managed remotely over SSH) or a laptop (run
+locally). The steps are identical; only the inventory differs.
 
-> Regola d'oro: prima sempre `--check --diff`, e per la prima applicazione
-> reale tieni aperta una console alternativa (secondo terminale, console
-> fisica/IPMI). Una configurazione errata di SSH o firewall può tagliare
-> l'accesso remoto.
+> Golden rule: always run `--check --diff` first, and for the first real
+> apply keep an alternate console open (second terminal, physical console or
+> IPMI). A misconfigured SSH or firewall can cut off remote access.
 
-## 1. Prerequisiti
+## 1. Prerequisites
 
-Sul computer di controllo (quello da cui lanci Ansible):
+On the control machine (the one you run Ansible from):
 
-- Linux o macOS, `git` e un client SSH.
-- Python 3.11+ e le versioni dichiarate dal progetto. Installazione in un
-  ambiente isolato:
+- Linux or macOS, `git`, and an SSH client.
+- Python 3.11+ and the versions declared by the project. Install in an
+  isolated environment:
 
   ```bash
   python3 -m venv .venv
@@ -24,34 +22,34 @@ Sul computer di controllo (quello da cui lanci Ansible):
   python3 -m pip install -r requirements-dev.txt
   ```
 
-Sull'host target:
+On the target host:
 
-- Debian 13 (trixie) o Ubuntu 24.04.
-- Un utente amministrativo con `sudo` e, per l'uso remoto, accesso SSH.
+- Debian 13 (trixie) or Ubuntu 24.04.
+- An admin user with `sudo` and, for remote use, SSH access.
 
-## 2. Clone del repository
+## 2. Clone the repository
 
 ```bash
 git clone https://github.com/Davidoneo/debian-server-blueprint.git
 cd debian-server-blueprint
 ```
 
-## 3. Dipendenze (collections)
+## 3. Dependencies (collections)
 
-Il playbook usa `community.general` e `ansible.posix`. Installa le versioni
-dichiarate:
+The playbook uses `community.general` and `ansible.posix`. Install the
+declared versions:
 
 ```bash
 ansible-galaxy collection install -r requirements.yml
 ```
 
-Per aggiornare/ricreare da zero: `ansible-galaxy collection install -r
+To update/recreate from scratch: `ansible-galaxy collection install -r
 requirements.yml --force`.
 
-## 4. Copia di inventory e group_vars
+## 4. Copy inventory and group_vars
 
-I file di esempio sono sicuri e non contengono dati reali. Copiali e
-personalizzali (i file reali sono in `.gitignore`, non finiscono in Git):
+The example files are safe and contain no real data. Copy and customize them
+(the real files are in `.gitignore`, they never reach Git):
 
 ```bash
 cp inventory/hosts.example inventory/hosts
@@ -60,92 +58,89 @@ $EDITOR inventory/hosts
 $EDITOR inventory/group_vars/all.yml
 ```
 
-- `inventory/hosts`: elenca i tuoi host, es.
+- `inventory/hosts`: lists your hosts, e.g.
   `server1.example.invalid ansible_host=192.0.2.10 ansible_user=deploy`.
-- `inventory/group_vars/all.yml`: tutte le variabili, già in versione
-  "safe" (server SSH, chiavi, firewall, hardening e Tailscale sono opt-in).
+- `inventory/group_vars/all.yml`: all variables, shipped in "safe" form
+  (SSH server, keys, firewall, hardening, and Tailscale are opt-in).
 
-## 5. Profilo laptop o server
+## 5. Laptop or server profile
 
-Imposta prima `blueprint_profile: laptop` oppure `server` nel file delle
-variabili.
+Set `blueprint_profile: laptop` or `server` first in the variables file.
 
-**Server o laptop remoto**: aggiungi l'host a `[managed]` con `ansible_host` e
-`ansible_user`, poi usa l'inventario reale:
+**Remote server or laptop**: add the host to `[managed]` with `ansible_host`
+and `ansible_user`, then use the real inventory:
 
 ```bash
 ansible-playbook -i inventory/hosts site.yml --check --diff
 ```
 
-**Laptop o server locale**: usa l'inventario locale fornito:
+**Local laptop or server**: use the provided local inventory:
 
 ```bash
 cp inventory/local.example inventory/hosts
 ansible-playbook -i inventory/hosts site.yml --check --diff -K
 ```
 
-Differenze pratiche da tenere presenti sul laptop:
+Practical differences to keep in mind on a laptop:
 
-- `sudo` potrebbe chiedere la password: usa `-K`/`--ask-become-pass`.
-- Il ruolo `firewall` limita il traffico in ingresso: su un laptop lascialo
-  disabilitato se non devi esporre servizi, oppure autorizza solo reti fidate.
-- `common_hostname`, timezone e unattended-upgrades valgono per entrambi i
-  profili; per un laptop valuta `common_unattended_upgrades_reboot: false`.
+- `sudo` may ask for a password: use `-K`/`--ask-become-pass`.
+- The `firewall` role restricts incoming traffic: leave it disabled on a
+  laptop unless you need to expose services, or allow only trusted networks.
+- `common_hostname`, timezone, and unattended-upgrades apply to both
+  profiles; on a laptop consider `common_unattended_upgrades_reboot: false`.
 
-## 6. Check mode (prova a secco)
+## 6. Check mode (dry run)
 
-Prima di ogni modifica reale, e comunque sempre alla prima run:
+Before any real change, and always on the first run:
 
 ```bash
 ansible-playbook -i inventory/hosts site.yml --check --diff
 ```
 
-Nessuna modifica viene applicata; `--diff` mostra cosa cambierebbe.
-Controlla che le preflight non falliscano e che i "changed" siano quelli
-attesi.
+No change is applied; `--diff` shows what would change. Make sure the
+preflight checks do not fail and the "changed" items are the expected ones.
 
-## 7. Applicazione per tag
+## 7. Applying by tag
 
-Il playbook applica di default solo il ruolo `common` (baseline sicura);
-Docker, firewall, hardening SSH e Tailscale sono opt-in espliciti. Per
-applicare un solo modulo:
+By default the playbook applies only the `common` role (safe baseline);
+Docker, firewall, SSH hardening, and Tailscale are explicit opt-ins. To apply
+a single module:
 
 ```bash
 ansible-playbook -i inventory/hosts site.yml --tags common
 ```
 
-Tag disponibili:
+Available tags:
 
-| Tag | Ruolo | Effetto |
+| Tag | Role | Effect |
 |---|---|---|
-| `common` | common | pacchetti base, timezone, locale, hostname, unattended-upgrades (opt-in) |
-| `ssh_access` | ssh_access | OpenSSH server e chiavi pubbliche fidate (opt-in) |
-| `docker` | docker | Docker Engine dal repo ufficiale + gruppo `docker` (opt-in) |
-| `ssh_hardening` | ssh_hardening | drop-in di hardening SSH (opt-in doppio, vedi `docs/SSH.md`) |
-| `firewall` | firewall | ufw con policy deny (opt-in doppio) |
-| `tailscale` | tailscale | installazione verificata; autenticazione manuale |
-| `baseline` | tutti | tutti i ruoli, con i loro opt-in |
+| `common` | common | base packages, timezone, locale, hostname, unattended-upgrades (opt-in) |
+| `ssh_access` | ssh_access | OpenSSH server and trusted public keys (opt-in) |
+| `docker` | docker | Docker Engine from the official repo + `docker` group (opt-in) |
+| `ssh_hardening` | ssh_hardening | SSH hardening drop-in (double opt-in, see `docs/SSH.md`) |
+| `firewall` | firewall | ufw with deny policy (double opt-in) |
+| `tailscale` | tailscale | verified install; manual auth |
+| `baseline` | all | all roles, with their opt-ins |
 
-Puoi limitare l'esecuzione a un host con `--limit server1.example.invalid`.
-Dopo un intervento parziale è possibile rieseguire lo stesso comando: il
-playbook è idempotente.
+You can restrict the run to one host with `--limit server1.example.invalid`.
+After a partial run you can re-run the same command: the playbook is
+idempotent.
 
-## 8. Rollback e sicurezza manuale
+## 8. Rollback and manual safety
 
-Il blueprint è pensato per non lasciare la macchina bloccata:
+The blueprint is designed not to lock the machine:
 
-- **Nessun file di sistema sovrascritto a caso**: l'hardening SSH genera un
-  *drop-in* in `/etc/ssh/sshd_config.d/` (il file principale non viene
-  toccato); il firewall usa ufw; Docker e Tailscale installano pacchetti
-  standard.
-- **Doppia conferma obbligatoria**: firewall e hardening SSH richiedono
-  `*_enabled=true` **e** `*_confirm=true`; le altre funzioni restano opt-in.
-- **Rollback manuale** (con accesso alla macchina):
-  - SSH: rimuovi `/etc/ssh/sshd_config.d/99-baseline-hardening.conf` e fai
+- **No system files overwritten at random**: SSH hardening generates a
+  *drop-in* in `/etc/ssh/sshd_config.d/` (the main file is untouched); the
+  firewall uses ufw; Docker and Tailscale install standard packages.
+- **Mandatory double confirmation**: firewall and SSH hardening require
+  `*_enabled=true` **and** `*_confirm=true`; the other features stay opt-in.
+- **Manual rollback** (with access to the machine):
+  - SSH: remove `/etc/ssh/sshd_config.d/99-baseline-hardening.conf` and run
     `systemctl reload ssh`.
   - Firewall: `sudo ufw disable`.
-  - Tailscale: `sudo tailscale down` se lo avevi autenticato manualmente.
-- Mantieni sempre un canale di accesso fuori banda e una seconda sessione
-  aperta mentre applichi modifiche a SSH/firewall.
-- Non committare mai inventory reale, `.env`, chiavi o token: usa Ansible
-  Vault o un secret manager con chiave di decifratura fuori dal repository.
+  - Tailscale: `sudo tailscale down` if you authenticated it manually.
+- Always keep an out-of-band access channel and a second session open while
+  applying SSH/firewall changes.
+- Never commit real inventory, `.env`, keys, or tokens: use Ansible Vault or
+  a secret manager with the decryption key outside the repository.

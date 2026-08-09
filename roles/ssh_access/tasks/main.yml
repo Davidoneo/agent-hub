@@ -1,11 +1,11 @@
 ---
-- name: SSH access | skip - disabilitato
+- name: SSH access | skip - disabled
   ansible.builtin.debug:
     msg: >-
-      ssh_access_enabled=false: nessuna chiave o servizio SSH viene modificato.
+      ssh_access_enabled=false: no key or SSH service is modified.
   when: not ssh_access_enabled | bool
 
-- name: SSH access | valida configurazione richiesta
+- name: SSH access | validate required configuration
   ansible.builtin.assert:
     that:
       - ssh_access_user is match('^[a-z_][a-z0-9_-]{0,31}$')
@@ -15,28 +15,28 @@
         reject('match', '^(ssh-ed25519|sk-ssh-ed25519@openssh.com) [A-Za-z0-9+/]+={0,3}( .*)?$') |
         list | length == 0
     fail_msg: >-
-      Specifica un utente esistente e almeno una chiave pubblica ed25519/FIDO
-      valida. Non inserire mai chiavi private nel repository o nelle variabili.
+      Specify an existing user and at least one valid ed25519/FIDO public key.
+      Never put private keys in the repository or in variables.
   when: ssh_access_enabled | bool
   no_log: true
 
-- name: SSH access | legge l'utente target
+- name: SSH access | read the target user
   ansible.builtin.getent:
     database: passwd
     key: "{{ ssh_access_user }}"
     fail_key: false
   when: ssh_access_enabled | bool
 
-- name: SSH access | richiede un utente target esistente
+- name: SSH access | require an existing target user
   ansible.builtin.assert:
     that:
       - ssh_access_user in (ansible_facts.getent_passwd | default({}))
     fail_msg: >-
-      L'utente {{ ssh_access_user }} non esiste. Crealo esplicitamente prima
-      del bootstrap SSH; questo ruolo non crea account amministrativi.
+      User {{ ssh_access_user }} does not exist. Create it explicitly before
+      the SSH bootstrap; this role does not create admin accounts.
   when: ssh_access_enabled | bool
 
-- name: SSH access | installa OpenSSH server
+- name: SSH access | install OpenSSH server
   ansible.builtin.apt:
     name: openssh-server
     state: present
@@ -44,7 +44,7 @@
     - ssh_access_enabled | bool
     - ssh_access_install_server | bool
 
-- name: SSH access | installa le chiavi pubbliche fidate
+- name: SSH access | install the trusted public keys
   ansible.posix.authorized_key:
     user: "{{ ssh_access_user }}"
     key: "{{ ssh_access_public_keys | join('\n') }}"
@@ -54,7 +54,7 @@
   when: ssh_access_enabled | bool
   no_log: true
 
-- name: SSH access | abilita il servizio SSH
+- name: SSH access | enable the SSH service
   ansible.builtin.systemd:
     name: ssh
     enabled: true

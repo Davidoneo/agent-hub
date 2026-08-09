@@ -3,7 +3,7 @@ galaxy_info:
   role_name: docker
   namespace: baseline
   author: debian-server-blueprint contributors
-  description: Installazione di Docker Engine da repository ufficiale (Debian 13 / Ubuntu) con configurazione opzionale del demone
+  description: Install Docker Engine from the official repository (Debian 13 / Ubuntu) with optional daemon configuration
   license: MIT
   min_ansible_version: "2.16"
   platforms:

@@ -1,41 +1,41 @@
-# Ruolo `firewall` (ufw) - STRICT OPT-IN
+# Role `firewall` (ufw) - STRICT OPT-IN
 
-Firewall tramite **ufw** per Debian 13 / Ubuntu.
+Firewall via **ufw** for Debian 13 / Ubuntu.
 
-> **ATTENZIONE**: attivare un firewall può interrompere SSH e la rete.
-> Per questo il ruolo è rigorosamente opt-in: di default non fa nulla.
+> **WARNING**: enabling a firewall can break SSH and networking.
+> For this reason the role is strictly opt-in: by default it does nothing.
 
-## Attivazione (richiede DUE variabili)
+## Enabling (requires TWO variables)
 
 ```yaml
 firewall_enabled: true
 firewall_confirm: true
 ```
 
-Le preflight si rifiutano di procedere se:
-- `firewall_enabled=true` senza `firewall_confirm=true`;
-- non esiste un percorso SSH tramite CIDR fidato, Tailscale, accesso globale o
-  una porta aggiuntiva esplicita.
+The preflight checks refuse to proceed if:
+- `firewall_enabled=true` without `firewall_confirm=true`;
+- there is no SSH path via trusted CIDR, Tailscale, global access, or an
+  explicit extra port.
 
-## Variabili principali
+## Main variables
 
-| Variabile | Default | Note |
+| Variable | Default | Notes |
 |---|---|---|
-| `firewall_enabled` | `false` | **opt-in** principale |
-| `firewall_confirm` | `false` | conferma esplicita (richiesta) |
-| `firewall_allow_ssh_from_anywhere` | `false` | consente SSH globalmente |
-| `firewall_ssh_port` | `22` | porta SSH da consentire |
-| `firewall_ssh_sources` | `[]` | CIDR sorgente fidati |
-| `firewall_allow_tailscale_ssh` | `false` | consente SSH su `tailscale0` |
-| `firewall_allow_ports` | `[]` | porte extra, formato `"porta/proto"` |
-| `firewall_default_incoming` | `deny` | policy di default in ingresso |
-| `firewall_default_outgoing` | `allow` | policy di default in uscita |
+| `firewall_enabled` | `false` | main **opt-in** |
+| `firewall_confirm` | `false` | explicit confirmation (required) |
+| `firewall_allow_ssh_from_anywhere` | `false` | allow SSH globally |
+| `firewall_ssh_port` | `22` | SSH port to allow |
+| `firewall_ssh_sources` | `[]` | trusted source CIDRs |
+| `firewall_allow_tailscale_ssh` | `false` | allow SSH on `tailscale0` |
+| `firewall_allow_ports` | `[]` | extra ports, format `"port/proto"` |
+| `firewall_default_incoming` | `deny` | default incoming policy |
+| `firewall_default_outgoing` | `allow` | default outgoing policy |
 
-## Raccomandazioni
+## Recommendations
 
-- Prima di attivare il firewall esegui sempre
-  `ansible-playbook site.yml --check` e verifica di avere un accesso fuori
-  banda (console, IPMI, Tailscale già attivo).
-- Interazione con Docker: le porte pubblicate dai container (flag `-p`)
-  passano dalle chain `DOCKER` di iptables e **bypassano ufw** di default.
-  Vedi `roles/docker/README.md`.
+- Before enabling the firewall always run
+  `ansible-playbook site.yml --check` and make sure you have out-of-band
+  access (console, IPMI, Tailscale already active).
+- Interaction with Docker: ports published by containers (`-p` flag) go
+  through the iptables `DOCKER` chains and **bypass ufw** by default. See
+  `roles/docker/README.md`.

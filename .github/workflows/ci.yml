@@ -1,8 +1,8 @@
 ---
 # CI GitHub Actions - debian-server-blueprint
 # Job:
-#   lint   -> ansible-lint (profilo configurato in .ansible-lint)
-#   syntax -> ansible-playbook --syntax-check sul playbook e sull'inventario
+#   lint   -> ansible-lint (profile configured in .ansible-lint)
+#   syntax -> ansible-playbook --syntax-check for playbook and inventory
 name: CI
 
 on:
@@ -24,11 +24,11 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-      - name: Installa Ansible e ansible-lint
+      - name: Install Ansible and ansible-lint
         run: pip install -r requirements-dev.txt
-      - name: Installa le collection
+      - name: Install collections
         run: ansible-galaxy collection install -r requirements.yml
-      - name: Esegue ansible-lint
+      - name: Run ansible-lint
         run: ansible-lint site.yml
 
   syntax:
@@ -41,11 +41,11 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-      - name: Installa Ansible
+      - name: Install Ansible
         run: pip install -r requirements-dev.txt
-      - name: Installa le collection
+      - name: Install collections
         run: ansible-galaxy collection install -r requirements.yml
-      - name: Syntax check del playbook e dell'inventario
+      - name: Check playbook and inventory syntax
         run: ansible-playbook --syntax-check -i inventory/hosts.example site.yml
       - name: Safety regression tests
         run: ansible-playbook -i localhost, -c local tests/safety.yml

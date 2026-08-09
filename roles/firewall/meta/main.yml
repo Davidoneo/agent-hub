@@ -3,7 +3,7 @@ galaxy_info:
   role_name: firewall
   namespace: baseline
   author: debian-server-blueprint contributors
-  description: Firewall ufw per Debian 13 / Ubuntu - STRICT OPT-IN con preflight e conferma esplicita
+  description: ufw firewall for Debian 13 / Ubuntu - STRICT OPT-IN with preflight and explicit confirmation
   license: MIT
   min_ansible_version: "2.16"
   platforms:

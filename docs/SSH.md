@@ -1,85 +1,84 @@
-# Accesso SSH: chiavi, bootstrap e hardening
+# SSH access: keys, bootstrap, and hardening
 
-Procedura consigliata per usare il blueprint senza mai chiudersi fuori dalla
-macchina. Tutti gli indirizzi, gli hostname e i commenti sono segnaposto
-(`example.invalid`, rete TEST-NET `192.0.2.0/24`): sostituiscili con i tuoi,
-ma non committare dati reali o chiavi private.
+Recommended procedure for using the blueprint without ever locking yourself
+out of the machine. All addresses, hostnames, and comments are placeholders
+(`example.invalid`, TEST-NET network `192.0.2.0/24`): replace them with
+yours, but never commit real data or private keys.
 
-## 1. Genera una chiave ed25519 su ciascuna macchina fidata
+## 1. Generate an ed25519 key on each trusted machine
 
-Sul computer di controllo **e su ogni laptop/PC che deve accedere** al
-server (mai condividere la chiave privata, e mai generare la chiave
-direttamente sul server):
+On the control machine **and on every laptop/PC that must access** the server
+(never share the private key, and never generate the key directly on the
+server):
 
 ```bash
-ssh-keygen -t ed25519 -a 100 -C "chiave-laptop-1@example.invalid"
+ssh-keygen -t ed25519 -a 100 -C "laptop-1-key@example.invalid"
 ```
 
-Consigli:
+Tips:
 
-- Accetta il percorso di default `~/.ssh/id_ed25519`; proteggila con una
-  passphrase (opzionale ma raccomandata).
-- Verifica i permessi: `chmod 600 ~/.ssh/id_ed25519`.
-- La chiave **pubblica** è `~/.ssh/id_ed25519.pub` (una riga che inizia con
-  `ssh-ed25519 AAAA...`). È l'unica cosa che deve uscire dalla macchina.
+- Accept the default path `~/.ssh/id_ed25519`; protect it with a passphrase
+  (optional but recommended).
+- Check the permissions: `chmod 600 ~/.ssh/id_ed25519`.
+- The **public** key is `~/.ssh/id_ed25519.pub` (one line starting with
+  `ssh-ed25519 AAAA...`). It is the only thing that should leave the machine.
 
-## 2. Inserisci le sole chiavi pubbliche in `ssh_access_public_keys`
+## 2. Put only public keys in `ssh_access_public_keys`
 
-In `inventory/group_vars/all.yml` (che non viene mai committato) definisci
-l'utente amministrativo e la **lista delle sole chiavi pubbliche**:
+In `inventory/group_vars/all.yml` (never committed) define the admin user and
+the **list of public keys only**:
 
 ```yaml
 ssh_access_enabled: true
 ssh_access_user: deploy
 ssh_access_install_server: true
 ssh_access_public_keys:
-  - "ssh-ed25519 AAAA... chiave-laptop-1@example.invalid"
-  - "ssh-ed25519 AAAA... chiave-laptop-2@example.invalid"
+  - "ssh-ed25519 AAAA... laptop-1-key@example.invalid"
+  - "ssh-ed25519 AAAA... laptop-2-key@example.invalid"
 ```
 
-Mai mettere qui una chiave privata. Il primo bootstrap usa il ruolo dedicato:
+Never put a private key here. First bootstrap uses the dedicated role:
 
 ```bash
 ansible-playbook -i inventory/hosts site.yml --tags ssh_access --check --diff
 ansible-playbook -i inventory/hosts site.yml --tags ssh_access
 ```
 
-Il comando è ripetibile: aggiungere una chiave alla lista e rilanciare è
-sicuro e idempotente.
+The command is repeatable: adding a key to the list and re-running is safe
+and idempotent.
 
-## 3. Primo bootstrap senza disabilitare la password
+## 3. First bootstrap without disabling the password
 
-L'hardening SSH è **disabilitato di default** (il login a password resta
-attivo). Ecco perché il primo accesso è sicuro:
+SSH hardening is **disabled by default** (password login stays active). This
+is why the first access is safe:
 
 ```bash
 ssh deploy@server1.example.invalid
 ```
 
-- Completa il passo 2 (installazione chiavi) **prima** di qualsiasi
-  hardening.
-- Verifica che l'autenticazione a chiave funzioni già in questa fase, mentre
-  la password è ancora attiva come "rete di sicurezza".
+- Complete step 2 (key installation) **before** any hardening.
+- Verify that key authentication already works at this stage, while the
+  password is still active as a "safety net".
 
-## 4. Test da secondo terminale
+## 4. Test from a second terminal
 
-Mai chiudere la sessione di lavoro prima di aver verificato tutto:
+Never close the working session before verifying everything:
 
-1. Lascia aperta la sessione del passo 3.
-2. Da un **secondo terminale** testa il login a chiave:
+1. Keep the session from step 3 open.
+2. From a **second terminal** test key login:
 
    ```bash
    ssh -i ~/.ssh/id_ed25519 deploy@server1.example.invalid
    ```
 
-3. Solo se il login a chiave funziona, procedi con l'hardening. Se qualcosa
-   va storto, la prima sessione è ancora aperta per il rollback.
+3. Only if key login works, proceed with hardening. If something goes wrong,
+   the first session is still open for rollback.
 
-## 5. Poi hardening e firewall
+## 5. Then hardening and firewall
 
-Attiva l'hardening SSH solo ora, con la doppia conferma richiesta dalle
-preflight e la lista `AllowUsers` compilata (obbligatoria quando le password
-vengono disabilitate):
+Enable SSH hardening only now, with the double confirmation required by the
+preflight checks and the `AllowUsers` list filled in (mandatory when passwords
+are disabled):
 
 ```yaml
 ssh_hardening_enabled: true
@@ -91,18 +90,18 @@ ssh_hardening_allow_users:
   - deploy
 ```
 
-Applica per tag:
+Apply by tag:
 
 ```bash
 ansible-playbook -i inventory/hosts site.yml --tags ssh_hardening --check --diff
 ansible-playbook -i inventory/hosts site.yml --tags ssh_hardening
 ```
 
-Il ruolo genera un drop-in convalidato con `sshd -t` e ricarica senza
-interrompere le sessioni attive (`state: reloaded`).
+The role generates a drop-in validated with `sshd -t` and reloads without
+interrupting active sessions (`state: reloaded`).
 
-**Firewall con CIDR fidato** (rete TEST-NET di esempio — sostituisci con la
-tua): consenti SSH soltanto dalla tua rete:
+**Firewall with trusted CIDR** (example TEST-NET network — replace with
+yours): allow SSH only from your network:
 
 ```yaml
 firewall_enabled: true
@@ -114,34 +113,34 @@ firewall_ssh_sources:
 firewall_allow_tailscale_ssh: false
 ```
 
-Applica il firewall per tag soltanto dopo avere verificato che l'indirizzo
-sorgente del client appartenga davvero al CIDR indicato:
+Apply the firewall by tag only after verifying that the client source address
+really belongs to the given CIDR:
 
 ```bash
 ansible-playbook -i inventory/hosts site.yml --tags firewall --check --diff
 ansible-playbook -i inventory/hosts site.yml --tags firewall
 ```
 
-**In alternativa: Tailscale** — se preferisci non aprire porte verso
-Internet, usa la rete Tailscale (range riservato `100.64.0.0/10`):
+**Alternatively: Tailscale** — if you prefer not to open ports to the
+Internet, use the Tailscale network (reserved range `100.64.0.0/10`):
 
-1. Installa Tailscale e poi autentica interattivamente il nodo:
+1. Install Tailscale, then authenticate the node interactively:
    ```bash
    ansible-playbook -i inventory/hosts site.yml --tags tailscale
    ssh deploy@server1.example.invalid
    sudo tailscale up
    ```
-2. Imposta `firewall_allow_tailscale_ssh: true` e lascia disabilitato
-   `firewall_allow_ssh_from_anywhere`; quindi applica UFW.
-3. Connettiti tramite nome MagicDNS o indirizzo Tailscale. L'hardening SSH
-   resta valido senza esporre globalmente la porta 22.
+2. Set `firewall_allow_tailscale_ssh: true` and keep
+   `firewall_allow_ssh_from_anywhere` disabled; then apply UFW.
+3. Connect via MagicDNS name or Tailscale address. SSH hardening stays valid
+   without exposing port 22 globally.
 
-Allinea sempre la porta SSH (`ssh_hardening_port`/`firewall_ssh_port`) tra i
-due ruoli: le preflight lo impongono.
+Always align the SSH port (`ssh_hardening_port`/`firewall_ssh_port`) between
+the two roles: the preflight checks enforce it.
 
-## 6. Esempio `~/.ssh/config` lato client
+## 6. Example client-side `~/.ssh/config`
 
-Per comodità, sul tuo computer di controllo:
+For convenience, on your control machine:
 
 ```
 Host server1
@@ -153,28 +152,28 @@ Host server1
     ServerAliveCountMax 3
 ```
 
-Poi basta `ssh server1`. Aggiungi `IdentitiesOnly yes` se hai più chiavi in
-agente.
+Then just `ssh server1`. Add `IdentitiesOnly yes` if you have multiple keys in
+the agent.
 
-## 7. Recovery da lockout
+## 7. Lockout recovery
 
-Se perdi l'accesso SSH (configurazione errata, chiavi perse, firewall):
+If you lose SSH access (misconfiguration, lost keys, firewall):
 
-1. Usa il canale fuori banda: console fisica, IPMI, seriale o (se attivo)
-   Tailscale.
-2. Accedi come utente con sudo o come root dalla console.
-3. Ripristina SSH: rimuovi il drop-in e ricarica il servizio:
+1. Use the out-of-band channel: physical console, IPMI, serial, or (if
+   enabled) Tailscale.
+2. Log in as a sudo user or as root from the console.
+3. Restore SSH: remove the drop-in and reload the service:
    ```bash
    sudo mv /etc/ssh/sshd_config.d/99-baseline-hardening.conf \
      /etc/ssh/sshd_config.d/99-baseline-hardening.conf.disabled
    sudo systemctl reload ssh
    ```
-4. Se il blocco è il firewall: `sudo ufw disable` (poi riapplica il
-   blueprint con un CIDR corretto).
-5. Verifica da un nuovo terminale con `ssh -v server1` prima di chiudere la
+4. If the firewall is the blocker: `sudo ufw disable` (then re-apply the
+   blueprint with a correct CIDR).
+5. Verify from a new terminal with `ssh -v server1` before closing the
    console.
 
-**Prevenzione** (il modo migliore): almeno due chiavi pubbliche valide in
-`ssh_access_public_keys` (es. due laptop o una chiave hardware), test da secondo terminale
-prima di ogni hardening, drop-in di backup del file di configurazione, e
-sessioni di lavoro aperte durante le modifiche.
+**Prevention** (the best way): at least two valid public keys in
+`ssh_access_public_keys` (e.g. two laptops or a hardware key), a test from a
+second terminal before every hardening, a backup of the config file drop-in,
+and working sessions left open during changes.

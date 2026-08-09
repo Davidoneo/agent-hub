@@ -1,5 +1,5 @@
 ---
-# Ruolo: tailscale - sola installazione; autenticazione interattiva separata
+# Role: tailscale - install only; interactive auth handled separately
 # Documentation in roles/tailscale/README.md
 
 tailscale_install: false

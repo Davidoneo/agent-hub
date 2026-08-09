@@ -1,11 +1,11 @@
 ---
-# Ruolo: common - baseline di base per Debian 13 / Ubuntu
+# Role: common - base baseline for Debian 13 / Ubuntu
 # Documentation in roles/common/README.md
 
-# Profilo effettivo; blueprint_profile è la variabile pubblica globale.
+# Effective profile; blueprint_profile is the public global variable.
 common_profile: "{{ blueprint_profile | default('laptop') }}"
 
-# --- pacchetti base ---
+# --- base packages ---
 common_base_packages:
   - ca-certificates
   - curl
@@ -32,14 +32,14 @@ common_packages: >-
 common_apt_update_cache: true
 common_apt_autoremove: false
 
-# --- sistema ---
+# --- system ---
 common_manage_timezone: false
 common_timezone: "Etc/UTC"
 common_manage_locale: false
 common_locale: "C.UTF-8"
 common_hostname: ""
 
-# --- OPT-IN: aggiornamenti automatici ---
+# --- OPT-IN: automatic updates ---
 common_unattended_upgrades: false
 common_unattended_upgrades_reboot: false
 common_unattended_upgrades_auto_reboot_time: "02:00"

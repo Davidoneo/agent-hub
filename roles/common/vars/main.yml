@@ -1,4 +1,4 @@
 ---
-# Ruolo: common - preflight e variabili derivate
-# (nessuna variabile derivata per ora: la mappatura distro->repo
-#  vive nei ruoli che la usano, es. docker/tailscale)
+# Role: common - preflight and derived variables
+# (no derived variables for now: the distro->repo mapping
+#  lives in the roles that use it, e.g. docker/tailscale)

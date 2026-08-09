@@ -1,22 +1,22 @@
-# Ruolo `tailscale`
+# Role `tailscale`
 
-Installa Tailscale dal repository ufficiale (`pkgs.tailscale.com`) dopo avere
-verificato il fingerprint della chiave. Non unisce il nodo alla rete.
+Installs Tailscale from the official repository (`pkgs.tailscale.com`) after
+verifying the key fingerprint. It does not join the node to the network.
 
-L'autenticazione resta deliberatamente fuori da Ansible per evitare auth key
-in argv, log o shell history. Dopo il playbook eseguire interattivamente:
+Authentication is deliberately kept out of Ansible to avoid auth keys in
+argv, logs, or shell history. After the playbook, run interactively:
 
 ```bash
 sudo tailscale up
 ```
 
-## Variabili principali
+## Main variables
 
-| Variabile | Default | Note |
+| Variable | Default | Notes |
 |---|---|---|
-| `tailscale_install` | `false` | opt-in: installa pacchetto e servizio |
+| `tailscale_install` | `false` | opt-in: install package and service |
 
-## Note
+## Notes
 
-- Configurare rotte, exit node e Tailscale SSH soltanto dopo aver verificato
-  l'accesso base e le policy della propria rete.
+- Configure routes, exit nodes, and Tailscale SSH only after verifying the
+  base access and your network's policies.

@@ -1,5 +1,5 @@
 ---
-# Bootstrap dell'accesso SSH con chiavi pubbliche di macchine fidate.
+# SSH access bootstrap with public keys from trusted machines.
 ssh_access_enabled: false
 ssh_access_user: ""
 ssh_access_install_server: true

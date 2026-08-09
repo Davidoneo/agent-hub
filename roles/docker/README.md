@@ -1,29 +1,31 @@
-# Ruolo `docker`
+# Role `docker`
 
-Installa Docker Engine dal repository ufficiale (`download.docker.com`),
-senza ricorrere a `curl | sh`: la chiave GPG viene scaricata via `get_url`
-e il repository apt viene aggiunto con `deb822_repository`. Il fingerprint
-della chiave viene verificato prima di fidarsi del repository.
+Installs Docker Engine from the official repository
+(`download.docker.com`), without relying on `curl | sh`: the GPG key is
+downloaded via `get_url` and the apt repository is added with
+`deb822_repository`. The key fingerprint is verified before trusting the
+repository.
 
-## Variabili principali
+## Main variables
 
-| Variabile | Default | Note |
+| Variable | Default | Notes |
 |---|---|---|
-| `docker_install` | `false` | opt-in: installa Docker Engine |
-| `docker_repo_channel` | `stable` | canale del repository |
-| `docker_packages` | docker-ce, cli, containerd, buildx, compose | pacchetti installati |
-| `docker_users` | `[]` | utenti da aggiungere al gruppo `docker` (**opt-in**) |
+| `docker_install` | `false` | opt-in: install Docker Engine |
+| `docker_repo_channel` | `stable` | repository channel |
+| `docker_packages` | docker-ce, cli, containerd, buildx, compose | packages installed |
+| `docker_users` | `[]` | users to add to the `docker` group (**opt-in**) |
 | `docker_daemon_config` | `{}` | dict -> `/etc/docker/daemon.json` (**opt-in**) |
 
-## Sicurezza e note
+## Security and notes
 
-- Il demone ascolta sul socket Unix `/var/run/docker.sock` (default sicuro).
-  Non esporre mai il socket TCP senza autenticazione.
-- Aggiungere un utente al gruppo `docker` equivale a dargli root: lascia
-  `docker_users` vuoto se non serve.
-- Se usi il firewall (ufw), tieni presente che le porte pubblicate dai
-  container (flag `-p`) passano dalle chain iptables `DOCKER` e **bypassano
-  ufw** nelle configurazioni predefinite. Per un isolamento reale valuta
-  `iptables: false` nel `docker_daemon_config` oppure backend nftables.
-- `docker_daemon_config` vuoto non tocca `/etc/docker/daemon.json` esistente:
-  se in un run precedente era stato generato, gestiscilo a parte.
+- The daemon listens on the Unix socket `/var/run/docker.sock` (safe default).
+  Never expose the TCP socket without authentication.
+- Adding a user to the `docker` group is equivalent to giving them root:
+  leave `docker_users` empty if not needed.
+- If you use the firewall (ufw), note that ports published by containers
+  (`-p` flag) go through the iptables `DOCKER` chains and **bypass ufw** in
+  default configurations. For real isolation consider `iptables: false` in
+  `docker_daemon_config` or an nftables backend.
+- An empty `docker_daemon_config` does not touch an existing
+  `/etc/docker/daemon.json`: if one was generated in a previous run, manage
+  it separately.

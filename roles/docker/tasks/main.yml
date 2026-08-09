@@ -1,30 +1,30 @@
 ---
-# Ruolo: docker - task principali
-# Installazione da repository ufficiale (download.docker.com).
-# NOTA: nessun `curl | sh`: la chiave GPG viene scaricata via get_url.
+# Role: docker - main tasks
+# Installation from the official repository (download.docker.com).
+# NOTE: no `curl | sh`: the GPG key is downloaded via get_url.
 
 # ------------------------------------------------------------
 # Preflight
 # ------------------------------------------------------------
-- name: Preflight | sistema operativo supportato (Docker)
+- name: Preflight | supported operating system (Docker)
   ansible.builtin.assert:
     that:
       - ansible_facts.os_family == "Debian"
       - ansible_facts.distribution in ["Debian", "Ubuntu"]
     fail_msg: >-
-      Ruolo 'docker' supporta solo Debian e Ubuntu.
-      Rilevato: {{ ansible_facts.distribution }}
+      Role 'docker' supports only Debian and Ubuntu.
+      Detected: {{ ansible_facts.distribution }}
       {{ ansible_facts.distribution_version }}.
 
-- name: Preflight | skip installazione richiesta
+- name: Preflight | installation not requested
   ansible.builtin.debug:
-    msg: "docker_install=false: il ruolo non modifica nulla."
+    msg: "docker_install=false: the role changes nothing."
   when: not docker_install | bool
 
 # ------------------------------------------------------------
-# Repository ufficiale Docker (apt)
+# Official Docker repository (apt)
 # ------------------------------------------------------------
-- name: Installa dipendenze per il repository
+- name: Install repository dependencies
   ansible.builtin.apt:
     name:
       - ca-certificates
@@ -34,27 +34,27 @@
     state: present
   when: docker_install | bool
 
-- name: Crea directory dei keyring
+- name: Create the keyrings directory
   ansible.builtin.file:
     path: /etc/apt/keyrings
     state: directory
     mode: "0755"
   when: docker_install | bool
 
-- name: Scarica la chiave GPG ufficiale di Docker
+- name: Download the official Docker GPG key
   ansible.builtin.get_url:
     url: "https://download.docker.com/linux/{{ docker_distro_slug }}/gpg"
     dest: "{{ docker_keyring_path }}"
     mode: "0644"
   when: docker_install | bool
 
-- name: Controlla la presenza della chiave Docker
+- name: Check for the presence of the Docker key
   ansible.builtin.stat:
     path: "{{ docker_keyring_path }}"
   register: docker_keyring_file
   when: docker_install | bool
 
-- name: Verifica il fingerprint della chiave Docker
+- name: Verify the Docker key fingerprint
   ansible.builtin.command:
     argv:
       - gpg
@@ -69,17 +69,17 @@
     - docker_install | bool
     - docker_keyring_file.stat.exists | bool
 
-- name: Rifiuta una chiave Docker inattesa
+- name: Reject an unexpected Docker key
   ansible.builtin.assert:
     that:
       - docker_key_fingerprint in docker_key_inspection.stdout
     fail_msg: >-
-      Fingerprint della chiave Docker inatteso: repository non configurato.
+      Unexpected Docker key fingerprint: repository not configured.
   when:
     - docker_install | bool
     - docker_keyring_file.stat.exists | bool
 
-- name: Aggiunge il repository apt di Docker
+- name: Add the Docker apt repository
   ansible.builtin.deb822_repository:
     name: docker
     types: [deb]
@@ -91,15 +91,15 @@
   when: docker_install | bool
 
 # ------------------------------------------------------------
-# Installazione pacchetti
+# Package installation
 # ------------------------------------------------------------
-- name: Installa i pacchetti Docker
+- name: Install the Docker packages
   ansible.builtin.apt:
     name: "{{ docker_packages }}"
     state: present
   when: docker_install | bool
 
-- name: Avvia e abilita il servizio Docker
+- name: Start and enable the Docker service
   ansible.builtin.systemd:
     name: docker
     enabled: true
@@ -107,9 +107,9 @@
   when: docker_install | bool
 
 # ------------------------------------------------------------
-# Utenti nel gruppo docker (OPT-IN: lista vuota di default)
+# Users in the docker group (OPT-IN: empty list by default)
 # ------------------------------------------------------------
-- name: Aggiunge utenti al gruppo docker
+- name: Add users to the docker group
   ansible.builtin.user:
     name: "{{ item }}"
     groups: docker
@@ -120,9 +120,9 @@
     - docker_users | length > 0
 
 # ------------------------------------------------------------
-# Configurazione del demone (OPT-IN via docker_daemon_config)
+# Daemon configuration (OPT-IN via docker_daemon_config)
 # ------------------------------------------------------------
-- name: Genera /etc/docker/daemon.json
+- name: Generate /etc/docker/daemon.json
   ansible.builtin.copy:
     content: "{{ docker_daemon_config | to_nice_json }}\n"
     dest: /etc/docker/daemon.json
@@ -132,4 +132,4 @@
   when:
     - docker_install | bool
     - docker_daemon_config | length > 0
-  notify: Riavvia Docker
+  notify: Restart Docker

@@ -1,26 +1,26 @@
 # ============================================================
-# group_vars/all.example.yml - Variabili di esempio (SICURE).
+# group_vars/all.example.yml - Example variables (SAFE).
 #
-# Copia questo file in `inventory/group_vars/all.yml` e
-# personalizza. I default seguenti sono tutti "safe":
-# - le azioni che possono interrompere SSH/rete (firewall e
-#   ssh_hardening) sono DISABILITATE;
-# - per attivarle servono SEMPRE due variabili: quella di
-#   abilitazione E quella di conferma (vedi sotto).
+# Copy this file to `inventory/group_vars/all.yml` and
+# customize. The defaults below are all "safe":
+# - actions that could break SSH/networking (firewall and
+#   ssh_hardening) are DISABLED;
+# - enabling them ALWAYS requires two variables: the
+#   enabling one AND the confirmation one (see below).
 #
-# Nessun dato reale o segreto: le chiavi/authkey vanno passate
-# a runtime (extra-vars, vault o ambiente), mai nel repository.
+# No real data or secrets: keys/authkeys must be provided at
+# runtime (extra-vars, vault, or environment), never in the repository.
 # ============================================================
 
 # ------------------------------------------------------------
-# profilo: laptop oppure server
+# profile: laptop or server
 # ------------------------------------------------------------
 blueprint_profile: laptop
 
 # ------------------------------------------------------------
 # common
 # ------------------------------------------------------------
-# Pacchetti base installati (lista espandibile).
+# Base packages installed (expandable list).
 common_base_packages:
   - ca-certificates
   - curl
@@ -32,15 +32,15 @@ common_base_packages:
   - unzip
   - vim
 
-common_apt_update_cache: true   # aggiorna la cache apt prima di installare
-common_apt_autoremove: false    # rimuove i pacchetti orfani
-common_manage_timezone: false   # true per modificare il fuso orario
+common_apt_update_cache: true   # refresh the apt cache before installing
+common_apt_autoremove: false    # remove orphan packages
+common_manage_timezone: false   # true to change the timezone
 common_timezone: "Etc/UTC"
-common_manage_locale: false     # true per generare il locale indicato
+common_manage_locale: false     # true to generate the given locale
 common_locale: "C.UTF-8"
-common_hostname: ""             # hostname da impostare (vuoto = non toccare)
+common_hostname: ""             # hostname to set (empty = leave as-is)
 
-# OPT-IN: aggiornamenti di sicurezza automatici
+# OPT-IN: automatic security updates
 common_unattended_upgrades: false
 common_unattended_upgrades_reboot: false
 common_unattended_upgrades_auto_reboot_time: "02:00"
@@ -48,7 +48,7 @@ common_unattended_upgrades_auto_reboot_time: "02:00"
 # ------------------------------------------------------------
 # docker
 # ------------------------------------------------------------
-docker_install: false           # opt-in: installa Docker Engine dal repo ufficiale
+docker_install: false           # opt-in: install Docker Engine from the official repo
 docker_repo_channel: stable
 docker_packages:
   - docker-ce
@@ -56,39 +56,39 @@ docker_packages:
   - containerd.io
   - docker-buildx-plugin
   - docker-compose-plugin
-docker_users: []                # utenti da aggiungere al gruppo `docker`
-docker_daemon_config: {}        # dict -> genera /etc/docker/daemon.json (vuoto = nessun file)
+docker_users: []                # users to add to the `docker` group
+docker_daemon_config: {}        # dict -> generates /etc/docker/daemon.json (empty = no file)
 
 # ------------------------------------------------------------
-# accesso SSH da macchine fidate - STRICT OPT-IN
+# SSH access from trusted machines - STRICT OPT-IN
 # ------------------------------------------------------------
 ssh_access_enabled: false
-ssh_access_user: ""              # utente gia esistente sul target
-ssh_access_install_server: true  # installa/avvia openssh-server se abilitato
-ssh_access_public_keys: []       # SOLO chiavi pubbliche ed25519/FIDO
-ssh_access_exclusive: false      # true rimuove le chiavi non elencate
+ssh_access_user: ""              # user already existing on the target
+ssh_access_install_server: true  # install/start openssh-server if enabled
+ssh_access_public_keys: []       # ed25519/FIDO PUBLIC keys ONLY
+ssh_access_exclusive: false      # true removes keys not listed
 
 # ------------------------------------------------------------
 # firewall (ufw) - STRICT OPT-IN
 # ------------------------------------------------------------
-# Per abilitare servono ENTRAMBE:
+# Enabling requires BOTH:
 #   firewall_enabled: true
 #   firewall_confirm: true
 firewall_enabled: false
 firewall_confirm: false
 firewall_allow_ssh_from_anywhere: false
 firewall_ssh_port: 22
-firewall_ssh_sources: []        # CIDR fidati, es. ["192.0.2.0/24"]
+firewall_ssh_sources: []        # trusted CIDRs, e.g. ["192.0.2.0/24"]
 firewall_allow_tailscale_ssh: false
-firewall_allow_ports: []        # porte extra in ingresso, formato "porta/proto"
-                                # es. ["2375/tcp", "8080/tcp"]
+firewall_allow_ports: []        # extra incoming ports, format "port/proto"
+                                # e.g. ["2375/tcp", "8080/tcp"]
 firewall_default_incoming: deny
 firewall_default_outgoing: allow
 
 # ------------------------------------------------------------
 # ssh_hardening - STRICT OPT-IN
 # ------------------------------------------------------------
-# Per abilitare servono ENTRAMBE:
+# Enabling requires BOTH:
 #   ssh_hardening_enabled: true
 #   ssh_hardening_confirm: true
 ssh_hardening_enabled: false
@@ -107,12 +107,12 @@ ssh_hardening_allow_tcp_forwarding: "no"
 ssh_hardening_client_alive_interval: 300
 ssh_hardening_client_alive_count_max: 3
 ssh_hardening_allow_users: []
-# IMPORTANTE: con ssh_hardening_password_auth=false la variabile
-# ssh_hardening_allow_users DEVE elencare gli utenti abilitati,
-# per evitare di chiudersi fuori dalla macchina.
-ssh_hardening_service_action: reloaded   # "reloaded" (sicuro) o "restarted"
+# IMPORTANT: with ssh_hardening_password_auth=false the variable
+# ssh_hardening_allow_users MUST list the enabled users,
+# to avoid locking yourself out of the machine.
+ssh_hardening_service_action: reloaded   # "reloaded" (safe) or "restarted"
 
 # ------------------------------------------------------------
-# tailscale - installazione base; autenticazione manuale
+# tailscale - base install; manual authentication
 # ------------------------------------------------------------
 tailscale_install: false
