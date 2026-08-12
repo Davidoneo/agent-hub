@@ -1,0 +1,1565 @@
+#!/usr/bin/env python3
+"""Agent Hub session wrapper.
+
+Root-owned, eseguito tramite sudo come `devagent` o `hostagent` dal servizio
+Agent Hub (che gira come account di servizio). Prende argomenti strutturati e ricava il
+comando da /etc/agent-hub/profiles.json: non e' una shell API generica.
+
+Persistenza delle sessioni
+--------------------------
+Le sessioni NON devono morire quando `agent-hub.service` viene riavviato.
+Per ottenerlo il server tmux non viene mai avviato dal processo che arriva da
+sudo (che eredita il cgroup di agent-hub.service) ma dall'unit systemd *utente*
+`agent-hub-tmux.service`, che vive in
+`/user.slice/user-<uid>.slice/user@<uid>.service`. Le sessioni create dopo sono
+figlie di quel server, quindi restano fuori dal cgroup del servizio web.
+Il socket dedicato e' `agenthub` (`tmux -L agenthub`).
+"""
+import fcntl
+import json
+import os
+import pwd
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+PROFILES = "/etc/agent-hub/profiles.json"
+TMUX_CONF = "/etc/agent-hub/tmux.conf"
+
+
+def _cfg(key, default):
+    """Legge una chiave da config.env. I wrapper sono invocati con `sudo -n -u`,
+    che filtra l'ambiente: non possono ereditare le variabili del servizio."""
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+PROJECT_UNIX_USER = _cfg("AGENT_HUB_PROJECT_USER", "projectagent")
+SERVER_UNIX_USER = _cfg("AGENT_HUB_SERVER_USER", "serveragent")
+
+TMUX_SOCKET = "agenthub"
+TMUX_UNIT = "agent-hub-tmux.service"
+LOG_DIR = "/srv/agent-workspace/logs"
+PROJECT_ROOT = "/srv/agent-workspace/projects"
+UPLOAD_ROOT = "/srv/agent-workspace/uploads"
+SESSION_RE = re.compile(r"^agenthub-[0-9a-f-]{6,40}$")
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+INPUT_DIRS = ("/run/agent-hub/", "/tmp/agent-hub-")
+RATE_LIMIT_TITLE = "Approaching rate limits"
+RATE_LIMIT_QUESTION = "for lower credit usage?"
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def me():
+    return pwd.getpwuid(os.getuid())
+
+
+def base_env():
+    u = me()
+    rt = f"/run/user/{u.pw_uid}"
+    env = {
+        "HOME": u.pw_dir,
+        "USER": u.pw_name,
+        "LOGNAME": u.pw_name,
+        "SHELL": "/bin/bash",
+        "PATH": f"{u.pw_dir}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        "TERM": "xterm-256color",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "COLORTERM": "truecolor",
+        # necessari per parlare con il manager systemd dell'utente
+        "XDG_RUNTIME_DIR": rt,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={rt}/bus",
+    }
+    if u.pw_name == PROJECT_UNIX_USER:
+        env["DOCKER_HOST"] = f"unix://{rt}/docker.sock"
+    return env
+
+
+def load_profiles():
+    with open(PROFILES) as fh:
+        return {p["id"]: p for p in json.load(fh)["profiles"]}
+
+
+def check_session(name):
+    if not SESSION_RE.match(name):
+        die(f"nome sessione non valido: {name}")
+    return name
+
+
+# ------------------------------------------------------------ server tmux
+
+def tmux(*args, env=None, check=False, capture=True):
+    cmd = ["tmux", "-L", TMUX_SOCKET, *args]
+    return subprocess.run(cmd, env=env or base_env(), check=check,
+                          capture_output=capture, text=True)
+
+
+def ensure_server(env):
+    """Avvia il server tmux dentro l'unit systemd utente, se non gira gia'.
+
+    E' questo il punto che disaccoppia le sessioni dal cgroup di
+    agent-hub.service: il processo tmux viene creato dal manager systemd
+    dell'utente, non dalla catena sudo che arriva dal servizio web.
+    """
+    r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", TMUX_UNIT], env=env)
+    if r.returncode == 0:
+        return
+    r = subprocess.run(["systemctl", "--user", "start", TMUX_UNIT],
+                       env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        die("avvio del server tmux fallito: " + (r.stderr or r.stdout).strip(), 3)
+    # attende che il socket risponda: `list-sessions` esce 1 con "no server
+    # running" finche' il server non e' su, 0 (o 1 con messaggio vuoto) dopo.
+    for _ in range(60):
+        r = tmux("list-sessions", env=env)
+        if r.returncode == 0 or "no server" not in (r.stderr or "").lower():
+            return
+        time.sleep(0.1)
+    die("il server tmux non risponde dopo l'avvio dell'unit", 3)
+
+
+def check_workdir(path, environment):
+    path = os.path.realpath(path)
+    if not os.path.isdir(path):
+        die(f"directory inesistente: {path}")
+    if environment == "PROJECT":
+        root = os.path.realpath(PROJECT_ROOT)
+        if path != root and not path.startswith(root + os.sep):
+            die(f"le sessioni PROJECT sono limitate a {root}")
+    return path
+
+
+def env_args(env):
+    """Variabili da iniettare nella sessione: il server tmux ha un env minimo."""
+    out = []
+    for k, v in env.items():
+        out += ["-e", f"{k}={v}"]
+    return out
+
+
+# ---------------------------------------------------------------- commands
+
+def ensure_trusted(prof, workdir):
+    """Registra la directory come fidata nel file di configurazione dell'harness.
+
+    Idempotente e protetta da lock: due sessioni avviate insieme non possono
+    scrivere due volte la stessa sezione (che renderebbe il TOML invalido).
+    Se il profilo non dichiara `trust_config` non fa nulla.
+    """
+    spec = prof.get("trust_config") or {}
+    path = spec.get("file")
+    if not path:
+        return
+    path = os.path.expanduser(path.replace("~", me().pw_dir, 1))
+    section = str(spec.get("section", "")).replace("{workdir}", workdir)
+    body = str(spec.get("body", ""))
+    if not section or not body:
+        return
+    header = f"[{section}]"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            fh.seek(0)
+            current = fh.read()
+            if header in current:
+                return
+            if current and not current.endswith("\n"):
+                fh.write("\n")
+            fh.write(f"\n{header}\n{body}\n")
+    except OSError:
+        pass  # la TUI mostrera' il dialogo: nessun danno, solo un clic in piu'
+
+
+def effort_args(prof, effort):
+    """Argomenti CLI che impostano il livello di effort, secondo il profilo.
+
+    Il profilo dichiara `effort_arg`: se un elemento contiene `{value}` il
+    valore viene sostituito li' dentro (Codex usa `-c chiave=valore`),
+    altrimenti viene aggiunto come argomento successivo (Claude Code usa
+    `--effort <livello>`). Il livello e' sempre confrontato con la lista
+    chiusa `effort_levels`: nessun valore arbitrario raggiunge la CLI.
+    """
+    if not effort:
+        return []
+    if not prof.get("supports_effort"):
+        die("questo profilo non supporta la selezione dell'effort")
+    if effort not in (prof.get("effort_levels") or []):
+        die(f"livello di effort non valido per {prof['id']}: {effort}")
+    spec = prof.get("effort_arg") or []
+    if not spec:
+        die("il profilo dichiara supports_effort ma non effort_arg")
+    if any("{value}" in str(a) for a in spec):
+        return [str(a).replace("{value}", effort) for a in spec]
+    return [*[str(a) for a in spec], effort]
+
+
+def cmd_start(argv):
+    """start <session> <env> <workdir> <profile> <perm> <cols> <rows> [model] [prompt-file] [prompt-mode] [effort] [harness-session-id] [executor-enabled] [executor-model] [executor-max]
+
+    prompt-mode: `argv` (prompt come argomento della CLI) oppure `paste`
+    (consegna successiva via `deliver`). Stampa un JSON con l'esito.
+
+    `harness-session-id` viene passato alla CLI solo se il profilo dichiara
+    `session_id_arg`: e' cio' che rende deterministico il percorso del file di
+    stato dell'harness e quindi leggibile il modello realmente in uso.
+    """
+    if len(argv) < 7:
+        die("uso: start <session> <env> <workdir> <profile> <perm> <cols> <rows> "
+            "[model] [prompt-file] [prompt-mode] [effort] [harness-session-id] "
+            "[executor-enabled] [executor-model] [executor-max]")
+    name = check_session(argv[0])
+    environment = argv[1]
+    if environment not in ("PROJECT", "SERVER"):
+        die("environment deve essere PROJECT o SERVER")
+    workdir = check_workdir(argv[2], environment)
+    profiles = load_profiles()
+    prof = profiles.get(argv[3]) or die(f"profilo sconosciuto: {argv[3]}")
+    perm = argv[4]
+    if perm not in prof.get("permission_modes", {}):
+        die(f"modalita' permessi non valida: {perm}")
+    try:
+        cols, rows = max(40, int(argv[5])), max(10, int(argv[6]))
+    except ValueError:
+        die("cols/rows devono essere numeri")
+    model = argv[7] if len(argv) > 7 else ""
+    prompt_file = argv[8] if len(argv) > 8 else ""
+    prompt_mode = (argv[9] if len(argv) > 9 else "paste") or "paste"
+    effort = argv[10] if len(argv) > 10 else ""
+    harness_sid = argv[11] if len(argv) > 11 else ""
+    executor_enabled = argv[12] if len(argv) > 12 else "0"
+    executor_model = argv[13] if len(argv) > 13 else ""
+    executor_max = argv[14] if len(argv) > 14 else "0"
+    if effort and not re.fullmatch(r"[a-z]{1,16}", effort):
+        die("livello di effort non valido")
+    if harness_sid and not UUID_RE.fullmatch(harness_sid):
+        die("harness-session-id non valido: atteso un UUID")
+    if executor_enabled not in ("0", "1"):
+        die("executor-enabled deve essere 0 o 1")
+    if executor_enabled == "1":
+        if not re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,79}$", executor_model):
+            die("executor-model non valido")
+        try:
+            executor_limit = int(executor_max)
+        except ValueError:
+            die("executor-max non valido")
+        if not 1 <= executor_limit <= 4:
+            die("executor-max deve essere compreso tra 1 e 4")
+    else:
+        executor_model, executor_max = "", "0"
+
+    user = me().pw_name
+    if user not in prof.get("allowed_users", []):
+        die(f"il profilo {prof['id']} non e' consentito per {user}")
+
+    prompt = ""
+    if prompt_file:
+        if not any(prompt_file.startswith(p) for p in INPUT_DIRS):
+            die("percorso del file di prompt non consentito")
+        try:
+            with open(prompt_file, encoding="utf-8", errors="replace") as fh:
+                prompt = fh.read()
+        except OSError as exc:
+            die(f"file di prompt illeggibile: {exc}")
+
+    cmd = [prof["command"], *prof.get("args", []), *prof["permission_modes"][perm]]
+    # Alcune TUI (Codex) aprono un dialogo di fiducia sulla directory prima di
+    # accettare qualsiasi input, in ogni modalita' permessi. Il profilo dichiara
+    # dove registrare la fiducia; la voce viene scritta con quoting TOML
+    # corretto, quindi regge anche gli slug che contengono un punto.
+    ensure_trusted(prof, workdir)
+    if model:
+        if not prof.get("supports_model"):
+            die("questo profilo non supporta la selezione del modello")
+        if not re.match(r"^[A-Za-z0-9._/:-]{1,80}$", model):
+            die("nome modello non valido")
+        cmd += [*(prof.get("model_arg") or []), model]
+    cmd += effort_args(prof, effort)
+    used_harness_sid = ""
+    if harness_sid and prof.get("session_id_arg"):
+        cmd += [*prof["session_id_arg"], harness_sid]
+        used_harness_sid = harness_sid
+    if prof.get("workdir_arg"):
+        cmd += [*prof["workdir_arg"], workdir]
+
+    delivered_via_argv = False
+    if prompt.strip() and prompt_mode == "argv":
+        spec = prof.get("prompt_arg") or {}
+        if spec.get("mode") == "flag" and spec.get("flag"):
+            cmd += [spec["flag"], prompt]
+            delivered_via_argv = True
+        elif spec.get("mode") == "positional":
+            cmd += [prompt]
+            delivered_via_argv = True
+
+    env = base_env()
+    for k, v in (prof.get("env") or {}).items():
+        env[str(k)] = str(v)
+    env["AGENT_HUB_SESSION"] = name
+    env["AGENT_HUB_SESSION_ID"] = name[len("agenthub-"):]
+    env["AGENT_HUB_ENVIRONMENT"] = environment
+    env["AGENT_HUB_EXECUTOR_ENABLED"] = executor_enabled
+    env["AGENT_HUB_EXECUTOR_MODEL"] = executor_model
+    env["AGENT_HUB_EXECUTOR_MAX_AGENTS"] = executor_max
+
+    ensure_server(env)
+
+    logfile = os.path.join(LOG_DIR, f"{name}.log")
+    # un restart riusa lo stesso nome: la trascrizione della run precedente
+    # non deve sopravvivere alla nuova
+    for stale in (f"{name}.transcript.txt",):
+        try:
+            os.unlink(os.path.join(LOG_DIR, stale))
+        except OSError:
+            pass
+    inner = "cd " + shlex.quote(workdir) + " && exec " + " ".join(shlex.quote(c) for c in cmd)
+
+    r = tmux("new-session", "-d", "-s", name, "-x", str(cols), "-y", str(rows),
+             "-c", workdir, *env_args(env), "bash", "-lc", inner, env=env)
+    if r.returncode != 0:
+        die(r.stderr.strip() or "tmux new-session fallito", 3)
+
+    tmux("set-option", "-t", name, "history-limit", "50000", env=env)
+    tmux("set-option", "-t", name, "status", "off", env=env)
+    tmux("set-option", "-t", name, "mouse", "on", env=env)
+    # `remain-on-exit` e' l'unico modo deterministico per conoscere il codice di
+    # uscita dell'harness: alla fine del comando il pane resta come «dead» e
+    # tmux espone #{pane_dead_status}. Il controller lo legge, lo registra e
+    # solo allora chiude la sessione. Senza questo, un processo terminato e uno
+    # ucciso sarebbero indistinguibili.
+    tmux("set-option", "-t", name, "remain-on-exit", "on", env=env)
+    # log persistente della sessione, leggibile dal gruppo agentprojects
+    tmux("pipe-pane", "-t", name, "-O", f"cat >> {shlex.quote(logfile)}", env=env)
+
+    print(json.dumps({
+        "session": name,
+        "argv_prompt": delivered_via_argv,
+        "command": cmd[0],
+        "effort": effort,
+        "harness_session_id": used_harness_sid,
+        # argv effettivo: il prompt e' testo dell'utente, non un argomento
+        # diagnostico, e viene sostituito da un segnaposto
+        "argv": ["«prompt iniziale»" if (delivered_via_argv and c == prompt) else c
+                 for c in cmd],
+        "cgroup": read_cgroup(name, env),
+    }))
+
+
+def read_cgroup(name, env):
+    r = tmux("list-panes", "-t", name, "-F", "#{pane_pid}", env=env)
+    pid = (r.stdout or "").strip().splitlines()
+    if not pid:
+        return ""
+    try:
+        with open(f"/proc/{int(pid[0])}/cgroup") as fh:
+            return fh.read().strip().split(":")[-1]
+    except (OSError, ValueError):
+        return ""
+
+
+# ---------------------------------------------------------- consegna testo
+
+def _read_input(path):
+    if not any(path.startswith(p) for p in INPUT_DIRS):
+        die("percorso del file di input non consentito")
+    if not os.path.isfile(path):
+        die("file di input inesistente")
+    return path
+
+
+def _paste(name, path, env, submit=True):
+    """Invia testo (anche multilinea) via buffer tmux: nessun quoting shell.
+
+    `paste-buffer -p` racchiude il testo nelle sequenze di *bracketed paste*
+    quando l'applicazione le ha richieste (tutte e tre le TUI lo fanno). Senza
+    di esse i newline arrivano alla TUI come singoli Invio e un messaggio
+    multilinea viene spezzato in piu' invii: il comportamento osservato era
+    non deterministico perche' dipendeva dall'euristica temporale della TUI.
+    L'invio resta un `send-keys Enter` esplicito, dopo la chiusura del blocco.
+    """
+    # Un pane «dead» appartiene ancora a una sessione tmux esistente: sta in
+    # piedi apposta, perche' `remain-on-exit` conserva il codice di uscita
+    # dell'harness. `has-session` quindi risponde di si' anche quando il
+    # processo e' finito, e senza questo controllo il testo verrebbe incollato
+    # in un pane che non legge piu' nulla — con exit code 0 su ogni comando
+    # tmux, cioe' una consegna dichiarata riuscita e in realta' persa.
+    r = tmux("display-message", "-p", "-t", name, "-F", "#{pane_dead}", env=env)
+    if (r.stdout or "").strip() == "1":
+        return False, ("il processo della sessione e' terminato: il pane non "
+                       "riceve piu' input, riavvia la sessione")
+    buf = f"ah-{os.getpid()}"
+    r = tmux("load-buffer", "-b", buf, path, env=env)
+    if r.returncode != 0:
+        return False, (r.stderr or "load-buffer fallito").strip()
+    r = tmux("paste-buffer", "-d", "-p", "-b", buf, "-t", name, env=env)
+    if r.returncode != 0:
+        return False, (r.stderr or "paste-buffer fallito").strip()
+    if submit:
+        # La TUI deve aver finito di consumare il blocco di paste prima
+        # dell'Invio. Un'attesa fissa e' una scommessa sulla velocita' di
+        # disegno: se il testo e' lungo o la macchina e' carica, l'Invio arriva
+        # dentro il blocco e diventa un a capo invece di inviare — il messaggio
+        # resta nel campo di composizione e la consegna risulta comunque
+        # riuscita. Si aspetta invece che lo schermo smetta di cambiare.
+        _settle(name, env)
+        r = tmux("send-keys", "-t", name, "Enter", env=env)
+        if r.returncode != 0:
+            return False, (r.stderr or "send-keys fallito").strip()
+    return True, ""
+
+
+def _settle(name, env, quiet=0.5, cap=8.0, floor=0.6):
+    """Attende che il pane smetta di cambiare: due letture identiche di seguito.
+
+    `floor` conserva la pausa minima di prima, `cap` impedisce di restare
+    appesi a una TUI che ridisegna in continuo (spinner, orologio).
+    """
+    time.sleep(floor)
+    deadline = time.time() + cap
+    previous = _screen_text(name, env)
+    stable_since = time.time()
+    while time.time() < deadline:
+        time.sleep(0.15)
+        current = _screen_text(name, env)
+        if current != previous:
+            previous, stable_since = current, time.time()
+            continue
+        if time.time() - stable_since >= quiet:
+            return True
+    return False
+
+
+def _pane_text(name, env, lines=80):
+    r = subprocess.run(["tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-J",
+                        "-t", name, "-S", f"-{lines}"],
+                       env=env, capture_output=True)
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
+def _screen_text(name, env):
+    """Solo la schermata visibile, senza scrollback ormai inattivo."""
+    r = subprocess.run(["tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-J",
+                        "-t", name], env=env, capture_output=True)
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
+def _rate_limit_menu(name, path, env):
+    """Gestisce il popup Codex dei limiti senza perdere il messaggio.
+
+    I menu numerati della TUI reagiscono a un singolo tasto letterale. Un
+    bracketed paste seguito da Invio, invece, viene ignorato dal menu e
+    l'Invio conferma la voce 1 preselezionata. Agent Hub usa normalmente il
+    paste per i messaggi multilinea: qui lo sostituiamo soltanto quando il
+    popup e' effettivamente visibile e il testo e' una scelta 1/2/3.
+
+    Ritorna None se non c'e' il popup, altrimenti (ok, errore).
+    """
+    # Lo scrollback puo' contenere un vecchio popup gia' chiuso. Usarlo qui
+    # trasformerebbe un successivo messaggio "3" in un tasto della TUI e lo
+    # segnerebbe erroneamente come non consegnato.
+    pane = _screen_text(name, env)
+    if RATE_LIMIT_TITLE not in pane or RATE_LIMIT_QUESTION not in pane:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            first = fh.readline(64).strip()
+    except OSError as exc:
+        return False, f"scelta non leggibile: {exc.strerror}"
+    match = re.fullmatch(r"([123])\.?", first)
+    if not match:
+        return False, ("Codex attende la scelta sui limiti: invia soltanto 1, 2 o 3 "
+                       "prima del prossimo messaggio")
+
+    # Il numero e' una scorciatoia del menu e conferma subito la voce. Non va
+    # aggiunto Enter: la voce 1 puo' aprire il menu dell'effort e un Invio
+    # ulteriore confermerebbe anche quello senza che l'utente lo abbia scelto.
+    r = tmux("send-keys", "-t", name, "-l", match.group(1), env=env)
+    if r.returncode != 0:
+        return False, (r.stderr or "invio scelta fallito").strip()
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        time.sleep(0.1)
+        if RATE_LIMIT_TITLE not in _screen_text(name, env):
+            return True, ""
+    return False, "Codex non ha chiuso il menu dopo la scelta"
+
+
+def _wait_ready(name, prof, timeout, env, auto_trust=True):
+    """Attende che la TUI sia pronta a ricevere input.
+
+    Nessun `sleep` fisso: si osserva il pane finche' non compare uno dei
+    marcatori del profilo (di norma il box del prompt di input). Alcune TUI
+    (Claude Code) mostrano prima un dialogo di conferma della directory che
+    blocca ogni input: viene riconosciuto e, se `auto_trust`, confermato.
+
+    Ritorna (ok, errore, trust_confermato, bloccata). `bloccata` distingue un
+    ostacolo riconosciuto — la TUI attende davvero una risposta umana — dal
+    semplice mancato riconoscimento dei marcatori: il chiamante puo' trattare i
+    due casi in modo diverso senza dover reinterpretare il testo dell'errore.
+    """
+    patterns = prof.get("ready_patterns") or [r".+"]
+    rx = [re.compile(p) for p in patterns]
+    trust = prof.get("trust_prompt") or {}
+    trust_rx = [re.compile(p) for p in trust.get("patterns", [])]
+    deadline = time.time() + timeout
+    seen = ""
+    trusted = False
+    note = ""
+    while time.time() < deadline:
+        if tmux("has-session", "-t", name, env=env).returncode != 0:
+            return False, "la sessione tmux non esiste piu'", trusted, False
+        seen = _pane_text(name, env)
+        if trust_rx and any(r.search(seen) for r in trust_rx):
+            if auto_trust and not trusted:
+                tmux("send-keys", "-t", name, trust.get("key", "Enter"), env=env)
+                trusted = True
+                time.sleep(1.0)
+                continue
+            note = ("la TUI attende la conferma della directory "
+                    "(«trust this folder»): confermala nel terminale")
+            time.sleep(1.0)
+            continue
+        if any(r.search(seen) for r in rx):
+            # piccola pausa: la TUI puo' aver appena disegnato il box
+            time.sleep(0.4)
+            return True, "", trusted, False
+        time.sleep(0.4)
+    tail = "\n".join(seen.strip().splitlines()[-5:])
+    reason = note or f"timeout di {timeout}s in attesa della TUI"
+    return False, f"{reason}. Ultime righe:\n{tail}", trusted, bool(note)
+
+
+def _harness_started(name, prof, env):
+    """L'harness e' davvero partito nel pane, anche se i marcatori non tornano.
+
+    Serve al prompt passato in argv: li' la consegna avviene alla exec e non
+    dipende dal disegno della TUI. Sono fatti osservabili, non interpretazioni:
+    il pane esiste, il processo non e' morto e qualcosa e' stato disegnato sullo
+    schermo. Il comando del pane resta un indizio riportato al chiamante ma non
+    e' un requisito: durante un tool call la TUI cede il pane a un sottoprocesso
+    e il nome cambia legittimamente.
+    """
+    r = tmux("display-message", "-p", "-t", name, "-F",
+             "#{pane_dead}\t#{pane_current_command}", env=env)
+    if r.returncode != 0:
+        return False, {"pane_dead": True, "pane_command": "", "pane_chars": 0}
+    parts = (r.stdout or "").strip().split("\t")
+    dead = (parts[0] if parts and parts[0] else "1") == "1"
+    command = parts[1] if len(parts) > 1 else ""
+    drawn = len(_pane_text(name, env).strip())
+    facts = {"pane_dead": dead, "pane_command": command, "pane_chars": drawn,
+             "profile_command": prof.get("command", "")}
+    return (not dead) and drawn > 0, facts
+
+
+def _timeout_arg(argv, idx, prof):
+    try:
+        t = max(5, min(600, int(argv[idx]))) if len(argv) > idx and argv[idx] else 0
+    except ValueError:
+        t = 0
+    return t or int(prof.get("ready_timeout", 90))
+
+
+def cmd_deliver(argv):
+    """deliver <session> <file> <profile-id> [timeout] [auto-trust] — attende la TUI e incolla."""
+    if len(argv) < 3:
+        die("uso: deliver <session> <file> <profile-id> [timeout] [auto-trust]")
+    name = check_session(argv[0])
+    path = _read_input(argv[1])
+    prof = load_profiles().get(argv[2]) or die("profilo sconosciuto")
+    timeout = _timeout_arg(argv, 3, prof)
+    auto_trust = (argv[4] != "0") if len(argv) > 4 else True
+    env = base_env()
+    ok, err, trusted, _blocked = _wait_ready(name, prof, timeout, env, auto_trust)
+    if not ok:
+        print(json.dumps({"ok": False, "method": "paste", "error": err, "trust_confirmed": trusted}))
+        sys.exit(4)
+    ok, err = _paste(name, path, env)
+    print(json.dumps({"ok": ok, "method": "paste", "error": err, "trust_confirmed": trusted}))
+    sys.exit(0 if ok else 5)
+
+
+def cmd_await_ready(argv):
+    """await-ready <session> <profile-id> [timeout] [auto-trust]
+
+    Usato quando il prompt e' gia' stato passato alla CLI come argomento. Li' il
+    testo e' entrato nella argv al momento della exec: non e' in discussione se
+    sia arrivato, ma se l'harness sia partito. Quando i marcatori della TUI non
+    tornano — perche' il profilo e' rimasto indietro rispetto alla CLI, o perche'
+    l'agente ha gia' riempito lo schermo di output — la risposta riporta anche
+    `started`, ricavato dai fatti del pane. Un ostacolo riconosciuto («trust this
+    folder») resta un fallimento: li' la TUI attende davvero una risposta umana.
+    """
+    if len(argv) < 2:
+        die("uso: await-ready <session> <profile-id> [timeout] [auto-trust]")
+    name = check_session(argv[0])
+    prof = load_profiles().get(argv[1]) or die("profilo sconosciuto")
+    timeout = _timeout_arg(argv, 2, prof)
+    auto_trust = (argv[3] != "0") if len(argv) > 3 else True
+    env = base_env()
+    ok, err, trusted, blocked = _wait_ready(name, prof, timeout, env, auto_trust)
+    out = {"ok": ok, "method": "cli-arg", "error": err, "trust_confirmed": trusted,
+           "blocked": blocked, "started": True, "pane": {}}
+    if not ok:
+        out["started"], out["pane"] = (False, {}) if blocked else _harness_started(name, prof, env)
+    print(json.dumps(out))
+    sys.exit(0 if ok else 4)
+
+
+def cmd_send(argv):
+    """send <session> <file> [nosubmit] — incolla il contenuto e preme Invio."""
+    if len(argv) < 2:
+        die("uso: send <session> <file> [nosubmit]")
+    name = check_session(argv[0])
+    path = _read_input(argv[1])
+    env = base_env()
+    if tmux("has-session", "-t", name, env=env).returncode != 0:
+        print(json.dumps({"ok": False, "method": "paste",
+                          "error": "la sessione tmux non e' attiva"}))
+        sys.exit(4)
+    menu = _rate_limit_menu(name, path, env)
+    if menu is not None:
+        ok, err = menu
+        print(json.dumps({"ok": ok, "method": "menu-choice", "error": err}))
+        sys.exit(0 if ok else 4)
+    ok, err = _paste(name, path, env, submit=(len(argv) < 3 or argv[2] != "nosubmit"))
+    print(json.dumps({"ok": ok, "method": "paste", "error": err}))
+    sys.exit(0 if ok else 5)
+
+
+def cmd_keys(argv):
+    """keys <session> <interrupt|escape|enter|up|down>"""
+    if len(argv) != 2:
+        die("uso: keys <session> <interrupt|escape|enter|up|down>")
+    name = check_session(argv[0])
+    # Su e Giu' servono a scegliere una voce diversa nei dialoghi della TUI:
+    # senza di loro Invio puo' solo confermare l'opzione gia' evidenziata.
+    mapping = {"interrupt": "C-c", "escape": "Escape", "enter": "Enter",
+               "up": "Up", "down": "Down"}
+    key = mapping.get(argv[1]) or die("tasto non consentito")
+    tmux("send-keys", "-t", name, key)
+    print("ok")
+
+
+def _capture_bytes(name, start="-"):
+    """Testo del pane senza sequenze ANSI (-J riunisce le righe spezzate)."""
+    r = subprocess.run(["tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-J",
+                        "-t", name, "-S", start],
+                       env=base_env(), capture_output=True)
+    return r.stdout if r.returncode == 0 else b""
+
+
+def _save_transcript(name):
+    """Conserva una trascrizione leggibile prima di eliminare la sessione tmux."""
+    data = _capture_bytes(name)
+    if not data.strip():
+        return
+    path = os.path.join(LOG_DIR, f"{name}.transcript.txt")
+    try:
+        with open(path, "wb") as fh:
+            fh.write(data)
+        os.chmod(path, 0o664)
+    except OSError:
+        pass
+
+
+def cmd_kill(argv):
+    if len(argv) != 1:
+        die("uso: kill <session>")
+    name = check_session(argv[0])
+    _save_transcript(name)
+    tmux("kill-session", "-t", name)
+    print("killed")
+
+
+def cmd_has(argv):
+    if len(argv) != 1:
+        die("uso: has <session>")
+    name = check_session(argv[0])
+    r = tmux("has-session", "-t", name)
+    print("yes" if r.returncode == 0 else "no")
+
+
+def cmd_list(argv):
+    # I campi 7-9 (#{pane_dead}, #{pane_dead_status}, #{pane_dead_signal})
+    # esistono solo per le sessioni avviate con remain-on-exit: per le altre
+    # restano vuoti e il controller tratta il codice di uscita come sconosciuto.
+    # Un processo ucciso da un segnale non ha exit status: lo dice il segnale.
+    r = tmux("list-sessions", "-F",
+             "#{session_name}\t#{session_created}\t#{session_attached}\t"
+             "#{window_width}x#{window_height}\t#{pane_pid}\t#{pane_current_command}\t"
+             "#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}")
+    if r.returncode != 0:
+        return
+    for line in r.stdout.splitlines():
+        if line.startswith("agenthub-"):
+            print(line)
+
+
+def cmd_capture(argv):
+    """capture <session> [lines|all] — testo del pane, senza sequenze ANSI."""
+    if len(argv) < 1:
+        die("uso: capture <session> [lines|all]")
+    name = check_session(argv[0])
+    lines = argv[1] if len(argv) > 1 else "200"
+    if lines == "all":
+        start = "-"  # tutta la history disponibile
+    elif lines.isdigit():
+        start = f"-{lines}"
+    else:
+        die("lines deve essere numerico oppure 'all'")
+    # byte grezzi: l'encoding di stdout dipende dal locale del chiamante
+    sys.stdout.buffer.write(_capture_bytes(name, start))
+
+
+def cmd_attach(argv):
+    """attach <session> — sostituisce il processo con tmux attach (usato dal PTY web)."""
+    if len(argv) != 1:
+        die("uso: attach <session>")
+    name = check_session(argv[0])
+    env = base_env()
+    os.chdir(env["HOME"])
+    os.execve("/usr/bin/tmux", ["tmux", "-L", TMUX_SOCKET, "attach-session", "-t", name], env)
+
+
+def cmd_resize(argv):
+    """resize <session> <cols> <rows>"""
+    if len(argv) != 3:
+        die("uso: resize <session> <cols> <rows>")
+    name = check_session(argv[0])
+    if not (argv[1].isdigit() and argv[2].isdigit()):
+        die("cols/rows non numerici")
+    tmux("resize-window", "-t", name, "-x", argv[1], "-y", argv[2])
+    print("ok")
+
+
+def cmd_login(argv):
+    """login <session> <profile-id> — sessione tmux dedicata al login provider."""
+    if len(argv) != 2:
+        die("uso: login <session> <profile-id>")
+    name = check_session(argv[0])
+    prof = load_profiles().get(argv[1]) or die("profilo sconosciuto")
+    login = prof.get("login") or die("il profilo non definisce un flusso di login")
+    user = me().pw_name
+    if user not in prof.get("allowed_users", []):
+        die("profilo non consentito per questo utente")
+    env = base_env()
+    ensure_server(env)
+    args = login.get("args", [])
+    if prof["harness"] == "claude":
+        # Claude Code: la TUI si apre e riceve /login come primo comando.
+        cmd = [prof["command"]]
+        prompt = "/login"
+    else:
+        cmd = [prof["command"], *args]
+        prompt = None
+    inner = "exec " + " ".join(shlex.quote(c) for c in cmd)
+    r = tmux("new-session", "-d", "-s", name, "-x", "120", "-y", "34",
+             "-c", env["HOME"], *env_args(env), "bash", "-lc", inner, env=env)
+    if r.returncode != 0:
+        die(r.stderr.strip() or "tmux new-session fallito", 3)
+    tmux("set-option", "-t", name, "history-limit", "50000", env=env)
+    tmux("set-option", "-t", name, "status", "off", env=env)
+    tmux("pipe-pane", "-t", name, "-O",
+         "cat >> " + shlex.quote(os.path.join(LOG_DIR, f"{name}.log")), env=env)
+    if prompt:
+        ok, err, _trusted, _blocked = _wait_ready(name, prof, int(prof.get("ready_timeout", 90)), env)
+        if ok:
+            path = f"/tmp/agent-hub-login-{os.getpid()}"
+            with open(path, "w") as fh:
+                fh.write(prompt)
+            os.chmod(path, 0o600)
+            _paste(name, path, env)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    print(json.dumps({"session": name}))
+
+
+# ------------------------------------------- stato reale del modello in uso
+#
+# Il modello e l'effort mostrati dall'Hub non sono quelli «richiesti» al
+# lancio ma quelli che l'harness ha davvero usato per l'ultima risposta: si
+# leggono dai file di stato che le CLI scrivono a ogni turno. Se il file non
+# esiste ancora (nessuna risposta prodotta) si dichiara `pending` e il
+# chiamante mostra i valori di avvio, senza spacciarli per verificati.
+
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,79}$")
+EFFORT_RE = re.compile(r"^[a-z]{1,16}$")
+MAX_STATE_BYTES = 16 * 1024 * 1024
+
+
+def _tail_lines(path, limit=MAX_STATE_BYTES):
+    """Ultimi `limit` byte del file, come righe complete."""
+    with open(path, "rb") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        if size > limit:
+            fh.seek(size - limit)
+            fh.readline()  # scarta la riga tronca
+        data = fh.read()
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def _ints(d, keys):
+    return {k: int(d.get(k) or 0) for k in keys if isinstance(d.get(k, 0), (int, float))}
+
+
+def _claude_runtime(harness_sid):
+    """Legge la trascrizione JSONL di Claude Code per la sessione indicata.
+
+    Il file e' individuato per nome (`<session-id>.jsonl`) sotto
+    ~/.claude/projects/*: e' deterministico perche' l'Hub avvia la CLI con
+    --session-id. Nessuna euristica sul percorso, nessun contenuto di
+    conversazione viene letto o restituito.
+    """
+    root = os.path.join(me().pw_dir, ".claude", "projects")
+    path = ""
+    try:
+        for entry in os.scandir(root):
+            cand = os.path.join(entry.path, f"{harness_sid}.jsonl")
+            if entry.is_dir() and os.path.isfile(cand):
+                path = cand
+                break
+    except OSError:
+        pass
+    if not path:
+        return {"state": "pending", "reason": "nessuna trascrizione: l'harness non ha ancora risposto"}
+
+    model = effort = last_at = ""
+    perm_mode = ""
+    turns = 0
+    ctx = {}
+    tot = {"input_tokens": 0, "output_tokens": 0,
+           "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    for line in _tail_lines(path):
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        kind = d.get("type")
+        if kind == "permission-mode":
+            perm_mode = str(d.get("permissionMode") or "")[:40]
+        if kind != "assistant":
+            continue
+        msg = d.get("message") or {}
+        usage = msg.get("usage") or {}
+        if not isinstance(usage, dict):
+            continue
+        turns += 1
+        cur = _ints(usage, tot)
+        for k in tot:
+            tot[k] += cur.get(k, 0)
+        # l'ultimo turno descrive lo stato corrente
+        ctx = cur
+        model = str(msg.get("model") or model)
+        effort = str(d.get("effort") or effort)
+        last_at = str(d.get("timestamp") or last_at)
+
+    if not MODEL_RE.match(model or ""):
+        model = ""
+    if not EFFORT_RE.match(effort or ""):
+        effort = ""
+    context_tokens = (ctx.get("input_tokens", 0) + ctx.get("cache_read_input_tokens", 0)
+                      + ctx.get("cache_creation_input_tokens", 0))
+    return {
+        "state": "live" if model else "pending",
+        "model": model,
+        "effort": effort,
+        "permission_mode": perm_mode if re.match(r"^[A-Za-z]{1,40}$", perm_mode) else "",
+        "turns": turns,
+        "context_tokens": context_tokens,
+        "usage": tot,
+        "last_at": last_at if re.match(r"^[0-9T:.+\-Z]{10,40}$", last_at) else "",
+        "source": "~/.claude/projects/…/" + os.path.basename(path),
+    }
+
+
+def _codex_runtime(workdir, since):
+    """Cerca il rollout Codex della sessione: stesso cwd, avviato dopo `since`.
+
+    Codex non accetta un identificativo di sessione dall'esterno, quindi
+    l'abbinamento e' per directory di lavoro e istante di avvio. Se piu'
+    rollout corrispondono si prende il piu' recente; se nessuno corrisponde si
+    dichiara `pending` invece di indovinare.
+    """
+    root = os.path.join(me().pw_dir, ".codex", "sessions")
+    best, best_mtime = "", 0.0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            if not (f.startswith("rollout-") and f.endswith(".jsonl")):
+                continue
+            p = os.path.join(dirpath, f)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if st.st_mtime < since - 60 or st.st_mtime <= best_mtime:
+                continue
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    head = json.loads(fh.readline() or "{}")
+            except (OSError, ValueError):
+                continue
+            if (head.get("payload") or {}).get("cwd") != workdir:
+                continue
+            best, best_mtime = p, st.st_mtime
+    if not best:
+        return {"state": "pending", "reason": "nessun rollout Codex per questa directory"}
+
+    model = last_at = ""
+    turns = 0
+    tot = {"input_tokens": 0, "output_tokens": 0,
+           "cached_input_tokens": 0, "reasoning_output_tokens": 0}
+    context_tokens = 0
+    for line in _tail_lines(best):
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        payload = d.get("payload") or {}
+        if d.get("type") == "turn_context":
+            model = str(payload.get("model") or model)
+            last_at = str(d.get("timestamp") or last_at)
+            turns += 1
+        elif d.get("type") == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info") or {}
+            total = info.get("total_token_usage") or {}
+            last = info.get("last_token_usage") or {}
+            if isinstance(total, dict):
+                tot.update(_ints(total, tot))
+            if isinstance(last, dict):
+                context_tokens = (int(last.get("input_tokens") or 0)
+                                  + int(last.get("output_tokens") or 0))
+    if not MODEL_RE.match(model or ""):
+        model = ""
+    return {
+        "state": "live" if model else "pending",
+        "model": model,
+        "effort": "",  # Codex non registra l'effort nel rollout
+        "turns": turns,
+        "context_tokens": context_tokens,
+        "usage": tot,
+        "last_at": last_at if re.match(r"^[0-9T:.+\-Z]{10,40}$", last_at) else "",
+        "source": "~/.codex/sessions/…/" + os.path.basename(best),
+    }
+
+
+def cmd_runtime(argv):
+    """runtime <profile-id> <workdir> [harness-session-id] [since-epoch]
+
+    Stato verificato dell'harness: modello, effort e token realmente usati.
+    L'output e' costruito campo per campo e validato: nessun testo grezzo
+    proveniente dai file di stato raggiunge il chiamante.
+    """
+    if len(argv) < 2:
+        die("uso: runtime <profile-id> <workdir> [harness-session-id] [since-epoch]")
+    prof = load_profiles().get(argv[0]) or die("profilo sconosciuto")
+    workdir = os.path.realpath(argv[1])
+    harness_sid = argv[2] if len(argv) > 2 else ""
+    try:
+        since = float(argv[3]) if len(argv) > 3 and argv[3] else 0.0
+    except ValueError:
+        since = 0.0
+    source = (prof.get("runtime") or {}).get("source", "")
+
+    try:
+        if source == "claude-jsonl":
+            if not harness_sid or not UUID_RE.fullmatch(harness_sid):
+                out = {"state": "unsupported",
+                       "reason": "sessione avviata senza --session-id: riavviala per leggere lo stato"}
+            else:
+                out = _claude_runtime(harness_sid)
+        elif source == "codex-rollout":
+            out = _codex_runtime(workdir, since)
+        else:
+            out = {"state": "unsupported",
+                   "reason": "questo harness non espone uno stato leggibile per sessione"}
+    except OSError as exc:
+        out = {"state": "error", "reason": f"stato non leggibile: {exc.strerror}"}
+    out["profile_id"] = prof["id"]
+    print(json.dumps(out))
+
+
+def cmd_command(argv):
+    """command <session> <profile-id> <slash-command> — esegue un comando della TUI.
+
+    Solo comandi slash con un argomento semplice (es. `/model sonnet`): il
+    formato e' verificato qui, quindi da questo punto non puo' passare testo
+    arbitrario alla sessione. Il testo viene battuto letteralmente e non
+    incollato, perche' le TUI trattano i blocchi di paste come testo normale e
+    non come comandi.
+
+    Alcuni comandi aprono un dialogo di conferma (Claude Code lo fa per
+    `/model` quando la conversazione e' gia' in cache). Senza risposta il
+    comando resta a meta': si attende quindi il dialogo e lo si conferma, ma
+    solo se il pane mostra uno dei marcatori dichiarati dal profilo — mai un
+    Invio «alla cieca», che potrebbe rispondere a una richiesta di permesso
+    dell'agente. Vengono restituite le ultime righe del pane: chi chiama vede
+    l'effetto reale invece di presumerlo.
+    """
+    if len(argv) != 3:
+        die("uso: command <session> <profile-id> <slash-command>")
+    name = check_session(argv[0])
+    prof = load_profiles().get(argv[1]) or die("profilo sconosciuto")
+    text = argv[2].strip()
+    if not re.fullmatch(r"/[a-z][a-z-]{0,31}(?: [A-Za-z0-9][A-Za-z0-9._/:-]{0,79})?", text):
+        die("comando non consentito: atteso «/comando [argomento]»")
+    env = base_env()
+    if tmux("has-session", "-t", name, env=env).returncode != 0:
+        print(json.dumps({"ok": False, "error": "la sessione tmux non e' attiva"}))
+        sys.exit(4)
+    r = tmux("send-keys", "-t", name, "-l", text, env=env)
+    if r.returncode != 0:
+        print(json.dumps({"ok": False, "error": (r.stderr or "send-keys fallito").strip()}))
+        sys.exit(5)
+    # la TUI deve aver processato l'intera riga (e chiuso l'eventuale menu di
+    # completamento) prima dell'Invio
+    time.sleep(0.8)
+    r = tmux("send-keys", "-t", name, "Enter", env=env)
+    if r.returncode != 0:
+        print(json.dumps({"ok": False, "error": (r.stderr or "Enter fallito").strip()}))
+        sys.exit(5)
+
+    rt = prof.get("runtime") or {}
+    confirm_rx = []
+    for p in rt.get("confirm_patterns") or []:
+        try:
+            confirm_rx.append(re.compile(p))
+        except re.error:
+            pass
+    confirmed = []
+    deadline = time.time() + 12
+    time.sleep(1.2)
+    while confirm_rx and time.time() < deadline and len(confirmed) < 3:
+        pane = _pane_text(name, env, lines=40)
+        hit = next((r.pattern for r in confirm_rx if r.search(pane)), "")
+        if not hit:
+            break
+        tmux("send-keys", "-t", name, rt.get("confirm_key", "Enter"), env=env)
+        confirmed.append(hit)
+        time.sleep(1.5)
+
+    time.sleep(0.8)
+    tail = "\n".join(_pane_text(name, env, lines=40).strip().splitlines()[-12:])
+    print(json.dumps({"ok": True, "command": text, "pane_tail": tail,
+                      "confirmed": len(confirmed)}))
+
+
+def cmd_info(argv):
+    """info — versioni, stato auth, chiavi SSH dell'utente corrente (JSON)."""
+    u = me()
+    env = base_env()
+
+    def run(cmd, timeout=25):
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                               timeout=timeout, cwd=env["HOME"])
+            return (r.stdout + r.stderr).strip()
+        except Exception as exc:  # noqa: BLE001
+            return f"non disponibile: {exc}"
+
+    out = {
+        "user": u.pw_name,
+        "home": u.pw_dir,
+        "codex_version": run(["codex", "--version"]),
+        "codex_auth": run(["codex", "login", "status"]),
+        "claude_version": run(["claude", "--version"]),
+        "claude_auth": "sconosciuto" if not os.path.exists(f"{u.pw_dir}/.claude/.credentials.json")
+                       else "credenziali presenti (~/.claude/.credentials.json)",
+        "opencode_version": run(["opencode", "--version"]),
+        # L'output della CLI non e' un contratto di sicurezza: non lo si porta
+        # nella UI per evitare che future versioni stampino metadati sensibili.
+        "opencode_providers": "consulta il catalogo modelli (credenziali nascoste)",
+        "ssh_keys": [],
+    }
+    if not os.path.exists(f"{u.pw_dir}/.claude/.credentials.json"):
+        out["claude_auth"] = "nessuna credenziale locale — login richiesto"
+    ssh_dir = os.path.join(u.pw_dir, ".ssh")
+    for root, _dirs, files in os.walk(ssh_dir):
+        for f in sorted(files):
+            if f.endswith(".pub"):
+                p = os.path.join(root, f)
+                try:
+                    with open(p) as fh:
+                        out["ssh_keys"].append({"path": p, "key": fh.read().strip()})
+                except OSError:
+                    pass
+    if u.pw_name == PROJECT_UNIX_USER:
+        out["docker"] = run(["docker", "info", "--format",
+                             "{{.ServerVersion}} | rootless={{.SecurityOptions}}"])
+    else:
+        out["docker"] = run(["docker", "info", "--format",
+                             "{{.ServerVersion}} | {{.Driver}} | containers={{.Containers}}"])
+    out["tmux_unit"] = run(["systemctl", "--user", "is-active", TMUX_UNIT])
+    out["tmux_sessions"] = run(["tmux", "-L", TMUX_SOCKET, "list-sessions", "-F",
+                                "#{session_name}"])
+    print(json.dumps(out))
+
+
+EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _model_entry(mid, name, efforts=()):
+    """Voce di catalogo validata campo per campo.
+
+    Niente stringhe grezze provenienti da una CLI o da una risposta HTTP:
+    l'id deve avere la forma di un id di modello, il nome viene ripulito e i
+    livelli di effort possono essere solo quelli della lista chiusa.
+    """
+    mid = str(mid or "").strip()
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._/:-]{1,127}", mid):
+        return None
+    name = re.sub(r"[^\w .+/()-]", "", str(name or "")).strip()[:60] or mid
+    good = [e for e in EFFORT_LEVELS if e in {str(x).strip().lower() for x in (efforts or [])}]
+    return {"id": mid, "name": name, "efforts": good}
+
+
+def _opencode_authenticated(provider):
+    """C'e' una credenziale locale per questo provider OpenCode?
+
+    `opencode models <provider>` risponde comunque, con l'elenco anonimo del
+    gateway, anche senza credenziale: sono modelli che poi falliscono con 401
+    alla prima chiamata reale. Offrirli sarebbe esattamente l'errore che il
+    catalogo esiste per evitare, quindi la presenza della credenziale viene
+    controllata qui. Si legge solo la lista delle chiavi presenti: nessun
+    valore di chiave lascia questa funzione.
+    """
+    path = os.path.join(me().pw_dir, ".local", "share", "opencode", "auth.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and bool((data.get(provider) or {}))
+
+
+def _models_opencode(provider):
+    """Modelli di un provider OpenCode (DeepSeek e simili).
+
+    OpenCode viene eseguito come l'utente proprietario delle credenziali. Di
+    auth.json leggiamo soltanto quali provider vi compaiono, mai le chiavi, e
+    non restituiamo mai stdout/stderr grezzi: solo ID modello validati oppure
+    un errore generico per il catalogo.
+    """
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", provider):
+        return {"models": [], "error": "provider non valido"}
+    if not _opencode_authenticated(provider):
+        return {"models": [], "error": "nessuna credenziale locale", "configured": False}
+    try:
+        r = subprocess.run(["opencode", "models", provider], env=base_env(),
+                           capture_output=True, text=True, timeout=40,
+                           cwd=base_env()["HOME"])
+    except subprocess.TimeoutExpired:
+        return {"models": [], "error": "timeout"}
+    except OSError:
+        return {"models": [], "error": "non disponibile"}
+    if r.returncode != 0:
+        text = (r.stderr or r.stdout or "").lower()
+        if "provider not found" in text or "not configured" in text:
+            # Nessuna credenziale per questo utente: il provider non e' solo
+            # «non verificato», e' inutilizzabile. La distinzione conta,
+            # perche' il chiamante NON deve ripiegare su una lista di scorta.
+            return {"models": [], "error": "provider non configurato", "configured": False}
+        return {"models": [], "error": "discovery fallita"}
+    ids = sorted(set(re.findall(rf"{re.escape(provider)}/[a-zA-Z0-9][a-zA-Z0-9._:-]*", r.stdout)))
+    out = [_model_entry(mid, mid.split("/", 1)[1]) for mid in ids]
+    return {"models": [m for m in out if m], "configured": True}
+
+
+def _models_codex():
+    """Catalogo reale di Codex: `codex debug models` stampa il JSON che la TUI usa.
+
+    I modelli marcati `visibility: hide` non sono scelte offribili all'utente
+    (varianti interne, agenti di servizio) e vengono esclusi. Da qui arrivano
+    anche i livelli di reasoning realmente supportati da ciascun modello.
+    """
+    try:
+        r = subprocess.run(["codex", "debug", "models"], env=base_env(),
+                           capture_output=True, text=True, timeout=60,
+                           cwd=base_env()["HOME"])
+    except subprocess.TimeoutExpired:
+        return {"models": [], "error": "timeout"}
+    except OSError:
+        return {"models": [], "error": "non disponibile"}
+    if r.returncode != 0:
+        text = (r.stderr or r.stdout or "").lower()
+        if "not logged in" in text or "auth" in text or "login" in text:
+            return {"models": [], "error": "account non autenticato", "configured": False}
+        return {"models": [], "error": "discovery fallita"}
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        return {"models": [], "error": "risposta non interpretabile"}
+    out = []
+    for m in data.get("models", []):
+        if not isinstance(m, dict) or m.get("visibility") == "hide":
+            continue
+        efforts = [e.get("effort") for e in (m.get("supported_reasoning_levels") or [])
+                   if isinstance(e, dict)]
+        entry = _model_entry(m.get("slug"), m.get("display_name"), efforts)
+        if entry:
+            out.append(entry)
+    return {"models": out, "configured": True}
+
+
+def _claude_oauth():
+    """Credenziale OAuth locale di Claude Code: (token, rinnovabile, errore).
+
+    Il token non lascia mai questo processo: viene letto dalla home dell'utente
+    e usato solo per le GET di metadati qui sotto.
+
+    Un access token scaduto NON significa account inutilizzabile: Claude Code
+    lo rinnova da solo al primo avvio usando il refresh token. In quel caso la
+    verifica e' semplicemente impossibile ora, e va dichiarata come tale
+    invece di far sparire modelli che funzionano.
+    """
+    path = os.path.join(me().pw_dir, ".claude", ".credentials.json")
+    try:
+        with open(path) as fh:
+            oauth = json.load(fh).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        oauth = {}
+    token = str(oauth.get("accessToken") or "")
+    renewable = bool(oauth.get("refreshToken"))
+    if not token:
+        return "", renewable, "nessuna credenziale locale"
+    if float(oauth.get("expiresAt") or 0) / 1000.0 <= time.time():
+        return "", renewable, ("token locale scaduto: Claude Code lo rinnova "
+                               "al prossimo avvio, catalogo non verificabile ora")
+    return token, renewable, ""
+
+
+def _models_claude():
+    """Catalogo reale di Claude Code: endpoint /v1/models con le credenziali locali.
+
+    `capabilities.effort` dice quali livelli il singolo modello supporta
+    davvero — e' cosi' che si scopre, per esempio, che Haiku non ne ha.
+    """
+    token, renewable, err = _claude_oauth()
+    if err:
+        # nessuna credenziale = provider inutilizzabile; token scaduto = solo
+        # non verificabile adesso, e il catalogo noto va conservato
+        if err == "nessuna credenziale locale":
+            return {"models": [], "error": err, "configured": False}
+        return {"models": [], "error": err}
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models?limit=100",
+        headers={"Authorization": f"Bearer {token}",
+                 "anthropic-version": "2023-06-01",
+                 "anthropic-beta": "oauth-2025-04-20"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            # con un refresh token il login e' recuperabile: non e' «assente»
+            return {"models": [], "error": "credenziale rifiutata",
+                    "configured": bool(renewable)}
+        return {"models": [], "error": "discovery fallita"}
+    except (urllib.error.URLError, OSError, ValueError):
+        return {"models": [], "error": "provider non raggiungibile"}
+    out = []
+    for m in data.get("data", []):
+        if not isinstance(m, dict):
+            continue
+        eff = (m.get("capabilities") or {}).get("effort") or {}
+        efforts = [lvl for lvl in EFFORT_LEVELS
+                   if isinstance(eff.get(lvl), dict) and eff[lvl].get("supported")]
+        entry = _model_entry(m.get("id"), m.get("display_name"), efforts)
+        if entry:
+            out.append(entry)
+    return {"models": out, "configured": True}
+
+
+def cmd_models(argv):
+    """models <deepseek|codex|claude|…> — catalogo reale, per questo utente Unix.
+
+    Ogni provider ha la propria sorgente di verita' e viene interrogato con le
+    credenziali dell'utente che lo possiede. L'output e' costruito campo per
+    campo: nessun testo grezzo della CLI o del provider raggiunge il chiamante,
+    e nessuna credenziale compare mai nel risultato.
+    """
+    provider = (argv[0].lower() if argv else "")
+    if provider == "codex":
+        out = _models_codex()
+    elif provider == "claude":
+        out = _models_claude()
+    else:
+        out = _models_opencode(provider)
+    out.setdefault("configured", True)
+    print(json.dumps(out))
+
+
+# ------------------------------------------------------- consumo dei piani
+#
+# Percentuali consumate lette dalla stessa sorgente che ogni CLI usa per il
+# proprio indicatore: qui non si stima e non si contano token. I tre provider
+# rispondono in formati diversi e vengono ricondotti a una forma unica —
+# finestre in percentuale e/o saldo residuo — costruita campo per campo, cosi'
+# nessun testo del provider raggiunge la pagina.
+
+USAGE_URLS = {
+    "claude": "https://api.anthropic.com/api/oauth/usage",
+    "codex": "https://chatgpt.com/backend-api/codex/usage",
+    "deepseek": "https://api.deepseek.com/user/balance",
+}
+
+
+def _usage_get(url, headers):
+    """GET autenticata con esiti distinti: (dati, errore, configurato)."""
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace")), "", True
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return None, "credenziale rifiutata", True
+        return None, "discovery fallita", True
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, "provider non raggiungibile", True
+
+
+def _epoch(value):
+    """Istante ISO o epoch → secondi epoch. 0 se assente o non plausibile."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0
+    try:
+        secs = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    # una data fuori da questa finestra non e' un reset: e' un campo che non
+    # abbiamo capito, e mostrarlo sarebbe peggio che tacerlo
+    return secs if time.time() - 86400 < secs < time.time() + 400 * 86400 else 0
+
+
+def _usage_window(label, percent, resets_at=None):
+    """Finestra normalizzata, o None se il provider non ha dato un numero."""
+    try:
+        pct = float(percent)
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= pct <= 1000.0:
+        return None
+    label = re.sub(r"[^\w .+/()-]", "", str(label or "")).strip()[:40]
+    return {"label": label or "finestra", "percent": round(pct, 1),
+            "resets_at": _epoch(resets_at)}
+
+
+def _window_label(seconds, fallback):
+    """Nome leggibile di una finestra a partire dalla sua durata."""
+    try:
+        secs = int(seconds)
+    except (TypeError, ValueError):
+        return fallback
+    if secs >= 172800:
+        return f"{secs // 86400} giorni"
+    if secs == 86400:
+        return "24 ore"
+    if secs >= 3600:
+        return f"{secs // 3600} ore"
+    return fallback
+
+
+def _usage_claude():
+    """Consumo del piano Claude: stesso endpoint dell'indicatore di /usage."""
+    token, renewable, err = _claude_oauth()
+    if err:
+        return {"error": err, "configured": renewable}
+    data, err, configured = _usage_get(USAGE_URLS["claude"], {
+        "Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20"})
+    if err:
+        return {"error": err, "configured": configured and renewable}
+    windows = []
+    for key, label in (("five_hour", "sessione (5 ore)"), ("seven_day", "7 giorni"),
+                       ("seven_day_opus", "7 giorni Opus"),
+                       ("seven_day_sonnet", "7 giorni Sonnet")):
+        blk = data.get(key)
+        if isinstance(blk, dict):
+            win = _usage_window(label, blk.get("utilization"), blk.get("resets_at"))
+            if win:
+                windows.append(win)
+    return {"windows": windows, "configured": True}
+
+
+def _usage_codex():
+    """Consumo del piano ChatGPT usato da Codex: stessa sorgente della TUI."""
+    path = os.path.join(me().pw_dir, ".codex", "auth.json")
+    try:
+        with open(path) as fh:
+            tokens = (json.load(fh) or {}).get("tokens") or {}
+    except (OSError, ValueError):
+        tokens = {}
+    token = str(tokens.get("access_token") or "")
+    if not token:
+        return {"error": "nessuna credenziale locale", "configured": False}
+    # il backend ChatGPT rifiuta con 403 lo User-Agent di default di urllib:
+    # senza questo header la lettura fallirebbe come «credenziale rifiutata»
+    data, err, configured = _usage_get(USAGE_URLS["codex"], {
+        "Authorization": f"Bearer {token}", "User-Agent": "codex-cli",
+        "chatgpt-account-id": str(tokens.get("account_id") or "")})
+    if err:
+        return {"error": err, "configured": configured}
+    windows = []
+    limit = data.get("rate_limit")
+    if isinstance(limit, dict):
+        for key, fallback in (("primary_window", "finestra principale"),
+                              ("secondary_window", "finestra secondaria")):
+            blk = limit.get(key)
+            if isinstance(blk, dict):
+                win = _usage_window(_window_label(blk.get("limit_window_seconds"), fallback),
+                                    blk.get("used_percent"), blk.get("reset_at"))
+                if win:
+                    windows.append(win)
+    # limiti per singolo modello: il nome arriva dal provider e va ripulito
+    for extra in (data.get("additional_rate_limits") or [])[:12]:
+        if not isinstance(extra, dict):
+            continue
+        blk = (extra.get("rate_limit") or {}).get("primary_window")
+        if not isinstance(blk, dict):
+            continue
+        win = _usage_window(extra.get("limit_name") or "limite aggiuntivo",
+                            blk.get("used_percent"), blk.get("reset_at"))
+        if win:
+            windows.append(win)
+    plan = re.sub(r"[^\w .-]", "", str(data.get("plan_type") or "")).strip()[:40]
+    return {"windows": windows, "plan": plan, "configured": True}
+
+
+def _usage_deepseek():
+    """DeepSeek e' a consumo: non ha finestre, ha un saldo residuo."""
+    path = os.path.join(me().pw_dir, ".local", "share", "opencode", "auth.json")
+    try:
+        with open(path) as fh:
+            key = str(((json.load(fh) or {}).get("deepseek") or {}).get("key") or "")
+    except (OSError, ValueError):
+        key = ""
+    if not key:
+        return {"error": "nessuna credenziale locale", "configured": False}
+    data, err, configured = _usage_get(USAGE_URLS["deepseek"],
+                                       {"Authorization": f"Bearer {key}"})
+    if err:
+        return {"error": err, "configured": configured}
+    for info in (data.get("balance_infos") or []):
+        if not isinstance(info, dict):
+            continue
+        currency = str(info.get("currency") or "")
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            continue
+        try:
+            amount = round(float(info.get("total_balance")), 2)
+        except (TypeError, ValueError):
+            continue
+        return {"balance": {"amount": amount, "currency": currency},
+                "available": bool(data.get("is_available")), "configured": True}
+    return {"error": "risposta non interpretabile", "configured": True}
+
+
+def cmd_usage(argv):
+    """usage <deepseek|codex|claude> — consumo del piano di QUESTO utente Unix.
+
+    Come `models`: ogni provider ha la propria sorgente di verita', interrogata
+    con le credenziali dell'utente che le possiede, e l'output e' costruito
+    campo per campo. Nessuna credenziale compare mai nel risultato.
+    """
+    collectors = {"claude": _usage_claude, "codex": _usage_codex,
+                  "deepseek": _usage_deepseek}
+    collector = collectors.get(argv[0].lower() if argv else "")
+    out = collector() if collector else {"error": "provider non valido",
+                                         "configured": False}
+    out.setdefault("windows", [])
+    out.setdefault("balance", None)
+    out.setdefault("plan", "")
+    out.setdefault("error", "")
+    out.setdefault("configured", True)
+    out["checked_at"] = int(time.time())
+    print(json.dumps(out))
+
+
+def cmd_version(argv):
+    """version — versioni delle CLI cosi' come le vede QUESTO utente Unix.
+
+    Claude Code vive in ~/.local/bin: il servizio web, che gira con il proprio account,
+    non puo' leggerlo. La pagina Status passa quindi da qui.
+    """
+    env = base_env()
+
+    def run(cmd):
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                               timeout=20, cwd=env["HOME"])
+            return (r.stdout + r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else ""
+        except Exception as exc:  # noqa: BLE001
+            return f"non disponibile: {exc}"
+
+    print(json.dumps({
+        "user": me().pw_name,
+        "claude": run(["claude", "--version"]),
+        "codex": run(["codex", "--version"]),
+        "opencode": run(["opencode", "--version"]),
+    }))
+
+
+def cmd_server(argv):
+    """server [status|ensure] — stato dell'unit systemd che ospita il server tmux."""
+    env = base_env()
+    action = argv[0] if argv else "status"
+    if action == "ensure":
+        ensure_server(env)
+    r = subprocess.run(["systemctl", "--user", "show", TMUX_UNIT, "-p",
+                        "ActiveState,SubState,ControlGroup,MainPID"],
+                       env=env, capture_output=True, text=True)
+    data = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            data[k] = v
+    data["user"] = me().pw_name
+    data["socket"] = TMUX_SOCKET
+    print(json.dumps(data))
+
+
+COMMANDS = {
+    "start": cmd_start, "send": cmd_send, "deliver": cmd_deliver,
+    "await-ready": cmd_await_ready, "keys": cmd_keys,
+    "kill": cmd_kill, "has": cmd_has, "list": cmd_list, "capture": cmd_capture,
+    "attach": cmd_attach, "resize": cmd_resize, "login": cmd_login, "info": cmd_info,
+    "models": cmd_models, "usage": cmd_usage, "runtime": cmd_runtime,
+    "command": cmd_command,
+    "server": cmd_server, "version": cmd_version,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        die("comandi: " + ", ".join(sorted(COMMANDS)))
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

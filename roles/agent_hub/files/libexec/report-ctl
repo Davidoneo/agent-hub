@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Agent Hub — registrazione dello stato finale di una sessione.
+
+Root-owned, eseguito tramite sudo come account di servizio (il proprietario del
+database) da `agent-report`, che gli agenti lanciano come `devagent` o
+`hostagent`. Non e' una API generica: accetta argomenti strutturati, valida
+tutto e tocca soltanto le colonne di report della sessione indicata.
+
+Effetti, nell'ordine:
+  1. verifica che la sessione esista in SQLite (altrimenti esce 3);
+  2. aggiorna `sessions` e inserisce una riga in `session_reports`;
+  3. scrive atomicamente l'evento JSON in /srv/agent-workspace/reports/.
+
+Idempotenza: ripetere lo stesso (stato, riepilogo) sulla stessa sessione non
+crea una nuova riga di storico e non e' un errore; l'evento viene riscritto
+identico. Cambiare stato o riepilogo aggiunge invece una riga allo storico.
+
+Nessuna connessione di rete, in nessun ramo.
+"""
+import json
+import os
+import re
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timezone
+
+DB = os.environ.get("AGENT_HUB_DB", "/var/lib/agent-hub/agent-hub.sqlite3")
+REPORT_DIR = os.environ.get("AGENT_HUB_REPORTS", "/srv/agent-workspace/reports")
+STATUSES = ("COMPLETED", "NEEDS_INPUT", "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
+SESSION_RE = re.compile(r"^[0-9a-fA-F-]{6,40}$")
+MAX_SUMMARY = 4000
+
+
+def die(msg, code=2):
+    print(json.dumps({"ok": False, "error": msg}), file=sys.stderr)
+    sys.exit(code)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def db():
+    conn = sqlite3.connect(DB, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def write_event(payload):
+    """Evento JSON locale, scritto atomicamente (tmp + rename)."""
+    try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+    except OSError as exc:
+        return f"directory eventi non creabile: {exc}"
+    final = os.path.join(REPORT_DIR, f"{payload['session_id']}.json")
+    tmp = final + f".tmp-{os.getpid()}"
+    data = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, final)          # sostituzione atomica
+        with open(os.path.join(REPORT_DIR, "events.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return f"evento non scritto: {exc}"
+    return ""
+
+
+def cmd_report(argv):
+    """report <session> <status> <summary> [source] [unix_user]"""
+    if len(argv) < 3:
+        die("uso: report <session-id> <status> <summary> [source] [unix-user]")
+    sid = argv[0].strip()
+    if sid.startswith("agenthub-"):
+        sid = sid[len("agenthub-"):]
+    if not SESSION_RE.match(sid):
+        die(f"identificatore di sessione non valido: {argv[0]}")
+    status = argv[1].strip().upper()
+    if status not in STATUSES:
+        die(f"stato non ammesso: {argv[1]} — ammessi: {', '.join(STATUSES)}")
+    summary = " ".join(argv[2].split())[:MAX_SUMMARY]
+    source = (argv[3] if len(argv) > 3 else "agent-report")[:40]
+    unix_user = (argv[4] if len(argv) > 4 else "")[:40]
+
+    stamp = now()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, name, report_status, report_summary, reported_at "
+            "FROM sessions WHERE id=?", (sid,)).fetchone()
+        if not row:
+            die(f"sessione inesistente: {sid}", 3)
+        duplicate = (row["report_status"] == status
+                     and (row["report_summary"] or "") == summary)
+        if duplicate:
+            stamp = row["reported_at"] or stamp
+        else:
+            conn.execute(
+                "INSERT INTO session_reports (id,session_id,status,summary,reported_at,"
+                "source,unix_user) VALUES (?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), sid, status, summary, stamp, source, unix_user))
+            conn.execute(
+                "UPDATE sessions SET report_status=?, report_summary=?, reported_at=? "
+                "WHERE id=?", (status, summary, stamp, sid))
+
+    payload = {
+        "session_id": sid,
+        "status": status,
+        "summary": summary,
+        "reported_at": stamp,
+        "source": source,
+        "unix_user": unix_user,
+        "session_name": row["name"],
+    }
+    # nel file resta lo *stato*, non la cronaca della chiamata: `duplicate`
+    # descrive l'invocazione e vive solo nella risposta a chi l'ha fatta
+    err = write_event(payload)
+    result = {"ok": True, **payload, "duplicate": duplicate}
+    if err:
+        result["event_error"] = err
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_show(argv):
+    """show <session> — ultimo stato registrato."""
+    if len(argv) != 1:
+        die("uso: show <session-id>")
+    sid = argv[0].strip()
+    if sid.startswith("agenthub-"):
+        sid = sid[len("agenthub-"):]
+    if not SESSION_RE.match(sid):
+        die(f"identificatore di sessione non valido: {argv[0]}")
+    with db() as conn:
+        row = conn.execute("SELECT id,name,status,report_status,report_summary,reported_at "
+                           "FROM sessions WHERE id=?", (sid,)).fetchone()
+    if not row:
+        die(f"sessione inesistente: {sid}", 3)
+    print(json.dumps({"ok": True, **dict(row)}, ensure_ascii=False))
+
+
+COMMANDS = {"report": cmd_report, "show": cmd_show}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        die("comandi: " + ", ".join(sorted(COMMANDS)))
+    try:
+        COMMANDS[sys.argv[1]](sys.argv[2:])
+    except sqlite3.Error as exc:
+        die(f"errore SQLite: {exc}", 4)
+
+
+if __name__ == "__main__":
+    main()

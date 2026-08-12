@@ -1,0 +1,163 @@
+---
+# Agent Hub: FastAPI web UI driving tmux sessions that outlive the browser
+# and the backend itself. See README.md for the threat model.
+
+- name: Agent Hub | skip unless explicitly enabled
+  ansible.builtin.meta: end_role
+  when: not agent_hub_install | bool
+
+- name: Agent Hub | required settings are present
+  ansible.builtin.assert:
+    that:
+      - agent_hub_origin | length > 0
+      - agent_hub_allowed_users | length > 0
+    fail_msg: >-
+      agent_hub_origin and agent_hub_allowed_users must be set. Without them
+      the CSRF check has no expected origin and every Tailscale identity would
+      be accepted, which defeats the point of the private UI.
+
+- name: Agent Hub | the Telegram token is set when the notifier is enabled
+  ansible.builtin.assert:
+    that:
+      - agent_hub_telegram_token | length > 0
+    fail_msg: >-
+      agent_hub_telegram_enabled is true but agent_hub_telegram_token is empty.
+      Store the token in a vault, not in group_vars.
+  when: agent_hub_telegram_enabled | bool
+
+- name: Agent Hub | packages
+  ansible.builtin.apt:
+    name: [python3, python3-venv, tmux, sudo, git]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Agent Hub | shared group for the agent accounts
+  ansible.builtin.group:
+    name: "{{ agent_hub_agent_group }}"
+    state: present
+
+- name: Agent Hub | service account
+  ansible.builtin.user:
+    name: "{{ agent_hub_service_user }}"
+    shell: /bin/bash
+    create_home: true
+    state: present
+
+- name: Agent Hub | agent accounts
+  ansible.builtin.user:
+    name: "{{ item }}"
+    shell: /bin/bash
+    create_home: true
+    groups: "{{ agent_hub_agent_group }}"
+    append: true
+    state: present
+  loop:
+    - "{{ agent_hub_project_user }}"
+    - "{{ agent_hub_server_user }}"
+
+# Sessions must survive logout: without lingering, systemd tears down the
+# user manager and the tmux server with it.
+- name: Agent Hub | keep the user managers running after logout
+  ansible.builtin.command: "loginctl enable-linger {{ item }}"
+  args:
+    creates: "/var/lib/systemd/linger/{{ item }}"
+  loop:
+    - "{{ agent_hub_project_user }}"
+    - "{{ agent_hub_server_user }}"
+
+- name: Agent Hub | directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default(agent_hub_service_user) }}"
+    group: "{{ item.group | default(agent_hub_service_user) }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - { path: "{{ agent_hub_root }}", owner: root, group: root }
+    - { path: "{{ agent_hub_root }}/app" }
+    - { path: "{{ agent_hub_root }}/app/static" }
+    - { path: "{{ agent_hub_libexec }}", owner: root, group: root }
+    - { path: "{{ agent_hub_config_dir }}", owner: root, group: root }
+    - { path: "{{ agent_hub_state_dir }}", mode: "0750" }
+    - { path: "{{ agent_hub_workspace }}", owner: root, group: "{{ agent_hub_agent_group }}", mode: "2775" }
+    - { path: "{{ agent_hub_workspace }}/projects", owner: "{{ agent_hub_project_user }}", group: "{{ agent_hub_agent_group }}", mode: "2775" }
+    - { path: "{{ agent_hub_workspace }}/logs", group: "{{ agent_hub_agent_group }}", mode: "2770" }
+    - { path: "{{ agent_hub_workspace }}/reports", group: "{{ agent_hub_agent_group }}", mode: "2775" }
+    - { path: "{{ agent_hub_workspace }}/knowledge", group: "{{ agent_hub_agent_group }}", mode: "2775" }
+    - { path: "{{ agent_hub_workspace }}/uploads", group: "{{ agent_hub_agent_group }}", mode: "2775" }
+
+- name: Agent Hub | application code
+  ansible.builtin.copy:
+    src: "app/"
+    dest: "{{ agent_hub_root }}/app/"
+    owner: "{{ agent_hub_service_user }}"
+    group: "{{ agent_hub_service_user }}"
+    mode: "0644"
+    directory_mode: "0755"
+  notify: Restart agent-hub
+
+- name: Agent Hub | privileged wrappers
+  ansible.builtin.copy:
+    src: "libexec/"
+    dest: "{{ agent_hub_libexec }}/"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Agent Hub | virtualenv
+  ansible.builtin.pip:
+    name: [fastapi, "uvicorn[standard]", jinja2, python-multipart]
+    virtualenv: "{{ agent_hub_root }}/.venv"
+    virtualenv_command: python3 -m venv
+  notify: Restart agent-hub
+
+- name: Agent Hub | service configuration
+  ansible.builtin.template:
+    src: config.env.j2
+    dest: "{{ agent_hub_config_dir }}/config.env"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart agent-hub
+
+# The wrappers are the whole privilege boundary: the web service runs as an
+# unprivileged user and may only call these scripts, as these users.
+- name: Agent Hub | sudoers rules for the wrappers
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: /etc/sudoers.d/agent-hub
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "visudo -cf %s"
+
+- name: Agent Hub | systemd unit
+  ansible.builtin.template:
+    src: agent-hub.service.j2
+    dest: /etc/systemd/system/agent-hub.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart agent-hub
+
+- name: Agent Hub | Telegram notifier unit
+  ansible.builtin.template:
+    src: agent-hub-telegram.service.j2
+    dest: /etc/systemd/system/agent-hub-telegram.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: agent_hub_telegram_enabled | bool
+  notify:
+    - Reload systemd
+    - Restart agent-hub-telegram
+
+- name: Agent Hub | enable the service
+  ansible.builtin.systemd:
+    name: agent-hub
+    enabled: true
+    state: started
+    daemon_reload: true

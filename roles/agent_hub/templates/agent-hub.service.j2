@@ -1,0 +1,33 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Agent Hub - persistent agent sessions behind a private web UI
+Documentation=file://{{ agent_hub_root }}/README.md
+After=network-online.target{% if agent_hub_require_tailscale %} tailscaled.service{% endif %}
+
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ agent_hub_service_user }}
+Group={{ agent_hub_service_user }}
+SupplementaryGroups={{ agent_hub_agent_group }}
+WorkingDirectory={{ agent_hub_root }}/app
+EnvironmentFile={{ agent_hub_config_dir }}/config.env
+ExecStart={{ agent_hub_root }}/.venv/bin/uvicorn main:app \
+  --host ${AGENT_HUB_BIND} --port ${AGENT_HUB_PORT} \
+  --no-server-header --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+RuntimeDirectory=agent-hub
+RuntimeDirectoryMode=0755
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-hub
+
+# The agent sessions live in the users' own tmux servers, outside this
+# cgroup: stopping the web service must not kill the work in progress.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

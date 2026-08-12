@@ -1,0 +1,41 @@
+---
+# Role: agent_hub - persistent agent sessions behind a private web UI
+# Documentation in roles/agent_hub/README.md
+
+# Opt-in, like every role that installs a long-running service.
+agent_hub_install: false
+
+# Unix accounts. The service account owns the web process; the two agent
+# accounts run the agent sessions and are deliberately separated so that a
+# project agent cannot reach host privileges.
+agent_hub_service_user: agenthub
+agent_hub_project_user: projectagent
+agent_hub_server_user: serveragent
+agent_hub_agent_group: agentprojects
+
+# Bind address. Keep it on loopback: exposure is meant to happen through
+# Tailscale Serve, never by binding a public interface.
+agent_hub_bind: 127.0.0.1
+agent_hub_port: 8787
+
+# Identity check. The reverse proxy (Tailscale Serve) injects the
+# Tailscale-User-Login header; only these logins are accepted.
+agent_hub_allowed_users: []
+agent_hub_require_tailscale: true
+
+# Expected HTTPS origin for the CSRF and WebSocket checks. Without it the
+# browser session cannot be validated, so the role refuses to run.
+agent_hub_origin: ""
+
+# Paths.
+agent_hub_root: /opt/agent-hub
+agent_hub_libexec: /usr/local/libexec/agent-hub
+agent_hub_config_dir: /etc/agent-hub
+agent_hub_state_dir: /var/lib/agent-hub
+agent_hub_workspace: /srv/agent-workspace
+
+# Telegram notifier. Disabled by default: it is the only component that
+# talks to the internet. Put the token in a vault, never in group_vars.
+agent_hub_telegram_enabled: false
+agent_hub_telegram_token: ""
+agent_hub_telegram_chat_ids: []

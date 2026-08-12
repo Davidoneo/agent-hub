@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#11131a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Agent Hub">
+<meta name="agent-hub-asset-version" content="__ASSET_VERSION__">
+<title>Agent Hub</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icons/agent-hub.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/vendor/xterm.css?v=__ASSET_VERSION__">
+<link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
+</head>
+<body>
+<header>
+  <div class="brand">Agent&nbsp;Hub</div>
+  <div class="header-right">
+    <button class="ghost small" id="usage-toggle" title="Mostra o nasconde il pannello del consumo">consumo</button>
+    <button class="ghost small" id="help-toggle" title="Mostra o nasconde le spiegazioni">? aiuti</button>
+    <button class="ghost small" id="theme-toggle" title="Tema chiaro / scuro / automatico">tema</button>
+    <span class="who" id="who"></span>
+  </div>
+</header>
+
+<nav id="nav">
+  <a href="#/">Dashboard</a>
+  <a href="#/projects">Progetti</a>
+  <a href="#/meetings">Riunioni e contesto</a>
+  <a href="#/documents">Documenti</a>
+  <a href="#/new">Nuova sessione</a>
+  <a href="#/accounts">Accounts</a>
+  <a href="#/status">Status</a>
+</nav>
+
+<div id="banner"></div>
+<div id="layout">
+  <main id="view"><p class="muted">Caricamento…</p></main>
+  <aside id="side"><div id="usage-panel"></div></aside>
+</div>
+
+<div id="toast"></div>
+
+<script src="/static/vendor/xterm.js?v=__ASSET_VERSION__"></script>
+<script src="/static/vendor/addon-fit.js?v=__ASSET_VERSION__"></script>
+<script src="/static/app.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Agent Hub - Telegram notifier (long polling)
+After=network-online.target agent-hub.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ agent_hub_service_user }}
+Group={{ agent_hub_service_user }}
+ExecStart={{ agent_hub_libexec }}/telegram-ctl run
+Restart=always
+RestartSec=10
+
+# The only component that talks to the internet: no privileges, no writes
+# outside its own state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={{ agent_hub_state_dir }}
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-hub-telegram
+
+[Install]
+WantedBy=multi-user.target

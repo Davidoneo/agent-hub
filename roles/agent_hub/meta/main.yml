@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  role_name: agent_hub
+  namespace: baseline
+  author: debian-server-blueprint contributors
+  description: Persistent agent sessions behind a private, Tailscale-only web UI, with the web service separated from the agent accounts by root-owned wrappers
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+dependencies: []

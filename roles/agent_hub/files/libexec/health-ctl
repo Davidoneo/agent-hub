@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""Agent Hub — controllo deterministico dello stato del server.
+
+Root-owned. Eseguito da:
+  * il timer systemd `agent-hub-health.timer` (ogni 30 minuti);
+  * la pagina Status, che passa da `sudo -n` come account di servizio;
+  * a mano, tramite /usr/local/bin/agent-hub-health.
+
+Ogni controllo produce OK / WARNING / CRITICAL da fatti verificabili: nessuna
+euristica, nessuna soglia nascosta nel codice (stanno in
+/etc/agent-hub/controller.json) e nessuna notifica esterna.
+
+Uso:
+    health-ctl [--json] [--save] [--quiet]
+
+    --json   stampa il risultato completo in JSON invece della sintesi testuale
+    --save   aggiorna /var/lib/agent-hub/health/last.json e registra nello
+             storico *solo* i cambi di stato
+    --quiet  non stampa nulla (per il timer)
+
+Uscita: 0 se OK, 1 se WARNING, 2 se CRITICAL, 3 in caso di errore interno.
+"""
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+CONFIG = "/etc/agent-hub/controller.json"
+PROFILES = "/etc/agent-hub/profiles.json"
+DB = "/var/lib/agent-hub/agent-hub.sqlite3"
+STATE_DIR = "/var/lib/agent-hub/health"
+LAST = os.path.join(STATE_DIR, "last.json")
+HISTORY = os.path.join(STATE_DIR, "history.jsonl")
+TEMPS = os.path.join(STATE_DIR, "temps.json")
+SESSION_CTL = "/usr/local/libexec/agent-hub/session-ctl"
+def _cfg(key, default):
+    """Legge una chiave da config.env: sudo filtra l'ambiente, quindi questo
+    wrapper non puo' ereditare le variabili del servizio."""
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+PROJECT_UNIX_USER = _cfg("AGENT_HUB_PROJECT_USER", "projectagent")
+SERVER_UNIX_USER = _cfg("AGENT_HUB_SERVER_USER", "serveragent")
+AGENT_USERS = (PROJECT_UNIX_USER, SERVER_UNIX_USER)
+OK, WARN, CRIT = "OK", "WARNING", "CRITICAL"
+RANK = {OK: 0, WARN: 1, CRIT: 2}
+OWNER = _cfg("AGENT_HUB_SERVICE_USER", "agenthub")
+
+DEFAULTS = {
+    "temperature": {"consecutive": 2, "warn_fallback": 80.0, "crit_fallback": 95.0,
+                    "warn_ratio": 0.90, "crit_ratio": 1.0},
+    "thresholds": {"disk_warn_pct": 85, "disk_crit_pct": 93,
+                   "mem_available_warn_pct": 15, "mem_available_crit_pct": 7,
+                   "swap_used_warn_pct": 60, "swap_used_crit_pct": 85,
+                   "load_warn_per_cpu": 2.0, "load_crit_per_cpu": 4.0,
+                   "oom_window_hours": 24},
+}
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as fh:
+            user = json.load(fh)
+        for key in DEFAULTS:
+            merged = dict(DEFAULTS[key])
+            merged.update(user.get(key) or {})
+            cfg[key] = merged
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def run(cmd, timeout=30, env=None):
+    """Esegue un comando: restituisce (rc, output). Mai un'eccezione."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=env or os.environ.copy())
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except FileNotFoundError:
+        return 127, f"comando non trovato: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, f"timeout dopo {timeout}s: {' '.join(cmd)}"
+    except OSError as exc:
+        return 125, str(exc)
+
+
+def run_stdout(cmd, timeout=30):
+    """Come `run` ma senza stderr: per i comandi il cui stdout e' JSON."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 125, ""
+
+
+def user_env(user):
+    """Ambiente minimo per parlare con il manager systemd *utente*."""
+    try:
+        uid = int(subprocess.run(["id", "-u", user], capture_output=True,
+                                 text=True, timeout=10).stdout.strip())
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None, None
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
+    return uid, env
+
+
+def check(name, label, status, detail, **data):
+    return {"name": name, "label": label, "status": status, "detail": detail, "data": data}
+
+
+# ------------------------------------------------------------------ servizi
+
+def check_service(unit, label, critical=True):
+    rc, out = run(["systemctl", "is-active", unit])
+    active = out.strip() == "active"
+    status = OK if active else (CRIT if critical else WARN)
+    rc2, detail = run(["systemctl", "show", unit, "-p",
+                       "ActiveState,SubState,NRestarts,ExecMainStartTimestamp"])
+    info = dict(line.split("=", 1) for line in detail.splitlines() if "=" in line)
+    return check(unit.replace(".service", ""), label, status,
+                 f"{out.strip()} ({info.get('SubState', '?')})", **info)
+
+
+def check_tailscale_serve():
+    rc, out = run(["tailscale", "serve", "status"], timeout=30)
+    if rc != 0:
+        return check("tailscale_serve", "Tailscale Serve", CRIT,
+                     f"comando fallito: {out[:200]}", output=out[:2000])
+    if not out.strip() or "no serve config" in out.lower():
+        return check("tailscale_serve", "Tailscale Serve", CRIT,
+                     "nessuna configurazione di serve attiva", output=out[:2000])
+    proxied = "127.0.0.1:8787" in out or "localhost:8787" in out
+    return check("tailscale_serve", "Tailscale Serve", OK if proxied else WARN,
+                 "proxy verso 127.0.0.1:8787 attivo" if proxied
+                 else "serve attivo ma non verso la porta dell'Agent Hub",
+                 output=out[:2000])
+
+
+def check_docker_rootless():
+    uid, env = user_env(PROJECT_UNIX_USER)
+    if env is None:
+        return check("docker_rootless", "Docker rootless (devagent)", CRIT,
+                     "utente devagent inesistente")
+    env["DOCKER_HOST"] = f"unix:///run/user/{uid}/docker.sock"
+    rc, out = run(["sudo", "-n", "-u", PROJECT_UNIX_USER,
+                   "env", f"DOCKER_HOST=unix:///run/user/{uid}/docker.sock",
+                   "docker", "info", "--format",
+                   "{{.ServerVersion}} | containers={{.Containers}} running={{.ContainersRunning}}"],
+                  timeout=45)
+    status = OK if rc == 0 else CRIT
+    return check("docker_rootless", "Docker rootless (devagent)", status,
+                 out.splitlines()[0][:300] if out else "nessun output", raw=out[:2000])
+
+
+def check_docker_rootful():
+    rc, out = run(["docker", "info", "--format",
+                   "{{.ServerVersion}} | {{.Driver}} | containers={{.Containers}} "
+                   "running={{.ContainersRunning}}"], timeout=45)
+    status = OK if rc == 0 else CRIT
+    return check("docker_rootful", "Docker rootful (host)", status,
+                 out.splitlines()[0][:300] if out else "nessun output", raw=out[:2000])
+
+
+# ----------------------------------------------------- sessioni e coerenza
+
+def tmux_sessions():
+    """Sessioni tmux vive per utente, lette dal wrapper dell'Agent Hub."""
+    live = {}
+    errors = []
+    for user in AGENT_USERS:
+        rc, out = run(["sudo", "-n", "-u", user, SESSION_CTL, "list"], timeout=45)
+        if rc != 0:
+            errors.append(f"{user}: {out[:200]}")
+            continue
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 4 and parts[0].startswith("agenthub-"):
+                live[parts[0]] = {
+                    "unix_user": user,
+                    "pane_pid": parts[4] if len(parts) > 4 else "",
+                    "command": parts[5] if len(parts) > 5 else "",
+                    "dead": (parts[6] if len(parts) > 6 else "0") == "1",
+                }
+    return live, errors
+
+
+def db_sessions():
+    try:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=15)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, name, tmux_name, status, unix_user, kind FROM sessions")]
+        conn.close()
+        return rows, ""
+    except sqlite3.Error as exc:
+        return [], str(exc)
+
+
+def check_tmux(live, errors):
+    total = len(live)
+    dead = [n for n, i in live.items() if i["dead"]]
+    status = CRIT if errors else OK
+    detail = f"{total} sessioni tmux vive"
+    if dead:
+        detail += f", {len(dead)} con pane terminato in attesa di raccolta"
+    if errors:
+        detail = "elenco non ottenibile — " + "; ".join(errors)
+    return check("tmux_sessions", "Sessioni tmux", status, detail,
+                 sessions=sorted(live), dead=dead, errors=errors)
+
+
+def check_coherence(live, rows, db_error):
+    if db_error:
+        return check("tmux_db_coherence", "Coerenza tmux ↔ SQLite", CRIT,
+                     f"database non leggibile: {db_error}")
+    names = set(live)
+    running_db = {r["tmux_name"] for r in rows if r["status"] in ("running", "starting")}
+    stale = sorted(running_db - names)              # marcate vive ma assenti da tmux
+    unknown = sorted(names - {r["tmux_name"] for r in rows})  # tmux senza riga in DB
+    status = WARN if (stale or unknown) else OK
+    bits = []
+    if stale:
+        bits.append(f"{len(stale)} sessioni 'running' in SQLite senza pane tmux")
+    if unknown:
+        bits.append(f"{len(unknown)} sessioni tmux non registrate in SQLite")
+    return check("tmux_db_coherence", "Coerenza tmux ↔ SQLite", status,
+                 "; ".join(bits) or f"{len(names)} sessioni tmux, {len(rows)} righe in SQLite",
+                 stale_in_db=stale, unknown_in_tmux=unknown)
+
+
+def harness_names():
+    try:
+        with open(PROFILES) as fh:
+            return {p["command"] for p in json.load(fh)["profiles"] if p.get("command")}
+    except (OSError, ValueError, KeyError):
+        return {"claude", "codex", "opencode"}
+
+
+def check_orphans(live):
+    """Processi agentici che non discendono da nessun pane tmux registrato."""
+    rc, out = run(["ps", "-eo", "pid=,ppid=,user=,args="], timeout=30)
+    if rc != 0:
+        return check("orphan_agents", "Processi agentici orfani", WARN,
+                     f"elenco processi non ottenibile: {out[:200]}")
+    procs = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            procs[int(parts[0])] = {"ppid": int(parts[1]), "user": parts[2], "args": parts[3]}
+        except ValueError:
+            continue
+
+    roots = {int(i["pane_pid"]) for i in live.values() if (i["pane_pid"] or "").isdigit()}
+    allowed = set(roots)
+    for pid in procs:                      # risale la catena fino a un pane noto
+        chain, cur = [], pid
+        for _ in range(40):
+            if cur in allowed:
+                allowed.update(chain)
+                break
+            if cur not in procs or cur <= 1:
+                break
+            chain.append(cur)
+            cur = procs[cur]["ppid"]
+
+    names = harness_names()
+    orphans = []
+    for pid, p in procs.items():
+        if p["user"] not in AGENT_USERS or pid in allowed:
+            continue
+        argv0 = p["args"].split()[0] if p["args"].split() else ""
+        base = os.path.basename(argv0)
+        if base in names or any(f"/{n}" in argv0 for n in names) or \
+                any(re.search(rf"(?:^|/){re.escape(n)}(?:\s|$)", p["args"]) for n in names):
+            orphans.append({"pid": pid, "user": p["user"], "args": p["args"][:200]})
+    status = WARN if orphans else OK
+    return check("orphan_agents", "Processi agentici orfani", status,
+                 f"{len(orphans)} processi agentici senza sessione tmux registrata"
+                 if orphans else "nessun processo agentico fuori dalle sessioni registrate",
+                 orphans=orphans[:20])
+
+
+# --------------------------------------------------------------- risorse
+
+def check_disk(th):
+    worst, rows, seen = OK, [], set()
+    for path in ("/", "/srv", "/var"):
+        if not os.path.isdir(path):
+            continue
+        try:
+            dev = os.stat(path).st_dev      # un solo filesystem, una sola riga
+            if dev in seen:
+                continue
+            seen.add(dev)
+            usage = shutil.disk_usage(path)
+        except OSError:
+            continue
+        pct = round(100.0 * usage.used / usage.total, 1) if usage.total else 0.0
+        st = CRIT if pct >= th["disk_crit_pct"] else (WARN if pct >= th["disk_warn_pct"] else OK)
+        worst = st if RANK[st] > RANK[worst] else worst
+        rows.append({"path": path, "used_pct": pct,
+                     "free_gib": round(usage.free / 1073741824, 1), "status": st})
+    detail = " · ".join(f"{r['path']} {r['used_pct']}% ({r['free_gib']} GiB liberi)" for r in rows)
+    return check("disk", "Spazio disco", worst, detail or "nessun filesystem esaminato",
+                 filesystems=rows)
+
+
+def meminfo():
+    data = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, _, v = line.partition(":")
+                data[k.strip()] = int(v.split()[0]) if v.split() else 0
+    except (OSError, ValueError):
+        pass
+    return data
+
+
+def check_memory(th):
+    m = meminfo()
+    total, avail = m.get("MemTotal", 0), m.get("MemAvailable", 0)
+    sw_total, sw_free = m.get("SwapTotal", 0), m.get("SwapFree", 0)
+    if not total:
+        return check("memory", "RAM e swap", WARN, "/proc/meminfo illeggibile")
+    avail_pct = round(100.0 * avail / total, 1)
+    sw_used_pct = round(100.0 * (sw_total - sw_free) / sw_total, 1) if sw_total else 0.0
+    st = OK
+    if avail_pct <= th["mem_available_crit_pct"]:
+        st = CRIT
+    elif avail_pct <= th["mem_available_warn_pct"]:
+        st = WARN
+    if sw_total:
+        sw_st = CRIT if sw_used_pct >= th["swap_used_crit_pct"] else (
+            WARN if sw_used_pct >= th["swap_used_warn_pct"] else OK)
+        st = sw_st if RANK[sw_st] > RANK[st] else st
+    return check("memory", "RAM e swap", st,
+                 f"RAM disponibile {avail_pct}% di {round(total / 1048576, 1)} GiB · "
+                 f"swap usata {sw_used_pct}%",
+                 mem_total_gib=round(total / 1048576, 2), mem_available_pct=avail_pct,
+                 swap_total_gib=round(sw_total / 1048576, 2), swap_used_pct=sw_used_pct)
+
+
+def check_load(th):
+    try:
+        one, five, fifteen = os.getloadavg()
+    except OSError:
+        return check("load", "Load average", WARN, "load average non disponibile")
+    cpus = os.cpu_count() or 1
+    per = round(five / cpus, 2)
+    st = CRIT if per >= th["load_crit_per_cpu"] else (
+        WARN if per >= th["load_warn_per_cpu"] else OK)
+    return check("load", "Load average", st,
+                 f"{one:.2f} {five:.2f} {fifteen:.2f} su {cpus} CPU ({per} per CPU)",
+                 load1=round(one, 2), load5=round(five, 2), load15=round(fifteen, 2),
+                 cpus=cpus, per_cpu=per)
+
+
+UNIT_RE = re.compile(r"^\S+\.(service|socket|timer|mount|target|path|scope)$")
+
+
+def _failed_units(text):
+    out = []
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if parts and UNIT_RE.match(parts[0]):
+            out.append(parts[0])
+    return out
+
+
+def check_failed_units():
+    rc, out = run(["systemctl", "--failed", "--no-legend", "--plain", "--no-pager"])
+    system = _failed_units(out)
+    per_user = {}
+    for user in AGENT_USERS:
+        uid, _env = user_env(user)
+        if uid is None:
+            continue
+        rc2, out2 = run(["sudo", "-n", "-u", user,
+                         "env", f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                         f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                         "systemctl", "--user", "--failed",
+                         "--no-legend", "--plain", "--no-pager"], timeout=30)
+        units = _failed_units(out2)
+        if units:
+            per_user[user] = units
+    total = len(system) + sum(len(v) for v in per_user.values())
+    status = WARN if total else OK
+    detail = (f"{total} unit fallite: " +
+              ", ".join(system + [f"{u}:{n}" for u, v in per_user.items() for n in v])
+              ) if total else "nessuna unit systemd fallita"
+    return check("failed_units", "Unit systemd fallite", status, detail[:400],
+                 system=system, user=per_user)
+
+
+def check_oom(th):
+    since = f"-{int(th['oom_window_hours'])}h"
+    rc, out = run(["journalctl", "-k", "--since", since, "--no-pager", "-q"], timeout=60)
+    oom = [l for l in out.splitlines()
+           if re.search(r"(?i)out of memory|oom-killer|oom_reaper", l)]
+    rc2, out2 = run(["journalctl", "--since", since, "-p", "3", "--no-pager", "-q"], timeout=60)
+    crashes = [l for l in out2.splitlines()
+               if re.search(r"(?i)segfault|core-dump|general protection fault", l)]
+    status = CRIT if oom else (WARN if crashes else OK)
+    detail = (f"{len(oom)} eventi OOM e {len(crashes)} crash nelle ultime "
+              f"{int(th['oom_window_hours'])}h") if (oom or crashes) else \
+        f"nessun OOM né crash nelle ultime {int(th['oom_window_hours'])}h"
+    return check("oom_crashes", "OOM e crash recenti", status, detail,
+                 oom=oom[-5:], crashes=crashes[-5:])
+
+
+# ----------------------------------------------------------- temperature
+
+def read_temps():
+    """Letture da `sensors -j`, con le soglie high/crit esposte dal chip."""
+    if not shutil.which("sensors"):
+        return None, "sensors non installato"
+    # solo stdout: `sensors` scrive su stderr gli avvisi sui chip non leggibili
+    rc, out = run_stdout(["sensors", "-j"], timeout=30)
+    if rc != 0 and not out.strip():
+        return None, "sensors non disponibile"
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None, "output di sensors non interpretabile"
+    temps = []
+    for chip, features in (data or {}).items():
+        if not isinstance(features, dict):
+            continue
+        for feature, values in features.items():
+            if not isinstance(values, dict):
+                continue
+            value = high = crit = None
+            for key, v in values.items():
+                if not isinstance(v, (int, float)):
+                    continue
+                if key.endswith("_input") and key.startswith("temp"):
+                    value = float(v)
+                elif key.endswith("_max"):
+                    high = float(v)
+                elif key.endswith("_crit") and not key.endswith("_crit_alarm"):
+                    crit = float(v)
+            if value is None:
+                continue
+            temps.append({"label": f"{chip}/{feature}", "value": round(value, 1),
+                          "high": high, "crit": crit})
+    return temps, ""
+
+
+def load_json(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def check_temperatures(cfg, save):
+    """Un picco isolato non e' un allarme: servono N letture consecutive elevate."""
+    tcfg = cfg["temperature"]
+    temps, err = read_temps()
+    if temps is None:
+        return check("temperature", "Temperature", OK, err, available=False)
+    if not temps:
+        return check("temperature", "Temperature", OK,
+                     "sensors presente ma nessuna lettura di temperatura", available=False)
+
+    streaks = load_json(TEMPS, {})
+    new_streaks, hot, critical = {}, [], []
+    for t in temps:
+        high = t["high"] if t["high"] else tcfg["warn_fallback"]
+        crit = t["crit"] if t["crit"] else tcfg["crit_fallback"]
+        warn_at = min(high, crit) * tcfg["warn_ratio"]
+        crit_at = crit * tcfg["crit_ratio"]
+        t["warn_at"], t["crit_at"] = round(warn_at, 1), round(crit_at, 1)
+        level = 2 if t["value"] >= crit_at else (1 if t["value"] >= warn_at else 0)
+        prev = streaks.get(t["label"], {"level": 0, "count": 0})
+        count = prev["count"] + 1 if level and level == prev.get("level") else (1 if level else 0)
+        new_streaks[t["label"]] = {"level": level, "count": count}
+        t["consecutive"] = count
+        if level and count >= tcfg["consecutive"]:
+            (critical if level == 2 else hot).append(t)
+
+    if save:
+        write_state(TEMPS, new_streaks)
+
+    status = CRIT if critical else (WARN if hot else OK)
+    if critical:
+        detail = "temperatura critica confermata: " + ", ".join(
+            f"{t['label']} {t['value']}°C (crit {t['crit_at']}°C, {t['consecutive']} letture)"
+            for t in critical)
+    elif hot:
+        detail = "temperatura elevata confermata: " + ", ".join(
+            f"{t['label']} {t['value']}°C (soglia {t['warn_at']}°C, {t['consecutive']} letture)"
+            for t in hot)
+    else:
+        peak = max(temps, key=lambda x: x["value"])
+        detail = f"massima {peak['label']} {peak['value']}°C (soglia {peak['warn_at']}°C)"
+    return check("temperature", "Temperature", status, detail,
+                 available=True, readings=temps,
+                 consecutive_required=tcfg["consecutive"])
+
+
+# ------------------------------------------------------------------ output
+
+def write_state(path, payload):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    chown_owner(path)
+    chown_owner(STATE_DIR)
+
+
+def chown_owner(path):
+    """I file restano leggibili e riscrivibili dall'account di servizio, che serve la pagina."""
+    try:
+        import pwd
+        u = pwd.getpwnam(OWNER)
+        os.chown(path, u.pw_uid, u.pw_gid)
+        os.chmod(path, 0o755 if os.path.isdir(path) else 0o644)
+    except (KeyError, OSError, PermissionError):
+        pass
+
+
+def summary_text(result):
+    lines = [f"agent-hub-health {result['overall']} — {result['generated_at']}",
+             "=" * 62]
+    for c in result["checks"]:
+        lines.append(f"[{c['status']:<8}] {c['label']}: {c['detail']}")
+    counts = result["counts"]
+    lines.append("=" * 62)
+    lines.append(f"OK {counts['OK']} · WARNING {counts['WARNING']} · CRITICAL {counts['CRITICAL']}")
+    return "\n".join(lines)
+
+
+def record_history(result):
+    """Solo i cambi di stato finiscono nello storico."""
+    prev = load_json(LAST, {})
+    key_now = (result["overall"], sorted(c["name"] for c in result["checks"]
+                                         if c["status"] != OK))
+    key_prev = (prev.get("overall"), sorted(c["name"] for c in prev.get("checks", [])
+                                            if c["status"] != OK))
+    if prev and key_now == key_prev:
+        return False
+    os.makedirs(STATE_DIR, exist_ok=True)
+    entry = {"at": result["generated_at"], "overall": result["overall"],
+             "previous": prev.get("overall", ""),
+             "problems": [{"name": c["name"], "status": c["status"], "detail": c["detail"]}
+                          for c in result["checks"] if c["status"] != OK]}
+    with open(HISTORY, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    chown_owner(HISTORY)
+    return True
+
+
+def collect(cfg, save):
+    th = cfg["thresholds"]
+    live, tmux_errors = tmux_sessions()
+    rows, db_error = db_sessions()
+    checks = [
+        check_service("agent-hub.service", "Agent Hub service"),
+        check_service("tailscaled.service", "Tailscale daemon"),
+        check_tailscale_serve(),
+        check_docker_rootless(),
+        check_docker_rootful(),
+        check_tmux(live, tmux_errors),
+        check_coherence(live, rows, db_error),
+        check_orphans(live),
+        check_disk(th),
+        check_memory(th),
+        check_load(th),
+        check_failed_units(),
+        check_oom(th),
+        check_temperatures(cfg, save),
+    ]
+    overall = OK
+    for c in checks:
+        if RANK[c["status"]] > RANK[overall]:
+            overall = c["status"]
+    counts = {OK: 0, WARN: 0, CRIT: 0}
+    for c in checks:
+        counts[c["status"]] += 1
+    result = {"generated_at": now(), "overall": overall, "counts": counts,
+              "checks": checks, "host": os.uname().nodename,
+              "duration_ms": 0}
+    result["summary_text"] = summary_text(result)
+    return result
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    save = "--save" in args
+    quiet = "--quiet" in args
+    for a in args:
+        if a not in ("--json", "--save", "--quiet"):
+            print(f"opzione sconosciuta: {a}\n{__doc__}", file=sys.stderr)
+            return 3
+
+    started = time.time()
+    cfg = load_config()
+    try:
+        result = collect(cfg, save)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"overall": CRIT, "error": f"controllo interrotto: {exc}"}),
+              file=sys.stderr)
+        return 3
+    result["duration_ms"] = int((time.time() - started) * 1000)
+    result["summary_text"] = summary_text(result)
+
+    if save:
+        changed = record_history(result)
+        result["state_changed"] = changed
+        write_state(LAST, result)
+
+    if not quiet:
+        print(json.dumps(result, ensure_ascii=False, indent=2) if as_json
+              else result["summary_text"])
+    return RANK[result["overall"]]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

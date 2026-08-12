@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""Agent Hub project wrapper — eseguito come `devagent` tramite sudo.
+
+Gestisce progetti, istruzioni agenti, deploy key read-only e azioni Docker
+Compose rootless. Argomenti strutturati, nessuna shell API generica.
+"""
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+
+
+def _cfg(key, default):
+    """Legge una chiave da config.env. I wrapper sono invocati con `sudo -n -u`,
+    che filtra l'ambiente: non possono ereditare le variabili del servizio."""
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+PROJECT_UNIX_USER = _cfg("AGENT_HUB_PROJECT_USER", "projectagent")
+SERVER_UNIX_USER = _cfg("AGENT_HUB_SERVER_USER", "serveragent")
+
+
+PROJECT_ROOT = "/srv/agent-workspace/projects"
+DATA_ROOT = "/srv/agent-workspace/data"
+DEPLOY_ROOT = "/srv/agent-workspace/deployments"
+TEMPLATE = "/srv/agent-workspace/templates/project"
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+COMPOSE_ACTIONS = {
+    "build-up": ["up", "-d", "--build"],
+    "pull-up": ["up", "-d", "--pull", "always"],
+    "restart": ["restart"],
+    "stop": ["stop"],
+    "down": ["down"],
+    "ps": ["ps", "--format", "json"],
+    "logs": ["logs", "--tail", "200", "--no-color"],
+}
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def env():
+    u = pwd.getpwuid(os.getuid())
+    e = {
+        "HOME": u.pw_dir, "USER": u.pw_name, "LOGNAME": u.pw_name,
+        "PATH": f"{u.pw_dir}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if u.pw_name == PROJECT_UNIX_USER:
+        rt = f"/run/user/{u.pw_uid}"
+        e["XDG_RUNTIME_DIR"] = rt
+        e["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={rt}/bus"
+        e["DOCKER_HOST"] = f"unix://{rt}/docker.sock"
+    return e
+
+
+def run(cmd, cwd=None, timeout=900):
+    return subprocess.run(cmd, cwd=cwd, env=env(), capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def check_slug(slug):
+    if not SLUG_RE.match(slug):
+        die("slug non valido (minuscole, cifre, . _ -)")
+    return slug
+
+
+def project_path(slug):
+    p = os.path.realpath(os.path.join(PROJECT_ROOT, check_slug(slug)))
+    root = os.path.realpath(PROJECT_ROOT)
+    if not (p == root or p.startswith(root + os.sep)):
+        die("percorso progetto fuori dalla root consentita")
+    return p
+
+
+def fix_perms(path):
+    os.umask(0o002)
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            fp = os.path.join(root, d)
+            try:
+                os.chmod(fp, os.stat(fp).st_mode | 0o2770)
+            except OSError:
+                pass
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                os.chmod(fp, os.stat(fp).st_mode | 0o660)
+            except OSError:
+                pass
+
+
+def copy_template(dest):
+    """Copia solo i file mancanti; non sovrascrive nulla."""
+    added = []
+    for root, _dirs, files in os.walk(TEMPLATE):
+        rel = os.path.relpath(root, TEMPLATE)
+        target_dir = dest if rel == "." else os.path.join(dest, rel)
+        os.makedirs(target_dir, exist_ok=True)
+        for f in files:
+            target = os.path.join(target_dir, f)
+            if not os.path.exists(target):
+                shutil.copy2(os.path.join(root, f), target)
+                added.append(os.path.relpath(target, dest))
+    return added
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_new(argv):
+    if len(argv) != 1:
+        die("uso: new <slug>")
+    path = project_path(argv[0])
+    if os.path.exists(path):
+        die("il progetto esiste gia'")
+    os.umask(0o002)
+    os.makedirs(path, 0o2775)
+    added = copy_template(path)
+    run(["git", "init", "-b", "main"], cwd=path)
+    run(["git", "add", "-A"], cwd=path)
+    run(["git", "-c", "user.name=devagent",
+         "-c", "user.email=devagent@localhost",
+         "commit", "-m", "chore: struttura iniziale del progetto"], cwd=path)
+    fix_perms(path)
+    print(json.dumps({"path": path, "created": added}))
+
+
+# URL con schema esplicito: https:// oppure ssh://
+URL_SCHEME_RE = re.compile(r"^(https|ssh)://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$")
+# Sintassi scp-style di git: [utente@]host:percorso — e' quella che usano sia
+# `git@github.com:OWNER/REPO.git` sia gli alias SSH delle deploy key generate
+# qui (`github-<slug>:OWNER/REPO.git`, l'URL che la pagina stessa suggerisce).
+# Il primo carattere non puo' essere `-`: nessun argomento puo' travestirsi da
+# opzione di `git clone`. Il percorso non puo' iniziare con `/`: cosi' la
+# forma resta quella di un repo remoto e non passa `file:///…`, che sarebbe un
+# trasporto locale, ne' altri schemi travestiti da host.
+URL_SCP_RE = re.compile(
+    r"^([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*"
+    r":[A-Za-z0-9._~+-][A-Za-z0-9._~/+-]*$")
+
+
+def valid_repo_url(url):
+    return bool(URL_SCHEME_RE.match(url) or URL_SCP_RE.match(url))
+
+
+def cmd_clone(argv):
+    if len(argv) < 2:
+        die("uso: clone <slug> <url> [ssh-key-name]")
+    path = project_path(argv[0])
+    url = argv[1]
+    if os.path.exists(path):
+        die("il progetto esiste gia'")
+    if not valid_repo_url(url):
+        die(f"URL repository non valido: {url}\n"
+            "Forme accettate:\n"
+            "  https://github.com/OWNER/REPO.git\n"
+            "  git@github.com:OWNER/REPO.git\n"
+            "  ssh://git@github.com/OWNER/REPO.git\n"
+            "  ALIAS:OWNER/REPO.git        (alias SSH di una deploy key, es. github-lsar)")
+    e = env()
+    key = argv[2] if len(argv) > 2 else ""
+    if key:
+        if not re.match(r"^[A-Za-z0-9._-]{1,64}$", key):
+            # errore frequente: qui si incolla la chiave pubblica invece del suo nome
+            die(f"nome chiave non valido: {key[:60]}\n"
+                "Questo campo vuole il NOME della deploy key (di norma lo slug del "
+                "progetto, es. «lsar»), non la chiave pubblica.")
+        kp = os.path.join(e["HOME"], ".ssh", "repo-keys", key, "id_ed25519")
+        if not os.path.isfile(kp):
+            die(f"chiave inesistente: {kp}")
+        e["GIT_SSH_COMMAND"] = (
+            f"ssh -i {kp} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        )
+    os.umask(0o002)
+    r = subprocess.run(["git", "clone", url, path], env=e, capture_output=True,
+                       text=True, timeout=1800)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip(), 3)
+    fix_perms(path)
+    print(json.dumps({"path": path, "output": (r.stdout + r.stderr).strip()}))
+
+
+def cmd_init_instructions(argv):
+    if len(argv) != 1:
+        die("uso: init-instructions <slug>")
+    path = project_path(argv[0])
+    if not os.path.isdir(path):
+        die("progetto inesistente")
+    added = copy_template(path)
+    fix_perms(path)
+    print(json.dumps({"path": path, "created": added}))
+
+
+def cmd_adopt(argv):
+    """adopt <slug> — registra una directory gia' presente sotto projects/."""
+    if len(argv) != 1:
+        die("uso: adopt <slug>")
+    path = project_path(argv[0])
+    if not os.path.isdir(path):
+        die("directory inesistente sotto /srv/agent-workspace/projects")
+    print(json.dumps({"path": path, "git": os.path.isdir(os.path.join(path, ".git"))}))
+
+
+def cmd_status(argv):
+    if len(argv) != 1:
+        die("uso: status <slug>")
+    path = project_path(argv[0])
+    if not os.path.isdir(path):
+        die("progetto inesistente")
+    out = {"path": path, "git": False, "branch": "", "short": "", "remote": "",
+           "compose": None, "handoff": ""}
+    if os.path.isdir(os.path.join(path, ".git")):
+        out["git"] = True
+        out["branch"] = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path).stdout.strip()
+        out["short"] = run(["git", "status", "--short"], cwd=path).stdout.strip()
+        out["remote"] = run(["git", "remote", "-v"], cwd=path).stdout.strip()
+    for cf in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"):
+        if os.path.isfile(os.path.join(path, cf)):
+            out["compose"] = cf
+            break
+    hp = os.path.join(path, ".agent", "HANDOFF.md")
+    if os.path.isfile(hp):
+        with open(hp, errors="replace") as fh:
+            out["handoff"] = fh.read()[:20000]
+    print(json.dumps(out))
+
+
+def cmd_changed(argv):
+    """changed <slug> [<base>] — percorsi toccati rispetto a un punto di partenza.
+
+    Unisce cio' che e' stato committato dopo `base` e cio' che e' ancora nel
+    worktree (modificato o non tracciato). Serve a verificare che una sessione
+    abbia rispettato il perimetro dichiarato. Sola lettura.
+    """
+    if len(argv) not in (1, 2):
+        die("uso: changed <slug> [<base>]")
+    path = project_path(argv[0])
+    base = (argv[1] if len(argv) > 1 else "").strip()
+    if not os.path.isdir(os.path.join(path, ".git")):
+        die("progetto senza repository git")
+    if base and not re.fullmatch(r"[0-9a-fA-F]{7,40}", base):
+        die("base non valida: atteso uno sha esadecimale")
+    head = run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
+    changed = set()
+    if base:
+        r = run(["git", "diff", "--name-only", f"{base}..HEAD"], cwd=path)
+        if r.returncode != 0:
+            die((r.stderr or r.stdout).strip() or "diff fallito")
+        changed.update(line.strip() for line in r.stdout.splitlines() if line.strip())
+    r = run(["git", "status", "--porcelain", "-z"], cwd=path)
+    for entry in r.stdout.split("\0"):
+        if len(entry) > 3:
+            changed.add(entry[3:].strip())
+    print(json.dumps({"head": head, "base": base,
+                      "changed": sorted(p for p in changed if p)}))
+
+
+def cmd_deploykey(argv):
+    """deploykey <slug> — genera una chiave Ed25519 read-only dedicata al repo."""
+    if len(argv) != 1:
+        die("uso: deploykey <slug>")
+    slug = check_slug(argv[0])
+    e = env()
+    d = os.path.join(e["HOME"], ".ssh", "repo-keys", slug)
+    os.makedirs(d, 0o700, exist_ok=True)
+    kp = os.path.join(d, "id_ed25519")
+    if not os.path.isfile(kp):
+        r = run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C",
+                 f"devagent-deploykey-{slug}", "-f", kp])
+        if r.returncode != 0:
+            die((r.stderr or r.stdout).strip(), 3)
+    with open(kp + ".pub") as fh:
+        pub = fh.read().strip()
+    # voce dedicata in ~/.ssh/config con host alias per repo
+    cfg = os.path.join(e["HOME"], ".ssh", "config")
+    alias = f"github-{slug}"
+    block = (f"\nHost {alias}\n  HostName github.com\n  User git\n"
+             f"  IdentityFile {kp}\n  IdentitiesOnly yes\n")
+    existing = ""
+    if os.path.isfile(cfg):
+        with open(cfg) as fh:
+            existing = fh.read()
+    if f"Host {alias}\n" not in existing:
+        with open(cfg, "a") as fh:
+            fh.write(block)
+        os.chmod(cfg, 0o600)
+    print(json.dumps({"slug": slug, "path": kp, "public_key": pub, "ssh_alias": alias,
+                      "clone_url_hint": f"{alias}:OWNER/REPO.git"}))
+
+
+def cmd_compose(argv):
+    if len(argv) != 2:
+        die("uso: compose <slug> <action>")
+    path = project_path(argv[0])
+    action = argv[1]
+    if action not in COMPOSE_ACTIONS:
+        die("azione compose non consentita: " + ", ".join(sorted(COMPOSE_ACTIONS)))
+    cf = None
+    for c in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"):
+        if os.path.isfile(os.path.join(path, c)):
+            cf = c
+            break
+    if not cf:
+        die("nessun compose.yaml nel progetto")
+    slug = os.path.basename(path)
+    os.makedirs(os.path.join(DATA_ROOT, slug), 0o2770, exist_ok=True)
+    os.makedirs(os.path.join(DEPLOY_ROOT, slug), 0o2770, exist_ok=True)
+    e = env()
+    e["PROJECT_DATA_DIR"] = os.path.join(DATA_ROOT, slug)
+    cmd = ["docker", "compose", "-p", f"agentapp-{slug}", "-f", os.path.join(path, cf),
+           *COMPOSE_ACTIONS[action]]
+    r = subprocess.run(cmd, cwd=path, env=e, capture_output=True, text=True, timeout=1800)
+    print(json.dumps({"action": action, "rc": r.returncode,
+                      "output": (r.stdout + r.stderr)[-60000:]}))
+
+
+def cmd_docker_status(argv):
+    e = env()
+    r = subprocess.run(["docker", "ps", "-a", "--format",
+                        "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"],
+                       env=e, capture_output=True, text=True, timeout=60)
+    print(json.dumps({"rc": r.returncode, "output": (r.stdout + r.stderr).strip()}))
+
+
+# ------------------------------------------------------------- documenti
+#
+# I documenti caricati dal browser arrivano in /srv/agent-workspace/uploads
+# (di proprieta' del servizio) e vengono copiati qui come `devagent`, cosi'
+# i file del progetto restano devagent:agentprojects.
+
+UPLOAD_ROOT = "/srv/agent-workspace/uploads"
+KNOWLEDGE_ROOT = "/srv/agent-workspace/knowledge/projects"
+DOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$")
+
+
+# Sottocartella per materiale di terze parti i cui diritti di redistribuzione
+# non sono ancora stati verificati. Il nome e' esplicito perche' deve saltare
+# all'occhio nella review che precede qualsiasi rilascio.
+UNVERIFIED_SUBDIR = "license-unverified"
+DOC_SUBDIRS = ("", UNVERIFIED_SUBDIR)
+
+UNVERIFIED_README = """# Third-Party Material With Unverified License
+
+Files here were imported through Agent Hub without confirming redistribution
+rights for the source material.
+
+Do not publish, package, or release anything in this directory until the
+applicable terms and conditions have been checked and the file has been moved
+out of here deliberately.
+"""
+
+
+def docs_dir(slug, subdir=""):
+    if subdir not in DOC_SUBDIRS:
+        die(f"sottocartella documenti non consentita: {subdir}")
+    base = os.path.join(project_path(slug), "docs", "input")
+    d = os.path.join(base, subdir) if subdir else base
+    os.umask(0o002)
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o2775)
+        os.chmod(base, 0o2775)
+        os.chmod(os.path.dirname(base), 0o2775)
+    except OSError:
+        pass
+    if subdir == UNVERIFIED_SUBDIR:
+        readme = os.path.join(d, "README.md")
+        if not os.path.exists(readme):
+            with open(readme, "w", encoding="utf-8") as fh:
+                fh.write(UNVERIFIED_README)
+            try:
+                os.chmod(readme, 0o664)
+            except OSError:
+                pass
+    return d
+
+
+def knowledge_dir(slug):
+    d = os.path.join(KNOWLEDGE_ROOT, check_slug(slug))
+    os.umask(0o002)
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o2775)
+    except OSError:
+        pass
+    return d
+
+
+def check_doc_name(name):
+    if not DOC_NAME_RE.match(name) or "/" in name or ".." in name:
+        die(f"nome documento non valido: {name}")
+    return name
+
+
+def cmd_doc_import(argv):
+    """doc-import <slug> <file-sorgente> <nome-destinazione> [sottocartella]"""
+    if len(argv) not in (3, 4):
+        die("uso: doc-import <slug> <src> <nome> [sottocartella]")
+    subdir = argv[3] if len(argv) == 4 else ""
+    slug = check_slug(argv[0])
+    src = os.path.realpath(argv[1])
+    root = os.path.realpath(UPLOAD_ROOT)
+    if not (src.startswith(root + os.sep)
+            or src.startswith(os.path.realpath(PROJECT_ROOT) + os.sep)
+            or src.startswith(os.path.realpath("/srv/agent-workspace/knowledge") + os.sep)):
+        die("sorgente non consentita")
+    if not os.path.isfile(src):
+        die("file sorgente inesistente")
+    name = check_doc_name(argv[2])
+    target = docs_dir(slug, subdir)
+    dest = os.path.join(target, name)
+    base, ext = os.path.splitext(name)
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        name = f"{base}-{n}{ext}"
+        dest = os.path.join(target, name)
+    shutil.copyfile(src, dest)
+    try:
+        os.chmod(dest, 0o664)
+    except OSError:
+        pass
+    print(json.dumps({"path": dest, "name": name, "subdir": subdir}))
+
+
+def cmd_doc_delete(argv):
+    """doc-delete <slug> <nome> [sottocartella]"""
+    if len(argv) not in (2, 3):
+        die("uso: doc-delete <slug> <nome> [sottocartella]")
+    slug = check_slug(argv[0])
+    name = check_doc_name(argv[1])
+    path = os.path.join(docs_dir(slug, argv[2] if len(argv) == 3 else ""), name)
+    if os.path.isfile(path):
+        os.unlink(path)
+        print(json.dumps({"deleted": path}))
+    else:
+        print(json.dumps({"deleted": ""}))
+
+
+def cmd_knowledge_import(argv):
+    """knowledge-import <slug> <file-sorgente> <nome-destinazione>."""
+    if len(argv) != 3:
+        die("uso: knowledge-import <slug> <src> <nome>")
+    slug = check_slug(argv[0])
+    src = os.path.realpath(argv[1])
+    allowed = (os.path.realpath(UPLOAD_ROOT), os.path.realpath(PROJECT_ROOT),
+               os.path.realpath("/srv/agent-workspace/knowledge"))
+    if not any(src.startswith(root + os.sep) for root in allowed):
+        die("sorgente non consentita")
+    if not os.path.isfile(src):
+        die("file sorgente inesistente")
+    name = check_doc_name(argv[2])
+    dest = os.path.join(knowledge_dir(slug), name)
+    if os.path.realpath(src) == os.path.realpath(dest):
+        print(json.dumps({"path": dest, "name": name}))
+        return
+    base, ext = os.path.splitext(name)
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        name = f"{base}-{n}{ext}"
+        dest = os.path.join(knowledge_dir(slug), name)
+    shutil.copyfile(src, dest)
+    os.chmod(dest, 0o664)
+    print(json.dumps({"path": dest, "name": name}))
+
+
+def cmd_knowledge_delete(argv):
+    if len(argv) != 2:
+        die("uso: knowledge-delete <slug> <nome>")
+    slug = check_slug(argv[0])
+    name = check_doc_name(argv[1])
+    path = os.path.join(knowledge_dir(slug), name)
+    if os.path.isfile(path):
+        os.unlink(path)
+        print(json.dumps({"deleted": path}))
+    else:
+        print(json.dumps({"deleted": ""}))
+
+
+def cmd_ls(argv):
+    """ls <path> — elenco delle sottodirectory, per il selettore di percorso."""
+    if len(argv) != 1:
+        die("uso: ls <path>")
+    path = os.path.realpath(argv[0] or "/")
+    if not os.path.isdir(path):
+        die(f"directory inesistente: {path}")
+    entries = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    if e.is_dir():
+                        entries.append(e.name)
+                except OSError:
+                    pass
+    except PermissionError:
+        die(f"permesso negato su {path}")
+    entries.sort()
+    print(json.dumps({"path": path, "parent": os.path.dirname(path) or "/",
+                      "dirs": entries[:500]}))
+
+
+COMMANDS = {
+    "new": cmd_new, "clone": cmd_clone, "init-instructions": cmd_init_instructions,
+    "adopt": cmd_adopt, "status": cmd_status, "deploykey": cmd_deploykey,
+    "compose": cmd_compose, "docker-status": cmd_docker_status,
+    "doc-import": cmd_doc_import, "doc-delete": cmd_doc_delete,
+    "knowledge-import": cmd_knowledge_import, "knowledge-delete": cmd_knowledge_delete,
+    "ls": cmd_ls, "changed": cmd_changed,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        die("comandi: " + ", ".join(sorted(COMMANDS)))
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

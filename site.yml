@@ -50,3 +50,5 @@
       tags: [ssh_hardening, ssh, baseline]
     - role: firewall
       tags: [firewall, baseline]
+    - role: agent_hub
+      tags: [agent_hub]

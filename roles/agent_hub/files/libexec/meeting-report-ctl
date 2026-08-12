@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Agent Hub — validatore e salvataggio dei report di riunione.
+
+Chiamato esclusivamente da `agent-meeting-report` via sudo. Riceve l'input JSON
+su stdin e lo valida prima di salvarlo nel database.
+
+Uso:
+    meeting-report-ctl submit <meeting_id> <session_id> <unix_user>
+
+Legge JSON da stdin. Valida:
+  - UUID formali per meeting e session
+  - Associazione sessione-meeting nel DB
+  - Status meeting = analyzing o revising
+  - Campi JSON ammessi e limiti
+
+Salva proposal_json e imposta status = awaiting_approval.
+NON modifica il round.
+Nessuna rete, nessun accesso a file arbitrari.
+"""
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timezone
+
+
+def _cfg(key, default):
+    """Legge una chiave da config.env. I wrapper sono invocati con `sudo -n -u`,
+    che filtra l'ambiente: non possono ereditare le variabili del servizio."""
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+PROJECT_UNIX_USER = _cfg("AGENT_HUB_PROJECT_USER", "projectagent")
+SERVER_UNIX_USER = _cfg("AGENT_HUB_SERVER_USER", "serveragent")
+
+
+DB = os.environ.get("AGENT_HUB_DB", "/var/lib/agent-hub/agent-hub.sqlite3")
+
+MAX_STDIN = 128 * 1024
+
+# Campi ammessi nella proposal
+ALLOWED_FIELDS = {"summary", "decisions", "actions", "operational_prompt", "target_architecture"}
+
+# Limiti
+MAX_SUMMARY = 5000
+MAX_DECISIONS = 50
+MAX_ACTIONS = 50
+MAX_OP_PROMPT = 20000
+MAX_TARGET_ARCH = 50000
+MAX_DECISION_TITLE = 500
+MAX_DECISION_DETAIL = 3000
+MAX_ACTION_TITLE = 500
+MAX_ACTION_DETAIL = 3000
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def db():
+    conn = sqlite3.connect(DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def fail(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------ minuta della riunione
+#
+# Un solo file per riunione, riscritto a ogni round: la cartella della riunione
+# resta a tre file (audio, trascrizione, minuta) qualunque sia il numero di
+# revisioni. Il messaggio Telegram porta solo le decisioni da approvare; qui
+# sta tutto il resto, per chi vuole entrare nel dettaglio.
+
+MINUTES_NAME = "minutes.md"
+
+
+def meeting_dir(meeting) -> str:
+    """Cartella della riunione, dedotta dai percorsi gia' registrati."""
+    for key in ("transcript_path", "audio_path"):
+        path = (meeting[key] or "").strip() if key in meeting.keys() else ""
+        if path:
+            return os.path.dirname(path)
+    return ""
+
+
+def minutes_markdown(meeting, proposal: dict) -> str:
+    """Minuta completa in Markdown: decisioni prima, riepilogo in fondo."""
+    lines = [f"# Minuta — {meeting['title']}", ""]
+    lines.append(f"- Progetto: {meeting['project_slug']}")
+    lines.append(f"- Data riunione: {meeting['meeting_date'] or '—'}")
+    lines.append(f"- Round: {meeting['round']}")
+    lines.append(f"- Minuta generata: {now()}")
+    lines.append("")
+
+    def section(title, items):
+        if not items:
+            return
+        lines.append(f"## {title}")
+        lines.append("")
+        for index, item in enumerate(items, start=1):
+            head = (item.get("title") or "").strip() or f"punto {index}"
+            lines.append(f"### {index}. {head}")
+            detail = (item.get("detail") or "").strip()
+            if detail:
+                lines.append("")
+                lines.append(detail)
+            lines.append("")
+
+    section("Decisioni", proposal.get("decisions") or [])
+    section("Azioni", proposal.get("actions") or [])
+    for title, body in (("Prompt operativo", proposal.get("operational_prompt")),
+                        ("Architettura target", proposal.get("target_architecture")),
+                        ("Riepilogo della discussione", proposal.get("summary"))):
+        body = (body or "").strip()
+        if body:
+            lines.append(f"## {title}")
+            lines.append("")
+            lines.append(body)
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_minutes(conn, meeting, proposal: dict) -> str:
+    """Scrive la minuta e la registra una sola volta nel catalogo Documenti.
+
+    Il record e' cercato per percorso: al secondo round il file viene riscritto
+    e la riga esistente aggiornata, senza creare un documento nuovo.
+    """
+    directory = meeting_dir(meeting)
+    if not directory or not os.path.isdir(directory):
+        return ""
+    path = os.path.join(directory, MINUTES_NAME)
+    text = minutes_markdown(meeting, proposal)
+    try:
+        tmp = f"{path}.tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        os.chmod(path, 0o664)
+    except OSError as exc:
+        print(f"minuta non scritta: {exc}", file=sys.stderr)
+        return ""
+    size = len(text.encode("utf-8"))
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    name = f"minuta-{meeting['title']}.md"
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name)[:120]
+    row = conn.execute("SELECT id FROM documents WHERE path=?", (path,)).fetchone()
+    if row:
+        conn.execute("UPDATE documents SET size=?, sha256=?, name=? WHERE id=?",
+                     (size, sha, name, row["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO documents (id,name,original_name,path,project_slug,scope,size,"
+            "sha256,content_type,created_at) VALUES (?,?,?,?,?,'private',?,?,'text/markdown',?)",
+            (str(uuid.uuid4()), name, MINUTES_NAME, path,
+             meeting["project_slug"], size, sha, now()))
+    return path
+
+
+def is_uuid(val: str) -> bool:
+    try:
+        uuid.UUID(val)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def canonicalize(data: dict) -> dict:
+    """Mantiene solo i campi ammessi e li tronca ai limiti."""
+    out = {}
+    for field in ALLOWED_FIELDS:
+        if field not in data:
+            continue
+        val = data[field]
+        if field == "summary":
+            out[field] = str(val)[:MAX_SUMMARY] if val else ""
+        elif field == "operational_prompt":
+            out[field] = str(val)[:MAX_OP_PROMPT] if val else ""
+        elif field == "target_architecture":
+            out[field] = str(val)[:MAX_TARGET_ARCH] if val else ""
+        elif field == "decisions":
+            items = val if isinstance(val, list) else []
+            clean = []
+            for d in items[:MAX_DECISIONS]:
+                if isinstance(d, dict):
+                    clean.append({
+                        "title": str(d.get("title", ""))[:MAX_DECISION_TITLE],
+                        "detail": str(d.get("detail", ""))[:MAX_DECISION_DETAIL],
+                    })
+                elif isinstance(d, str):
+                    clean.append({"title": d[:MAX_DECISION_TITLE], "detail": ""})
+            out[field] = clean
+        elif field == "actions":
+            items = val if isinstance(val, list) else []
+            clean = []
+            for a in items[:MAX_ACTIONS]:
+                if isinstance(a, dict):
+                    clean.append({
+                        "title": str(a.get("title", ""))[:MAX_ACTION_TITLE],
+                        "detail": str(a.get("detail", ""))[:MAX_ACTION_DETAIL],
+                    })
+                elif isinstance(a, str):
+                    clean.append({"title": a[:MAX_ACTION_TITLE], "detail": ""})
+            out[field] = clean
+    return out
+
+
+def cmd_submit(meeting_id: str, session_id: str, unix_user: str) -> None:
+    # Leggi stdin
+    try:
+        raw = sys.stdin.buffer.read(MAX_STDIN + 1)
+    except (OSError, IOError):
+        fail("impossibile leggere stdin")
+    if len(raw) > MAX_STDIN:
+        fail("input troppo grande (massimo 128 KiB)")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"JSON non valido: {exc}")
+    if not isinstance(data, dict):
+        fail("il JSON deve essere un oggetto")
+
+    # Valida UUID
+    if not is_uuid(meeting_id):
+        fail(f"meeting_id non e' un UUID valido: {meeting_id}")
+    if not is_uuid(session_id):
+        fail(f"session_id non e' un UUID valido: {session_id}")
+    if unix_user not in (PROJECT_UNIX_USER, SERVER_UNIX_USER):
+        fail("utente agente non ammesso")
+
+    # Verifica su DB
+    conn = db()
+    try:
+        meeting = conn.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
+        if not meeting:
+            fail(f"meeting non trovato: {meeting_id}")
+        if meeting["status"] not in ("analyzing", "revising"):
+            fail(f"il meeting non e' in analisi o revisione (stato: {meeting['status']})")
+        # Verifica che la sessione sia associata al meeting
+        if meeting["analysis_session_id"] != session_id:
+            fail(f"la sessione {session_id} non corrisponde all'analisi del meeting {meeting_id}")
+        # Canonicalizza e salva
+        proposal = canonicalize(data)
+        if not proposal.get("summary", "").strip():
+            fail("summary obbligatorio e non vuoto")
+        proposal.setdefault("decisions", [])
+        proposal.setdefault("actions", [])
+        proposal.setdefault("operational_prompt", "")
+        proposal.setdefault("target_architecture", "")
+        proposal_json = json.dumps(proposal, ensure_ascii=False)
+        conn.execute(
+            "UPDATE meetings SET proposal_json=?, status='awaiting_approval', updated_at=? WHERE id=?",
+            (proposal_json, now(), meeting_id))
+        minutes_path = write_minutes(conn, meeting, proposal)
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(json.dumps({"ok": True, "meeting": meeting_id, "session": session_id,
+                      "status": "awaiting_approval", "minutes": minutes_path}))
+    sys.exit(0)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    action = sys.argv[1]
+    if action != "submit":
+        print(f"azione sconosciuta: {action}", file=sys.stderr)
+        sys.exit(2)
+    if len(sys.argv) != 5:
+        print("Uso: meeting-report-ctl submit <meeting_id> <session_id> <unix_user>",
+              file=sys.stderr)
+        sys.exit(2)
+    meeting_id = sys.argv[2]
+    session_id = sys.argv[3]
+    unix_user = sys.argv[4]
+    cmd_submit(meeting_id, session_id, unix_user)
+
+
+if __name__ == "__main__":
+    main()

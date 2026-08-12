@@ -55,6 +55,12 @@ trusted CIDRs or the Tailscale interface. The playbook checks the admin key,
 | Tailscale installation | disabled |
 | SSH hardening | disabled, confirmation required |
 | UFW firewall | disabled, confirmation required |
+| Agent Hub (agent sessions behind a private web UI) | disabled |
+
+The Agent Hub role installs a private web UI that drives persistent
+`tmux` agent sessions, with the web service separated from the agent
+accounts by root-owned wrappers; see
+[roles/agent_hub/README.md](roles/agent_hub/README.md).
 
 See [installation](docs/INSTALL.md), [SSH setup and recovery](docs/SSH.md),
 and [security](SECURITY.md). Other distributions require a fork with adjusted

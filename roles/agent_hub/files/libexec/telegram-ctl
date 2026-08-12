@@ -1,0 +1,1407 @@
+#!/usr/bin/env python3
+"""Agent Hub — notificatore Telegram.
+
+Gira come account di servizio sotto `agent-hub-telegram.service`. Due compiti in un solo
+ciclo, senza dipendenze esterne (solo `urllib` della standard library):
+
+  * **notifica** gli eventi gia' prodotti dal controller — stati finali
+    registrati con `agent-report`, stati dedotti che richiedono attenzione,
+    cambi di stato del controllo di salute;
+  * **risponde** ai comandi in arrivo via long polling (`getUpdates`).
+
+Il notificatore non calcola nulla: legge `session_reports`, `sessions.lifecycle`
+e lo storico di `agent-hub-health`. Se questo servizio e' fermo, l'Agent Hub
+funziona esattamente come prima — l'integrazione e' un consumatore, non un
+componente del percorso critico.
+
+Consegna una sola volta: ogni evento notificato lascia una riga in
+`notifications`, con chiave l'evento e non il messaggio.
+
+Comandi: /start /aiuto /stato /sessioni /sessione <id> /salute /riunioni
+Le sole scritture sono voti e richieste di revisione delle riunioni, limitate
+alle due chat esplicitamente autorizzate; il bot non comanda sessioni o host.
+
+Uso:
+    telegram-ctl run          ciclo continuo (usato dall'unit systemd)
+    telegram-ctl test         invia un messaggio di prova e esce
+    telegram-ctl check        verifica token e configurazione, non invia nulla
+    telegram-ctl pair         mostra le chat che hanno scritto al bot
+"""
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+CONFIG_FILE = "/etc/agent-hub/telegram.env"
+DB = "/var/lib/agent-hub/agent-hub.sqlite3"
+STATE_DIR = "/var/lib/agent-hub/telegram"
+STATE = os.path.join(STATE_DIR, "state.json")
+HEALTH_LAST = "/var/lib/agent-hub/health/last.json"
+HEALTH_HISTORY = "/var/lib/agent-hub/health/history.jsonl"
+PRESENCE_FILE = "/var/lib/agent-hub/ui-activity.json"
+API = "https://api.telegram.org"
+CHANNEL = "telegram"
+
+# Stati dedotti dal controller che meritano un avviso. Gli stati dichiarati
+# dall'agente si notificano tutti, perche' e' l'agente ad averlo chiesto.
+ALERT_LIFECYCLES = ("CRASHED", "ENDED_UNREPORTED", "AUTH_REQUIRED",
+                    "USAGE_LIMIT", "POSSIBLY_STALLED")
+
+ICON = {
+    "COMPLETED": "✅", "NEEDS_INPUT": "❓", "NEEDS_HOST_ACTION": "🛠",
+    "FAILED": "❌", "CANCELLED": "⚪", "CRASHED": "💥",
+    "ENDED_UNREPORTED": "⚠️", "POSSIBLY_STALLED": "🐢",
+    "AUTH_REQUIRED": "🔑", "USAGE_LIMIT": "⏳", "RUNNING": "▶️", "STARTING": "🚀",
+    "OK": "✅", "WARNING": "⚠️", "CRITICAL": "🚨",
+}
+LABEL = {
+    "COMPLETED": "Completato", "NEEDS_INPUT": "Attende input",
+    "NEEDS_HOST_ACTION": "Richiede azione host", "FAILED": "Fallito",
+    "CANCELLED": "Annullato", "CRASHED": "Crash",
+    "ENDED_UNREPORTED": "Concluso senza report", "POSSIBLY_STALLED": "Forse bloccato",
+    "AUTH_REQUIRED": "Login richiesto", "USAGE_LIMIT": "Limite d'uso",
+    "RUNNING": "In esecuzione", "STARTING": "Avvio",
+}
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# ------------------------------------------------------------ configurazione
+
+def load_config():
+    """Legge il file in stile env. Le chiavi mancanti restano stringhe vuote."""
+    cfg = {"token": "", "chat_id": "", "pairing_code": "", "meeting_approvers_csv": "",
+           "origin": "", "notify": "reports,lifecycle,health",
+           "poll_timeout": "25", "quiet": "0", "verbosity": "compact",
+           "active_pause_seconds": "0"}
+    keys = {
+        "AGENT_HUB_TG_VERBOSITY": "verbosity",
+        "AGENT_HUB_TG_TOKEN": "token",
+        "AGENT_HUB_TG_CHAT_ID": "chat_id",
+        "AGENT_HUB_TG_PAIRING_CODE": "pairing_code",
+        "AGENT_HUB_TG_ORIGIN": "origin",
+        "AGENT_HUB_TG_NOTIFY": "notify",
+        "AGENT_HUB_TG_POLL_TIMEOUT": "poll_timeout",
+        "AGENT_HUB_TG_QUIET": "quiet",
+        "AGENT_HUB_TG_ACTIVE_PAUSE_SECONDS": "active_pause_seconds",
+        "AGENT_HUB_TG_MEETING_APPROVERS": "meeting_approvers_csv",
+    }
+    try:
+        with open(CONFIG_FILE) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() in keys:
+                    cfg[keys[k.strip()]] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for env, key in keys.items():        # l'ambiente ha comunque la precedenza
+        if os.environ.get(env):
+            cfg[key] = os.environ[env]
+    if cfg["verbosity"] not in ("compact", "full"):
+        cfg["verbosity"] = "compact"
+    return cfg
+
+
+def ui_is_active(cfg):
+    """Attivita' recente nella pagina Agent Hub, mai semplice pagina aperta."""
+    try:
+        window = max(0, int(cfg.get("active_pause_seconds", "0")))
+        age = time.time() - os.stat(PRESENCE_FILE).st_mtime
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(window and 0 <= age <= window)
+
+
+def get_meeting_approvers(cfg, state):
+    """Approvatori effettivi: unione ordinata di primaria, CSV e state, max 2."""
+    primary = str(cfg.get("chat_id", "") or state.get("chat_id", "")).strip()
+    csv_ids = [x.strip() for x in cfg.get("meeting_approvers_csv", "").split(",") if x.strip()]
+    state_ids = state.get("meeting_approvers", [])
+    if not isinstance(state_ids, list):
+        state_ids = []
+    seen = set()
+    result = []
+    for cid in [primary] + csv_ids + state_ids:
+        cid = str(cid).strip()
+        if cid and cid not in seen:
+            seen.add(cid)
+            result.append(cid)
+        if len(result) >= 2:
+            break
+    return result
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = f"{STATE}.tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE)
+        os.chmod(STATE, 0o600)
+    except OSError as exc:
+        log(f"stato non salvato: {exc}")
+
+
+def chat_id_of(cfg, state):
+    """La chat configurata a mano vince su quella appresa con /start."""
+    return str(cfg["chat_id"] or state.get("chat_id") or "").strip()
+
+
+def is_secondary_approver(cfg, state, sender):
+    """True se `sender` è un approvatore riunioni ma NON la chat primaria."""
+    primary = chat_id_of(cfg, state)
+    if not primary or sender == primary:
+        return False
+    approvers = get_meeting_approvers(cfg, state)
+    return sender in approvers
+
+
+# ------------------------------------------------------------- API Telegram
+
+class TelegramError(Exception):
+    pass
+
+
+def call(cfg, method, params=None, timeout=60):
+    if not cfg["token"]:
+        raise TelegramError("token non configurato")
+    url = f"{API}/bot{cfg['token']}/{method}"
+    data = urllib.parse.urlencode(params or {}).encode()
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type":
+                                          "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise TelegramError(f"HTTP {exc.code}: {detail}")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise TelegramError(str(exc))
+    if not body.get("ok"):
+        raise TelegramError(str(body.get("description", body))[:300])
+    return body.get("result")
+
+
+def send(cfg, chat, text, silent=False, button_url="", reply_markup=None):
+    """Testo semplice, mai markdown: i riepiloghi li scrivono gli agenti e non
+    devono poter rompere (o sfruttare) la formattazione del messaggio.
+    reply_markup: dict o stringa JSON; se specificato ha precedenza su button_url."""
+    if not chat:
+        return False
+    for attempt in range(3):
+        try:
+            params = {
+                "chat_id": chat, "text": text[:4000],
+                "disable_web_page_preview": "true",
+                "disable_notification": "true" if silent else "false",
+            }
+            if reply_markup is not None:
+                if isinstance(reply_markup, str):
+                    params["reply_markup"] = reply_markup
+                else:
+                    params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+            elif button_url:
+                params["reply_markup"] = json.dumps({"inline_keyboard": [[{
+                    "text": "Apri sessione", "url": button_url,
+                }]]}, ensure_ascii=False)
+            call(cfg, "sendMessage", params)
+            return True
+        except TelegramError as exc:
+            msg = str(exc)
+            wait = 5 * (attempt + 1)
+            m = re.search(r"retry after (\d+)", msg, re.I)
+            if m:
+                wait = int(m.group(1)) + 1
+            if attempt == 2:
+                log(f"invio fallito: {msg}")
+                return False
+            time.sleep(wait)
+    return False
+
+
+# Limite Telegram per messaggio: 4096 caratteri. Restiamo sotto per lasciare
+# spazio all'intestazione «parte i/n» aggiunta a ogni pezzo.
+TELEGRAM_CHUNK = 3800
+
+
+def split_long_line(line, limit=TELEGRAM_CHUNK):
+    """Spezza una singola riga troppo lunga in pezzi di dimensione simile.
+
+    Il taglio cade su uno spazio quando ce n'e' uno vicino: un paragrafo lungo
+    (il prompt operativo, l'architettura target) resta leggibile invece di
+    finire troncato a meta' parola. I pezzi sono equilibrati, cosi' non si
+    ottiene un ultimo messaggio di due caratteri.
+    """
+    parts = []
+    while len(line) > limit:
+        pieces = -(-len(line) // limit)          # quanti pezzi servono ancora
+        target = min(-(-len(line) // pieces), limit)
+        cut = line.rfind(" ", target // 2, target + 1)
+        if cut <= 0:
+            cut = target
+        parts.append(line[:cut].rstrip())
+        line = line[cut:].lstrip()
+    if line:
+        parts.append(line)
+    return parts
+
+
+def split_message(text, limit=TELEGRAM_CHUNK):
+    """Spezza il testo in pezzi sotto il limite, preferendo i confini di riga."""
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        for piece in (split_long_line(line, limit) if len(line) > limit else [line]):
+            candidate = f"{current}\n{piece}" if current else piece
+            if len(candidate) > limit:
+                if current:
+                    chunks.append(current)
+                current = piece
+            else:
+                current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def call_upload(cfg, method, fields, filename, content, content_type, timeout=120):
+    """POST multipart/form-data: `sendDocument` non accetta urlencode."""
+    if not cfg["token"]:
+        raise TelegramError("token non configurato")
+    boundary = "----AgentHub" + os.urandom(16).hex()
+    body = bytearray()
+    for key, value in fields.items():
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                 f"{value}\r\n").encode("utf-8")
+    body += (f"--{boundary}\r\n"
+             f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+             f"Content-Type: {content_type}\r\n\r\n").encode("utf-8")
+    body += content + b"\r\n"
+    body += f"--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(
+        f"{API}/bot{cfg['token']}/{method}", data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raise TelegramError(f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:300]}")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise TelegramError(str(exc))
+    if not payload.get("ok"):
+        raise TelegramError(str(payload.get("description", payload))[:300])
+    return payload.get("result")
+
+
+# Telegram accetta file ben piu' grandi, ma una minuta e' testo: oltre questa
+# soglia c'e' un errore da guardare, non un allegato da mandare.
+MAX_ATTACHMENT = 2 * 1024 * 1024
+
+
+def send_document(cfg, chat, path, caption="", silent=True):
+    """Allega un file alla chat. Il fallimento non blocca il messaggio di voto."""
+    try:
+        size = os.path.getsize(path)
+        if size > MAX_ATTACHMENT:
+            log(f"allegato troppo grande, saltato: {path} ({size} byte)")
+            return False
+        with open(path, "rb") as fh:
+            content = fh.read()
+    except OSError as exc:
+        log(f"allegato non leggibile: {exc}")
+        return False
+    fields = {"chat_id": str(chat),
+              "disable_notification": "true" if silent else "false"}
+    if caption:
+        fields["caption"] = caption[:1024]
+    try:
+        call_upload(cfg, "sendDocument", fields, os.path.basename(path),
+                    content, "text/markdown")
+        return True
+    except TelegramError as exc:
+        log(f"invio allegato fallito: {exc}")
+        return False
+
+
+def send_long(cfg, chat, text, reply_markup=None, silent=False):
+    """Invia un testo di qualsiasi lunghezza in piu' messaggi consecutivi.
+
+    I pulsanti inline stanno su un solo messaggio: vanno sull'ultimo pezzo,
+    cosi' si approva dopo aver letto tutto. Se un pezzo non parte, si ferma
+    tutto e la notifica non viene marcata come inviata: al giro dopo riparte.
+    """
+    chunks = split_message(text)
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+        body = chunk if total == 1 else f"[parte {index}/{total}]\n{chunk}"
+        last = index == total
+        if not send(cfg, chat, body,
+                    silent=silent or not last,
+                    reply_markup=reply_markup if last else None):
+            return False
+    return True
+
+
+# ------------------------------------------------------------------ database
+
+def db(readonly=False):
+    uri = f"file:{DB}?mode=ro" if readonly else f"file:{DB}"
+    conn = sqlite3.connect(uri, uri=True, timeout=20)
+    conn.row_factory = sqlite3.Row
+    if not readonly:
+        conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def already_sent(conn, kind, key):
+    return conn.execute("SELECT 1 FROM notifications WHERE channel=? AND kind=? AND key=?",
+                        (CHANNEL, kind, key)).fetchone() is not None
+
+
+def mark_sent(conn, kind, key, detail=""):
+    conn.execute("INSERT OR REPLACE INTO notifications (channel,kind,key,sent_at,detail) "
+                 "VALUES (?,?,?,?,?)", (CHANNEL, kind, key, now(), detail[:500]))
+
+
+def session_url(cfg, sid):
+    origin = (cfg["origin"] or "").rstrip("/")
+    return f"{origin}/#/session/{sid}" if origin else ""
+
+
+def session_line(row):
+    bits = [row["environment"], row["profile_id"]]
+    if row["project_slug"]:
+        bits.append(row["project_slug"])
+    return " · ".join(b for b in bits if b)
+
+
+# --------------------------------------------------------------- notifiche
+
+def pending_reports(conn):
+    """Stati finali registrati dagli agenti e non ancora notificati."""
+    rows = conn.execute(
+        "SELECT r.rowid AS rid, r.session_id, r.status, r.summary, r.reported_at, "
+        "r.unix_user, s.name, s.environment, s.profile_id, s.project_slug "
+        "FROM session_reports r LEFT JOIN sessions s ON s.id = r.session_id "
+        "ORDER BY r.reported_at, r.rowid").fetchall()
+    return [r for r in rows if not already_sent(conn, "report", f"{r['session_id']}:{r['rid']}")]
+
+
+def clip(text, limit):
+    """Riepilogo accorciato: sul telefono conta il primo colpo d'occhio, il
+    testo intero resta su /sessione e nella pagina web."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip(" ,;:.") + "…"
+
+
+def report_message(cfg, r):
+    """In compact notifica soltanto stato e titolo della richiesta.
+
+    Il riepilogo e' output dell'agente: resta disponibile su richiesta con i
+    comandi del bot o aprendo la sessione. La modalita' full e' mantenuta per
+    diagnostica e configurazioni che desiderano esplicitamente l'anteprima."""
+    icon = ICON.get(r["status"], "•")
+    label = LABEL.get(r["status"], r["status"])
+    lines = [f"{icon} {label} · {r['name'] or '(sessione eliminata)'}"]
+    if cfg["verbosity"] == "full":
+        if r["name"]:
+            lines.append(session_line(r))
+        lines.append(clip(r["summary"], 700) or "(nessun riepilogo)")
+    return "\n".join(lines)
+
+
+def pending_lifecycles(conn):
+    """Stati dedotti che richiedono attenzione, uno per (sessione, stato)."""
+    rows = conn.execute(
+        "SELECT id, name, lifecycle, lifecycle_at, exit_code, environment, "
+        "profile_id, project_slug, report_status FROM sessions "
+        f"WHERE lifecycle IN ({','.join('?' * len(ALERT_LIFECYCLES))})",
+        ALERT_LIFECYCLES).fetchall()
+    out = []
+    for r in rows:
+        # se l'agente ha dichiarato uno stato, quello e' gia' stato notificato
+        if r["report_status"] and r["lifecycle"] == r["report_status"]:
+            continue
+        if not already_sent(conn, "lifecycle", f"{r['id']}:{r['lifecycle']}"):
+            out.append(r)
+    return out
+
+
+def lifecycle_message(cfg, r):
+    icon = ICON.get(r["lifecycle"], "•")
+    label = LABEL.get(r["lifecycle"], r["lifecycle"])
+    lines = [f"{icon} {label} · {r['name']}"]
+    hint = {
+        "CRASHED": f"Processo uscito con codice {r['exit_code'] or '?'}, nessuno stato finale.",
+        "ENDED_UNREPORTED": "Terminata senza agent-report: esito da verificare nella trascrizione.",
+        "AUTH_REQUIRED": "Login scaduto: rifallo dalla pagina Accounts.",
+        "USAGE_LIMIT": "Limite d'uso raggiunto.",
+        "POSSIBLY_STALLED": "Ferma e senza stato finale anche dopo il sollecito. Non è stata terminata.",
+    }.get(r["lifecycle"], "")
+    if cfg["verbosity"] == "full":
+        if hint:
+            lines.append(clip(hint, 700))
+        lines.append(session_line(r))
+    return "\n".join(lines)
+
+
+def pending_health(conn):
+    """Cambi di stato del controllo di salute, gia' deduplicati alla fonte."""
+    try:
+        with open(HEALTH_HISTORY) as fh:
+            entries = [json.loads(l) for l in fh.read().splitlines()[-30:] if l.strip()]
+    except (OSError, ValueError):
+        return []
+    return [e for e in entries if not already_sent(conn, "health", e.get("at", ""))]
+
+
+def health_message(cfg, entry):
+    overall = entry.get("overall", "?")
+    icon = ICON.get(overall, "•")
+    head = f"{icon} Server {overall}"
+    if entry.get("previous"):
+        head += f" (prima: {entry['previous']})"
+    lines = [head]
+    problems = entry.get("problems", [])
+    if not problems:
+        return head + " — tutti i controlli OK."
+    show = 8 if cfg["verbosity"] == "full" else 1
+    for p in problems[:show]:
+        limit = 120 if cfg["verbosity"] == "full" else 90
+        lines.append(f"• {p.get('name')}: {clip(p.get('detail', ''), limit)}")
+    if len(problems) > show:
+        lines.append(f"…e altri {len(problems) - show}. Dettagli: /salute")
+    return "\n".join(lines)
+
+
+def deliver_pending(cfg, chat, first_run=False, state=None):
+    """Invia gli eventi non ancora notificati. Alla prima esecuzione li marca
+    soltanto: nessuno vuole ricevere in blocco lo storico di ieri.
+    Le riunioni vengono sempre elaborate (non dipendono da notify)."""
+    wanted = {w.strip() for w in cfg["notify"].split(",") if w.strip()}
+    sent = 0
+    with db() as conn:
+        jobs = []
+        if "reports" in wanted:
+            jobs += [("report", f"{r['session_id']}:{r['rid']}", report_message(cfg, r),
+                      r["status"], session_url(cfg, r["session_id"]))
+                     for r in pending_reports(conn)]
+        if "lifecycle" in wanted:
+            jobs += [("lifecycle", f"{r['id']}:{r['lifecycle']}", lifecycle_message(cfg, r),
+                      r["lifecycle"], session_url(cfg, r["id"]))
+                     for r in pending_lifecycles(conn)]
+        if "health" in wanted:
+            jobs += [("health", e.get("at", ""), health_message(cfg, e),
+                      e.get("overall", ""), "")
+                     for e in pending_health(conn)]
+        active = ui_is_active(cfg)
+        # Questi eventi interrompono anche durante il lavoro attivo. Tutto il
+        # resto e' gia' visibile nella UI e viene archiviato senza Telegram.
+        urgent = {"NEEDS_HOST_ACTION", "FAILED", "CRASHED", "ENDED_UNREPORTED",
+                  "AUTH_REQUIRED", "USAGE_LIMIT", "CRITICAL"}
+        for kind, key, text, detail, button_url in jobs:
+            if first_run:
+                mark_sent(conn, kind, key, "storico precedente, non notificato")
+                continue
+            if active and detail not in urgent:
+                mark_sent(conn, kind, key, f"{detail} (omesso: UI attiva)")
+                continue
+            if send(cfg, chat, text, silent=(cfg["quiet"] == "1"),
+                    button_url=button_url):
+                mark_sent(conn, kind, key, detail)
+                sent += 1
+            else:
+                break        # Telegram non risponde: si riprova al giro dopo
+        # Riunioni: sempre attive, non controllate da notify
+        if not first_run and chat:
+            try:
+                sent += deliver_meetings(cfg, state or load_state(), conn)
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                # tabelle meeting non ancora migrate: ignora silenziosamente
+        conn.commit()
+    return sent
+
+
+# -------------------------------------------------------- riunioni / meeting
+
+# Quanto dettaglio accompagna il titolo di ogni decisione nel messaggio. Serve
+# a capire il punto senza aprire la minuta; il testo integrale sta nell'allegato.
+MEETING_DECISION_DETAIL = 160
+
+
+def meeting_decisions_text(proposal_json_str):
+    """Solo le decisioni da approvare, una per punto numerato.
+
+    E' l'unica cosa che serve leggere per votare: sono le decisioni che
+    aggiorneranno il contesto del progetto. Riepilogo, azioni, prompt operativo
+    e architettura target ripetevano in larga parte le stesse cose e ora stanno
+    nella minuta allegata, per chi vuole entrare nel dettaglio.
+    """
+    try:
+        proposal = json.loads(proposal_json_str)
+    except (json.JSONDecodeError, TypeError):
+        proposal = {}
+    decisions = proposal.get("decisions") or []
+    if not decisions:
+        return "Nessuna decisione nella proposta: vedi la minuta allegata."
+    lines = [f"Decisioni da approvare ({len(decisions)}):", ""]
+    for index, item in enumerate(decisions, start=1):
+        if isinstance(item, str):
+            title, detail = item, ""
+        elif isinstance(item, dict):
+            title = item.get("title", item.get("text", ""))
+            detail = item.get("detail", "")
+        else:
+            continue
+        marker = f"{index}. "
+        lines.append(marker + (title or "").strip())
+        detail = clip((detail or "").strip(), MEETING_DECISION_DETAIL)
+        if detail:
+            lines.append(" " * len(marker) + detail)
+    return "\n".join(lines)
+
+
+def meeting_when(value):
+    """Data della riunione leggibile: gg/mm/aaaa hh:mm, senza fuso ne' secondi."""
+    raw = (value or "").strip()
+    if not raw:
+        return "—"
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    return stamp.strftime("%d/%m/%Y %H:%M")
+
+
+def pending_meetings(conn):
+    """Meeting in attesa di approvazione."""
+    try:
+        return conn.execute(
+            "SELECT id, title, project_slug, meeting_date, proposal_json, round, status, "
+            "transcript_path, audio_path "
+            "FROM meetings WHERE status='awaiting_approval'").fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+
+
+def meeting_minutes_path(m):
+    """La minuta sta accanto ad audio e trascrizione, una sola per riunione."""
+    for key in ("transcript_path", "audio_path"):
+        base = (m[key] or "").strip() if key in m.keys() else ""
+        if base:
+            path = os.path.join(os.path.dirname(base), "minutes.md")
+            return path if os.path.isfile(path) else ""
+    return ""
+
+
+def deliver_meetings(cfg, state, conn):
+    """Notifica le riunioni in attesa agli approvatori (se sono 2)."""
+    approvers = get_meeting_approvers(cfg, state)
+    if len(approvers) < 2:
+        # Log una volta per round se meno di 2 approvatori
+        meetings = pending_meetings(conn)
+        for m in meetings:
+            key = f"warn:{m['id']}:{m['round']}"
+            if not already_sent(conn, "meeting_approval_warn", key):
+                log(f"riunione {m['id'][:8]} in attesa ma <2 approvatori")
+                mark_sent(conn, "meeting_approval_warn", key, "lt2")
+        return 0
+    sent = 0
+    for m in pending_meetings(conn):
+        header = (f"\U0001f4cb {m['title']} \u00b7 {m['project_slug']}\n"
+                  f"{meeting_when(m['meeting_date'])} \u00b7 round {m['round']}\n\n")
+        text = header + meeting_decisions_text(m["proposal_json"] or "{}")
+        minutes = meeting_minutes_path(m)
+        if minutes:
+            text += "\n\nMinuta completa nel file allegato qui sopra."
+        keyboard = {"inline_keyboard": [[
+            {"text": "\u2705 Approvo",
+             "callback_data": f"ma:{m['id']}:{m['round']}"},
+            {"text": "\u270f\ufe0f Propongo modifica",
+             "callback_data": f"mr:{m['id']}:{m['round']}"},
+        ]]}
+        for aid in approvers:
+            key = f"{m['id']}:{m['round']}:{aid}"
+            if already_sent(conn, "meeting_approval", key):
+                continue
+            # Prima la minuta, in silenzio: e' il dettaglio facoltativo. Poi le
+            # decisioni con i pulsanti, cosi' l'ultimo messaggio e' quello su
+            # cui si vota. Se l'allegato non parte, il voto resta possibile.
+            if minutes:
+                send_document(cfg, aid, minutes,
+                              caption=f"Minuta \u2014 {m['title']} (round {m['round']})")
+            if send_long(cfg, aid, text, reply_markup=keyboard):
+                mark_sent(conn, "meeting_approval", key, m["title"])
+                sent += 1
+            else:
+                return sent
+    return sent
+
+
+# ---------------------------------------------------- callback delle riunioni
+
+def handle_meeting_approve(cfg, state, chat_id, meeting_id, meeting_round):
+    """Callback Approva: registra decisione, al 2/2 finalizza."""
+    approvers = get_meeting_approvers(cfg, state)
+    if chat_id not in approvers:
+        send(cfg, chat_id, "Non sei autorizzato ad approvare riunioni.")
+        return
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            meeting = conn.execute(
+                "SELECT id, title, round, status, context_on_approval "
+                "FROM meetings WHERE id=? AND status='awaiting_approval' AND round=?",
+                (meeting_id, meeting_round)).fetchone()
+            if not meeting:
+                conn.rollback()
+                send(cfg, chat_id, "Riunione non pi\u00f9 in attesa di approvazione.")
+                return
+            conn.execute(
+                "INSERT OR REPLACE INTO meeting_approvals "
+                "(meeting_id, round, chat_id, decision, note, created_at) "
+                "VALUES (?, ?, ?, 'approved', '', ?)",
+                (meeting_id, meeting_round, chat_id, now()))
+            count = conn.execute(
+                "SELECT COUNT(*) FROM meeting_approvals "
+                "WHERE meeting_id=? AND round=? AND decision='approved'",
+                (meeting_id, meeting_round)).fetchone()[0]
+            if count >= 2:
+                conn.execute(
+                    "UPDATE meetings SET status='approved', updated_at=? WHERE id=?",
+                    (now(), meeting_id))
+                conn.execute(
+                    "INSERT INTO meeting_actions (meeting_id, kind, payload, status, created_at) "
+                    "VALUES (?, 'implement', '', 'pending', ?)",
+                    (meeting_id, now()))
+                if meeting["context_on_approval"]:
+                    conn.execute(
+                        "INSERT INTO meeting_actions (meeting_id, kind, payload, status, created_at) "
+                        "VALUES (?, 'context', '', 'pending', ?)",
+                        (meeting_id, now()))
+                conn.commit()
+                for aid in approvers:
+                    send(cfg, aid,
+                         f"\u2705 Riunione \u00ab{meeting['title']}\u00bb "
+                         "approvata da entrambi. L'implementazione parte.")
+            else:
+                conn.commit()
+                send(cfg, chat_id,
+                     "\u2705 Approvazione registrata. In attesa dell'altro approvatore.")
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+
+
+def handle_meeting_revise(cfg, state, chat_id, meeting_id, meeting_round):
+    """Callback Modifica: imposta stato pending_revision per la chat."""
+    approvers = get_meeting_approvers(cfg, state)
+    if chat_id not in approvers:
+        send(cfg, chat_id, "Non sei autorizzato.")
+        return
+    with db(readonly=True) as conn:
+        current = conn.execute(
+            "SELECT 1 FROM meetings WHERE id=? AND status='awaiting_approval' AND round=?",
+            (meeting_id, meeting_round)).fetchone()
+    if not current:
+        send(cfg, chat_id, "Riunione non piu' in attesa o round gia' cambiato.")
+        return
+    pending = state.get("pending_revision", {})
+    pending[chat_id] = {"meeting_id": meeting_id, "round": meeting_round,
+                        "at": now()}
+    state["pending_revision"] = pending
+    save_state(state)
+    send(cfg, chat_id,
+         "Scrivi il testo con le modifiche richieste (max 6000 caratteri).")
+
+
+def handle_revision_text(cfg, state, chat_id, text, primary_chat):
+    """Consuma il testo di revisione dallo stato pending."""
+    pending = state.get("pending_revision", {})
+    entry = pending.get(chat_id)
+    if not entry:
+        return
+    meeting_id = entry["meeting_id"]
+    meeting_round = entry["round"]
+    text = text[:6000]
+    approvers = get_meeting_approvers(cfg, state)
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            meeting = conn.execute(
+                "SELECT id, title, round, status FROM meetings "
+                "WHERE id=? AND status='awaiting_approval' AND round=?",
+                (meeting_id, meeting_round)).fetchone()
+            if not meeting:
+                conn.rollback()
+                pending.pop(chat_id, None)
+                state["pending_revision"] = pending
+                save_state(state)
+                send(cfg, chat_id,
+                     "La riunione non \u00e8 pi\u00f9 in attesa di approvazione "
+                     "o il round \u00e8 cambiato.")
+                return
+            conn.execute(
+                "INSERT OR REPLACE INTO meeting_approvals "
+                "(meeting_id, round, chat_id, decision, note, created_at) "
+                "VALUES (?, ?, ?, 'revision', ?, ?)",
+                (meeting_id, meeting_round, chat_id, text, now()))
+            conn.execute(
+                "UPDATE meetings SET status='revision_requested', updated_at=? "
+                "WHERE id=?", (now(), meeting_id))
+            conn.execute(
+                "INSERT INTO meeting_actions (meeting_id, kind, payload, status, created_at) "
+                "VALUES (?, 'revise', ?, 'pending', ?)",
+                (meeting_id, text, now()))
+            conn.commit()
+            pending.pop(chat_id, None)
+            state["pending_revision"] = pending
+            save_state(state)
+            for aid in approvers:
+                send(cfg, aid,
+                     f"\u270f\ufe0f Riunione \u00ab{meeting['title']}\u00bb: "
+                     "richiesta modifica inviata. Parte un nuovo round.")
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+
+
+def handle_callback(cfg, state, cb_chat_id, cb_data):
+    """Instrada i callback delle riunioni."""
+    if cb_data.startswith("ma:"):
+        parts = cb_data.split(":")
+        if len(parts) >= 3:
+            handle_meeting_approve(cfg, state, cb_chat_id,
+                                   parts[1], int(parts[2]))
+    elif cb_data.startswith("mr:"):
+        parts = cb_data.split(":")
+        if len(parts) >= 3:
+            handle_meeting_revise(cfg, state, cb_chat_id,
+                                  parts[1], int(parts[2]))
+
+
+# ---------------------------------------------------------------- comandi
+
+# Menu del bot: quello che compare nel pulsante «/» di Telegram. Sostituisce
+# quello dell'orchestrator precedente (/request /pause /stop /resume), i cui
+# comandi erano tutti di controllo e non hanno posto in un bot in sola lettura.
+MENU = [
+    ("stato", "Sessioni attive, quelle che richiedono attenzione e salute del server"),
+    ("sessioni", "Elenco delle sessioni con lo stato di ciascuna"),
+    ("sessione", "Dettaglio di una sessione: /sessione <id o prime cifre>"),
+    ("report", "Ultimi stati finali registrati dagli agenti"),
+    ("log", "Ultime righe della trascrizione: /log <id> [righe]"),
+    ("salute", "Ultimo controllo dello stato del server"),
+    ("riunioni", "Riunioni in attesa di approvazione o in corso"),
+    ("approvatori", "Approvatori riunioni configurati"),
+    ("aiuto", "Elenco dei comandi e cosa fa ciascuno"),
+]
+BOT_NAME = "Agent Hub"
+BOT_SHORT = "Notifiche, stato sessioni e approvazione riunioni."
+BOT_ABOUT = ("Notifica gli stati finali registrati dagli agenti, i crash, gli stalli, "
+             "i login scaduti, i limiti d'uso e i cambi di stato del server. "
+             "Consente l'approvazione delle riunioni (scrittura solo per approvatori autorizzati).")
+SECONDARY_MENU = [
+    ("riunioni", "Riunioni in attesa di approvazione o in corso"),
+]
+
+
+def cmd_help():
+    lines = ["Agent Hub — comandi disponibili", ""]
+    for name, desc in MENU:
+        lines.append(f"/{name} — {desc}")
+    lines += [
+        "/chatid — identificativo di questa chat (diagnostica)",
+        "",
+        "L'approvazione delle riunioni richiede due approvatori autorizzati.",
+        "Le sessioni si comandano dalla pagina web.",
+    ]
+    return "\n".join(lines)
+
+
+def setup_menu(cfg, state=None):
+    """Registra menu, nome e descrizioni, sostituendo quelli del bot precedente.
+    Se state è fornito imposta anche il menu ristretto per il secondo approvatore."""
+    done = []
+    try:
+        call(cfg, "setMyCommands", {"commands": json.dumps(
+            [{"command": c, "description": d} for c, d in MENU])}, timeout=30)
+        done.append("menu")
+    except TelegramError as exc:
+        log(f"setMyCommands: {exc}")
+    for method, params, tag in (
+            ("setMyName", {"name": BOT_NAME}, "nome"),
+            ("setMyShortDescription", {"short_description": BOT_SHORT}, "descrizione breve"),
+            ("setMyDescription", {"description": BOT_ABOUT}, "descrizione"),
+    ):
+        try:
+            call(cfg, method, params, timeout=30)
+            done.append(tag)
+        except TelegramError as exc:
+            # setMyName ha un limite severo di frequenza: non e' un errore fatale
+            log(f"{method}: {exc}")
+    # Scoped menu per il secondo approvatore
+    if state:
+        approvers = get_meeting_approvers(cfg, state)
+        primary = chat_id_of(cfg, state)
+        for aid in approvers:
+            if aid == primary:
+                continue  # la primaria ha già il menu globale
+            try:
+                call(cfg, "setMyCommands", {
+                    "commands": json.dumps(
+                        [{"command": c, "description": d} for c, d in SECONDARY_MENU]),
+                    "scope": json.dumps({"type": "chat", "chat_id": aid}),
+                }, timeout=30)
+                done.append(f"secondary_menu")
+            except TelegramError as exc:
+                log(f"setMyCommands(secondary): {exc}")
+    return done
+
+
+def cmd_sessions():
+    with db(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT id, name, lifecycle, status, environment, report_summary "
+            "FROM sessions ORDER BY (status='running') DESC, created_at DESC LIMIT 20"
+        ).fetchall()
+    if not rows:
+        return "Nessuna sessione registrata."
+    lines = ["Sessioni (max 20):"]
+    for r in rows:
+        life = r["lifecycle"] or r["status"]
+        lines.append(f"{ICON.get(life, '•')} {r['name']} — {LABEL.get(life, life)}")
+        lines.append(f"    {r['environment']} · {r['id'][:8]}")
+    return "\n".join(lines)
+
+
+def cmd_session(arg):
+    token = (arg or "").strip()
+    if not token:
+        return "Uso: /sessione <id o prime cifre dell'id>"
+    with db(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE id=? OR id LIKE ? LIMIT 1",
+            (token, token + "%")).fetchone()
+        if not row:
+            return f"Nessuna sessione corrisponde a «{token}»."
+        reports = conn.execute(
+            "SELECT status, summary, reported_at FROM session_reports "
+            "WHERE session_id=? ORDER BY reported_at DESC LIMIT 5", (row["id"],)).fetchall()
+    life = row["lifecycle"] or row["status"]
+    lines = [f"{ICON.get(life, '•')} {row['name']}",
+             f"Stato: {life} — {LABEL.get(life, life)}",
+             f"Ambiente: {row['environment']} · {row['unix_user']}",
+             f"Harness: {row['profile_id']}" + (f" · {row['model']}" if row["model"] else ""),
+             f"Directory: {row['workdir']}",
+             f"Avvio: {row['created_at']}"]
+    if row["exit_code"]:
+        lines.append(f"Exit code: {row['exit_code']}")
+    if reports:
+        lines.append("")
+        lines.append("Stati registrati:")
+        for r in reports:
+            lines.append(f"• {r['status']} — {r['summary'] or '(nessun riepilogo)'}")
+    lines.append("")
+    lines.append(row["id"])
+    return "\n".join(lines)
+
+
+def cmd_reports(arg):
+    """Gli ultimi lavori conclusi, con il riepilogo scritto dall'agente stesso."""
+    try:
+        limit = max(1, min(20, int((arg or "").strip() or 10)))
+    except ValueError:
+        limit = 10
+    with db(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT r.status, r.summary, r.reported_at, r.session_id, s.name "
+            "FROM session_reports r LEFT JOIN sessions s ON s.id = r.session_id "
+            "ORDER BY r.reported_at DESC, r.rowid DESC LIMIT ?", (limit,)).fetchall()
+    if not rows:
+        return "Nessuno stato finale registrato finora."
+    lines = [f"Ultimi {len(rows)} stati registrati:", ""]
+    for r in rows:
+        lines.append(f"{ICON.get(r['status'], '•')} {r['status']} — {r['name'] or '(sessione eliminata)'}")
+        lines.append(f"    {r['summary'] or '(nessun riepilogo)'}")
+        lines.append(f"    {r['reported_at']} · {r['session_id'][:8]}")
+    return "\n".join(lines)
+
+
+def clean_text(data, cols, rows):
+    """Trascrizione leggibile dal log PTY, riusando il sanitizzatore del backend."""
+    try:
+        sys.path.insert(0, "/opt/agent-hub/app")
+        import transcript as tr
+        return tr.sanitize(data, cols, rows)
+    except Exception:  # noqa: BLE001
+        text = data.decode("utf-8", "replace")
+        text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_][^\x1b]*(\x1b\\|\x07)?", "", text)
+        return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
+
+
+def cmd_log(arg):
+    """Ultime righe della trascrizione: per capire dal telefono a che punto è."""
+    parts = (arg or "").split()
+    token = parts[0] if parts else ""
+    if not token:
+        return "Uso: /log <id o prime cifre dell'id> [numero di righe]"
+    try:
+        want = max(5, min(60, int(parts[1]))) if len(parts) > 1 else 25
+    except ValueError:
+        want = 25
+    with db(readonly=True) as conn:
+        row = conn.execute("SELECT id, name, tmux_name, cols, rows, lifecycle FROM sessions "
+                           "WHERE id=? OR id LIKE ? LIMIT 1",
+                           (token, token + "%")).fetchone()
+    if not row:
+        return f"Nessuna sessione corrisponde a «{token}»."
+    path = f"/srv/agent-workspace/logs/{row['tmux_name']}.log"
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > 200_000:
+                fh.seek(size - 200_000)
+            data = fh.read()
+    except OSError:
+        return f"Nessun log disponibile per «{row['name']}»."
+    text = clean_text(data, int(row["cols"] or 100), int(row["rows"] or 30))
+    lines = [l for l in text.splitlines() if l.strip()][-want:]
+    if not lines:
+        return f"La trascrizione di «{row['name']}» è vuota."
+    head = f"{ICON.get(row['lifecycle'], '•')} {row['name']} — ultime {len(lines)} righe\n\n"
+    body = "\n".join(lines)
+    if len(head) + len(body) > 3800:      # limite di Telegram, con margine
+        body = "…\n" + body[-(3800 - len(head)):]
+    return head + body
+
+
+def cmd_health():
+    try:
+        with open(HEALTH_LAST) as fh:
+            last = json.load(fh)
+    except (OSError, ValueError):
+        return "Nessun controllo di salute disponibile."
+    lines = [f"{ICON.get(last['overall'], '•')} Server {last['overall']}",
+             f"Ultimo controllo: {last.get('generated_at', '?')}"]
+    problems = [c for c in last.get("checks", []) if c["status"] != "OK"]
+    if problems:
+        lines.append("")
+        for c in problems:
+            lines.append(f"{ICON.get(c['status'], '•')} {c['label']}: {c['detail'][:200]}")
+    else:
+        lines.append(f"Tutti i {len(last.get('checks', []))} controlli sono OK.")
+    return "\n".join(lines)
+
+
+def cmd_status():
+    with db(readonly=True) as conn:
+        running = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE status='running'").fetchone()[0]
+        # Solo sessioni ancora running meritano attenzione; le sessioni
+        # ended/chiuse non compaiono, qualunque sia il lifecycle residuo.
+        attention = conn.execute(
+            "SELECT id, name, lifecycle FROM sessions WHERE status='running' "
+            "AND lifecycle IN "
+            "('NEEDS_INPUT','NEEDS_HOST_ACTION','FAILED','CRASHED','AUTH_REQUIRED',"
+            "'USAGE_LIMIT','POSSIBLY_STALLED','ENDED_UNREPORTED')").fetchall()
+    lines = [f"▶️ Sessioni attive: {running}"]
+    if attention:
+        lines.append(f"Richiedono attenzione: {len(attention)}")
+        for r in attention[:10]:
+            lines.append(f"{ICON.get(r['lifecycle'], '•')} {r['name']} — "
+                         f"{LABEL.get(r['lifecycle'], r['lifecycle'])}")
+    else:
+        lines.append("Nessuna sessione richiede attenzione.")
+    lines.append("")
+    lines.append(cmd_health())
+    return "\n".join(lines)
+
+
+def cmd_approvatori(cfg, state):
+    """Mostra gli approvatori configurati senza esporre ID completi."""
+    approvers = get_meeting_approvers(cfg, state)
+    lines = ["Approvatori riunioni:"]
+    if not approvers:
+        lines.append("Nessun approvatore configurato.")
+        lines.append("Invia /start con il codice di accoppiamento per registrarti.")
+    else:
+        for i in range(1, 3):
+            if i <= len(approvers):
+                lines.append(f"Approvatore {i}: configurato \u2713")
+            else:
+                lines.append(f"Approvatore {i}: non configurato")
+        if len(approvers) < 2:
+            lines.append("Per aggiungere il secondo approvatore, invia /start "
+                         "con il codice di accoppiamento da un'altra chat.")
+    return "\n".join(lines)
+
+
+def cmd_riunioni():
+    """Meeting in attesa o in corso (max 10)."""
+    try:
+        with db(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT id, title, project_slug, meeting_date, status, round "
+                "FROM meetings WHERE status IN "
+                "('awaiting_approval','revision_requested','approved','implementing') "
+                "ORDER BY meeting_date DESC LIMIT 10").fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return "Nessuna riunione disponibile (tabelle non ancora migrate)."
+        raise
+    if not rows:
+        return "Nessuna riunione in attesa o in corso."
+    status_label = {
+        "awaiting_approval": "In attesa di approvazione",
+        "revision_requested": "Modifiche richieste",
+        "approved": "Approvata",
+        "implementing": "Aggiornamento documentazione",
+    }
+    lines = ["Riunioni (max 10):"]
+    for r in rows:
+        sl = status_label.get(r["status"], r["status"])
+        lines.append(f"\u2022 {r['title']} \u2014 {sl} (round {r['round']})")
+        lines.append(f"  {r['project_slug']} \u00b7 {r['id'][:8]}")
+    return "\n".join(lines)
+
+
+def handle_command(cfg, text, chat, state=None):
+    """Comandi di lettura e riunioni. state serve per /approvatori."""
+    parts = text.strip().split(None, 1)
+    cmd = parts[0].lower().split("@")[0]
+    arg = parts[1] if len(parts) > 1 else ""
+    if cmd in ("/aiuto", "/help", "/start"):
+        return cmd_help()
+    if cmd in ("/stato", "/status"):
+        return cmd_status()
+    if cmd in ("/sessioni", "/sessions"):
+        return cmd_sessions()
+    if cmd in ("/sessione", "/session"):
+        return cmd_session(arg)
+    if cmd in ("/report", "/reports", "/lavori"):
+        return cmd_reports(arg)
+    if cmd in ("/log", "/trascrizione"):
+        return cmd_log(arg)
+    if cmd in ("/salute", "/health"):
+        return cmd_health()
+    if cmd in ("/approvatori", "/approvers"):
+        return cmd_approvatori(cfg, state or {})
+    if cmd in ("/riunioni", "/meetings"):
+        return cmd_riunioni()
+    # comandi del bot precedente: erano tutti di controllo, qui non esistono
+    if cmd in ("/request", "/pause", "/stop", "/resume", "/cancel"):
+        return ("Questo comando apparteneva all'orchestrator precedente e non esiste pi\u00f9.\n"
+                "Le sessioni si comandano dalla pagina web.\n\n"
+                + cmd_help())
+    if cmd == "/chatid":
+        return f"Questa chat: {chat}"
+    return None      # niente risposta ai messaggi che non sono comandi noti
+
+
+def poll_updates(cfg, state, chat):
+    """Long polling. Restituisce True se una nuova chat e' stata associata."""
+    paired = False
+    try:
+        updates = call(cfg, "getUpdates", {
+            "offset": state.get("offset", 0),
+            "timeout": int(cfg["poll_timeout"] or 25),
+            "allowed_updates": json.dumps(["message", "callback_query"]),
+        }, timeout=int(cfg["poll_timeout"] or 25) + 20)
+    except TelegramError as exc:
+        log(f"getUpdates: {exc}")
+        time.sleep(10)
+        return False
+    for up in updates or []:
+        state["offset"] = up["update_id"] + 1
+
+        # --- callback_query (pulsanti inline riunioni) --------------------
+        cb = up.get("callback_query")
+        if cb:
+            cb_data = cb.get("data", "")
+            cb_chat_id = str((cb.get("from") or {}).get("id", ""))
+            # answerCallbackQuery sempre
+            try:
+                call(cfg, "answerCallbackQuery", {
+                    "callback_query_id": cb.get("id", ""),
+                }, timeout=10)
+            except TelegramError as exc:
+                log(f"answerCallbackQuery: {exc}")
+            if cb_chat_id and cb_data:
+                try:
+                    handle_callback(cfg, state, cb_chat_id, cb_data)
+                except sqlite3.OperationalError as exc:
+                    if "no such table" not in str(exc).lower():
+                        log(f"callback error: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"callback error: {exc}")
+            continue
+
+        # --- messaggi -----------------------------------------------------
+        msg = up.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        sender = str((msg.get("chat") or {}).get("id", ""))
+        if not text or not sender:
+            continue
+
+        # Testo di revisione pendente (consuma solo se non e' un comando)
+        pending_rev = (state.get("pending_revision") or {}).get(sender)
+        if pending_rev and not text.startswith("/"):
+            try:
+                handle_revision_text(cfg, state, sender, text, chat)
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    log(f"revision error: {exc}")
+                else:
+                    send(cfg, sender,
+                         "Funzionalit\u00e0 riunioni non ancora disponibile "
+                         "(tabelle non migrate).")
+            except Exception as exc:  # noqa: BLE001
+                log(f"revision error: {exc}")
+            continue
+
+        if not chat:
+            # Nessuna chat primaria: si accetta soltanto chi conosce il
+            # codice di accoppiamento.
+            code = cfg["pairing_code"].strip()
+            if code and code in text:
+                state["chat_id"] = sender
+                save_state(state)
+                send(cfg, sender, "Chat associata all'Agent Hub.\n\n" + cmd_help())
+                log("chat primaria associata")
+                paired = True
+                chat = sender
+            else:
+                log(f"messaggio da chat non associata {sender}: ignorato")
+            continue
+
+        if sender != chat:
+            # Chat primaria esiste, mittente non autorizzato:
+            # puo' registrarsi come meeting approver (max 2)
+            code = cfg["pairing_code"].strip()
+            approvers = get_meeting_approvers(cfg, state)
+            if sender in approvers:
+                if is_secondary_approver(cfg, state, sender):
+                    # Secondo approvatore: solo /riunioni fra i comandi testuali
+                    if text.startswith("/"):
+                        parts = text.strip().split(None, 1)
+                        cmd = parts[0].lower().split("@")[0]
+                        if cmd == "/riunioni":
+                            try:
+                                reply = cmd_riunioni()
+                            except Exception as exc:  # noqa: BLE001
+                                reply = f"Comando non eseguito: {exc}"
+                        else:
+                            reply = (
+                                "Come secondo approvatore puoi usare solo "
+                                "/riunioni tra i comandi.\n"
+                                "Usa i pulsanti nei messaggi di approvazione "
+                                "per votare."
+                            )
+                        if reply:
+                            send_long(cfg, sender, reply)
+                else:
+                    try:
+                        reply = handle_command(cfg, text, sender, state=state)
+                    except Exception as exc:  # noqa: BLE001
+                        reply = f"Comando non eseguito: {exc}"
+                    if reply:
+                        send_long(cfg, sender, reply)
+            elif code and text.startswith("/start") and code in text:
+                if len(approvers) < 2:
+                    state_approvers = list(state.get("meeting_approvers", []))
+                    if not isinstance(state_approvers, list):
+                        state_approvers = []
+                    if sender not in state_approvers and sender != chat:
+                        state_approvers.append(sender)
+                        state["meeting_approvers"] = state_approvers
+                        save_state(state)
+                        send(cfg, sender,
+                             "Registrato come approvatore riunioni.\n\n"
+                             "Come secondo approvatore puoi usare /riunioni "
+                             "e rispondere ai messaggi di approvazione con "
+                             "i pulsanti Approvo / Propongo modifica.")
+                        # Imposta subito il menu ristretto per questa chat
+                        try:
+                            call(cfg, "setMyCommands", {
+                                "commands": json.dumps(
+                                    [{"command": c, "description": d}
+                                     for c, d in SECONDARY_MENU]),
+                                "scope": json.dumps({"type": "chat",
+                                                     "chat_id": sender}),
+                            }, timeout=30)
+                        except TelegramError as exc:
+                            log(f"setMyCommands(secondary pairing): {exc}")
+                        log("secondo approvatore riunioni associato")
+                        paired = True
+                else:
+                    send(cfg, sender,
+                         "Ci sono gi\u00e0 due approvatori configurati. "
+                         "Usa /approvatori per vederli.")
+            else:
+                log("messaggio da chat non autorizzata: ignorato")
+            continue
+
+        try:
+            reply = handle_command(cfg, text, sender, state=state)
+        except Exception as exc:  # noqa: BLE001
+            reply = f"Comando non eseguito: {exc}"
+        if reply:
+            send_long(cfg, sender, reply)
+    save_state(state)
+    return paired
+
+
+# ------------------------------------------------------------------ comandi
+
+def run():
+    cfg = load_config()
+    if not cfg["token"]:
+        log(f"token assente in {CONFIG_FILE}: il notificatore resta in attesa")
+    state = load_state()
+    first_run = not state.get("bootstrapped")
+    while True:
+        cfg = load_config()          # token e chat modificabili senza riavvio
+        if not cfg["token"]:
+            time.sleep(30)
+            continue
+        # il menu si registra solo quando cambia davvero: setMyName ha un
+        # limite di frequenza severo e non va chiamato a ogni riavvio
+        fingerprint = str(hash((tuple(MENU), BOT_NAME, BOT_SHORT, BOT_ABOUT)))
+        secondary_fp = str(hash(tuple(get_meeting_approvers(cfg, state))))
+        if (state.get("menu_fingerprint") != fingerprint
+                or state.get("menu_secondary_fingerprint") != secondary_fp):
+            if setup_menu(cfg, state):
+                state["menu_fingerprint"] = fingerprint
+                state["menu_secondary_fingerprint"] = secondary_fp
+                save_state(state)
+        try:
+            # poll_updates aggiorna `state` in place (offset, eventuale chat)
+            poll_updates(cfg, state, chat_id_of(cfg, state))
+            chat = chat_id_of(cfg, state)
+            if chat:
+                deliver_pending(cfg, chat, first_run=first_run, state=state)
+                if first_run:
+                    state["bootstrapped"] = now()
+                    save_state(state)
+                    first_run = False
+        except sqlite3.Error as exc:
+            log(f"database non disponibile: {exc}")
+            time.sleep(15)
+        except Exception as exc:  # noqa: BLE001
+            log(f"errore nel ciclo: {exc}")
+            time.sleep(15)
+
+
+def check():
+    cfg = load_config()
+    state = load_state()
+    out = {"config_file": CONFIG_FILE,
+           "token_presente": bool(cfg["token"]),
+           "chat_id": chat_id_of(cfg, state) or "(non associata)",
+           "notify": cfg["notify"], "verbosita": cfg["verbosity"],
+           "pausa_ui_secondi": cfg["active_pause_seconds"],
+           "ui_attiva": ui_is_active(cfg),
+           "origin": cfg["origin"] or "(non impostato)",
+           "codice_accoppiamento": "presente" if cfg["pairing_code"] else "assente"}
+    if cfg["token"]:
+        try:
+            me = call(cfg, "getMe", timeout=20)
+            out["bot"] = f"@{me.get('username')} ({me.get('first_name')})"
+        except TelegramError as exc:
+            out["bot"] = f"token non valido o rete assente: {exc}"
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if cfg["token"] else 1
+
+
+def test():
+    cfg = load_config()
+    chat = chat_id_of(cfg, load_state())
+    if not chat:
+        print("nessuna chat associata: scrivi al bot il codice di accoppiamento",
+              file=sys.stderr)
+        return 1
+    ok = send(cfg, chat, "🔔 Agent Hub: messaggio di prova.\n\n" + cmd_status())
+    print("inviato" if ok else "invio fallito")
+    return 0 if ok else 1
+
+
+def pair():
+    """Mostra chi ha scritto al bot: utile per associare la chat a mano."""
+    cfg = load_config()
+    try:
+        updates = call(cfg, "getUpdates", {"timeout": 0}, timeout=30)
+    except TelegramError as exc:
+        print(f"getUpdates fallito: {exc}", file=sys.stderr)
+        return 1
+    seen = {}
+    for up in updates or []:
+        c = (up.get("message") or {}).get("chat") or {}
+        if c.get("id"):
+            seen[str(c["id"])] = c.get("username") or c.get("first_name") or "?"
+    if not seen:
+        print("nessun messaggio in coda: scrivi qualcosa al bot e riprova")
+        return 1
+    for cid, who in seen.items():
+        print(f"{cid}\t{who}")
+    return 0
+
+
+def menu():
+    """Registra il menu subito, senza aspettare il ciclo del daemon."""
+    cfg = load_config()
+    done = setup_menu(cfg)
+    if not done:
+        print("nessun aggiornamento riuscito", file=sys.stderr)
+        return 1
+    print("aggiornati: " + ", ".join(done))
+    try:
+        for c in call(cfg, "getMyCommands", {}, timeout=20) or []:
+            print(f"  /{c['command']} — {c['description']}")
+    except TelegramError as exc:
+        print(f"rilettura del menu fallita: {exc}", file=sys.stderr)
+    return 0
+
+
+COMMANDS = {"run": run, "check": check, "test": test, "pair": pair, "menu": menu}
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if action not in COMMANDS:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return COMMANDS[action]() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

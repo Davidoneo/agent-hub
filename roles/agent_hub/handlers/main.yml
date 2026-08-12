@@ -1,0 +1,15 @@
+---
+# Role: agent_hub - handlers
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart agent-hub
+  ansible.builtin.systemd:
+    name: agent-hub
+    state: restarted
+
+- name: Restart agent-hub-telegram
+  ansible.builtin.systemd:
+    name: agent-hub-telegram
+    state: restarted
