@@ -170,7 +170,7 @@ def cmd_clone(argv):
             "  https://github.com/OWNER/REPO.git\n"
             "  git@github.com:OWNER/REPO.git\n"
             "  ssh://git@github.com/OWNER/REPO.git\n"
-            "  ALIAS:OWNER/REPO.git        (alias SSH di una deploy key, es. github-lsar)")
+            "  ALIAS:OWNER/REPO.git        (alias SSH di una deploy key, es. github-project)")
     e = env()
     key = argv[2] if len(argv) > 2 else ""
     if key:
@@ -178,7 +178,7 @@ def cmd_clone(argv):
             # errore frequente: qui si incolla la chiave pubblica invece del suo nome
             die(f"nome chiave non valido: {key[:60]}\n"
                 "Questo campo vuole il NOME della deploy key (di norma lo slug del "
-                "progetto, es. «lsar»), non la chiave pubblica.")
+                "progetto, es. «my-project»), non la chiave pubblica.")
         kp = os.path.join(e["HOME"], ".ssh", "repo-keys", key, "id_ed25519")
         if not os.path.isfile(kp):
             die(f"chiave inesistente: {kp}")

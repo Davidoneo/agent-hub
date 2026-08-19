@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public Tailscale APT repository signing-key fingerprint"
+regexTarget = "match"
+regexes = ['''2596A99EAAB33821893C0A79458CA832957F5868''']
+
+[[allowlists]]
+description = "Vendored upstream minified xterm.js"
+paths = ['''(roles/agent_hub/files/)?app/static/vendor/xterm\.js''']

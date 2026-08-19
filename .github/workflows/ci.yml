@@ -49,3 +49,23 @@ jobs:
         run: ansible-playbook --syntax-check -i inventory/hosts.example site.yml
       - name: Safety regression tests
         run: ansible-playbook -i localhost, -c local tests/safety.yml
+      - name: Agent Hub least-privilege defaults
+        run: ansible-playbook -i localhost, -c local tests/agent_hub_safety.yml
+      - name: Application and wrapper syntax
+        run: ./scripts/check-source.sh
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - name: Scan Git history with Gitleaks
+        run: >-
+          docker run --rm -v "$PWD:/repo:ro"
+          zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git /repo --config /repo/.gitleaks.toml --no-banner --redact

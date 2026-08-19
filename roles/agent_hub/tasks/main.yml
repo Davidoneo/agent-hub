@@ -2,10 +2,6 @@
 # Agent Hub: FastAPI web UI driving tmux sessions that outlive the browser
 # and the backend itself. See README.md for the threat model.
 
-- name: Agent Hub | skip unless explicitly enabled
-  ansible.builtin.meta: end_role
-  when: not agent_hub_install | bool
-
 - name: Agent Hub | required settings are present
   ansible.builtin.assert:
     that:
@@ -25,9 +21,21 @@
       Store the token in a vault, not in group_vars.
   when: agent_hub_telegram_enabled | bool
 
+- name: Agent Hub | full host administration is explicitly confirmed
+  ansible.builtin.assert:
+    that:
+      - agent_hub_server_admin_confirm | bool
+    fail_msg: >-
+      agent_hub_server_admin grants passwordless root access. Set both
+      agent_hub_server_admin=true and agent_hub_server_admin_confirm=true to
+      acknowledge that privilege boundary.
+  when: agent_hub_server_admin | bool
+
 - name: Agent Hub | packages
   ansible.builtin.apt:
-    name: [python3, python3-venv, tmux, sudo, git]
+    name: >-
+      {{ ['python3', 'python3-venv', 'tmux', 'sudo', 'git'] +
+         (['nftables'] if agent_hub_loopback_guard_enabled | bool else []) }}
     state: present
     update_cache: true
     cache_valid_time: 3600
@@ -90,7 +98,7 @@
 
 - name: Agent Hub | application code
   ansible.builtin.copy:
-    src: "app/"
+    src: "{{ agent_hub_source_root }}/app/"
     dest: "{{ agent_hub_root }}/app/"
     owner: "{{ agent_hub_service_user }}"
     group: "{{ agent_hub_service_user }}"
@@ -100,7 +108,7 @@
 
 - name: Agent Hub | privileged wrappers
   ansible.builtin.copy:
-    src: "libexec/"
+    src: "{{ agent_hub_source_root }}/libexec/"
     dest: "{{ agent_hub_libexec }}/"
     owner: root
     group: root
@@ -108,7 +116,7 @@
 
 - name: Agent Hub | agent-facing CLI commands
   ansible.builtin.copy:
-    src: "bin/{{ item }}"
+    src: "{{ agent_hub_source_root }}/bin/{{ item }}"
     dest: "/usr/local/bin/{{ item }}"
     owner: root
     group: root
@@ -148,7 +156,7 @@
 
 - name: Agent Hub | audit every git push
   ansible.builtin.copy:
-    src: github-audit/git
+    src: "{{ agent_hub_source_root }}/packaging/github-audit/git"
     dest: /usr/local/bin/git
     owner: root
     group: root
@@ -163,7 +171,7 @@
 
 - name: Agent Hub | audit GitHub CLI use when gh is installed
   ansible.builtin.copy:
-    src: github-audit/gh
+    src: "{{ agent_hub_source_root }}/packaging/github-audit/gh"
     dest: /usr/local/bin/gh
     owner: root
     group: root
@@ -195,7 +203,17 @@
     owner: root
     group: root
     mode: "0644"
-  notify: Restart agent-hub
+  notify:
+    - Restart agent-hub
+    - Reload agent-hub-loopback-guard
+
+- name: Agent Hub | service deploy-key profiles
+  ansible.builtin.template:
+    src: service-deploy.json.j2
+    dest: "{{ agent_hub_config_dir }}/service-deploy.json"
+    owner: root
+    group: root
+    mode: "0600"
 
 # The wrappers are the whole privilege boundary: the web service runs as an
 # unprivileged user and may only call these scripts, as these users.
@@ -218,6 +236,18 @@
   notify:
     - Reload systemd
     - Restart agent-hub
+
+- name: Agent Hub | loopback proxy guard unit
+  ansible.builtin.template:
+    src: agent-hub-loopback-guard.service.j2
+    dest: /etc/systemd/system/agent-hub-loopback-guard.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: agent_hub_loopback_guard_enabled | bool
+  notify:
+    - Reload systemd
+    - Reload agent-hub-loopback-guard
 
 - name: Agent Hub | Telegram notifier unit
   ansible.builtin.template:
@@ -242,6 +272,14 @@
     - agent-hub-health.service
     - agent-hub-health.timer
   notify: Reload systemd
+
+- name: Agent Hub | enable the loopback proxy guard
+  ansible.builtin.systemd:
+    name: agent-hub-loopback-guard.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: agent_hub_loopback_guard_enabled | bool
 
 - name: Agent Hub | enable the service
   ansible.builtin.systemd:

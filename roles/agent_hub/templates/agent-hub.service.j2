@@ -2,7 +2,9 @@
 [Unit]
 Description=Agent Hub - persistent agent sessions behind a private web UI
 Documentation=file://{{ agent_hub_root }}/README.md
-After=network-online.target{% if agent_hub_require_tailscale %} tailscaled.service{% endif %}
+After=network-online.target{% if agent_hub_require_tailscale %} tailscaled.service{% endif %}{% if agent_hub_loopback_guard_enabled %} agent-hub-loopback-guard.service{% endif %}
+{% if agent_hub_loopback_guard_enabled %}Requires=agent-hub-loopback-guard.service
+{% endif %}
 
 Wants=network-online.target
 

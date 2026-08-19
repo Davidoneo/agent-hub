@@ -52,3 +52,4 @@
       tags: [firewall, baseline]
     - role: agent_hub
       tags: [agent_hub]
+      when: agent_hub_install | default(false) | bool

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Allow only root-owned local proxies (not agent sessions) to reach Agent Hub.
+set -Eeuo pipefail
+
+NFT=/usr/sbin/nft
+TABLE=agent_hub_guard
+CONFIG=/etc/agent-hub/config.env
+
+port_from_config() {
+  local port
+  port=$(awk -F= '$1 == "AGENT_HUB_PORT" { print $2; exit }' "$CONFIG")
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
+    echo "loopback-guard-ctl: porta Agent Hub non valida" >&2
+    exit 2
+  }
+  printf '%s\n' "$port"
+}
+
+remove_table() {
+  "$NFT" list table inet "$TABLE" >/dev/null 2>&1 || return 0
+  "$NFT" delete table inet "$TABLE"
+}
+
+install_guard() {
+  local port
+  port=$(port_from_config)
+  remove_table
+  "$NFT" -f - <<EOF
+table inet $TABLE {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    oifname "lo" ip daddr 127.0.0.1 tcp dport $port meta skuid != 0 reject with tcp reset
+  }
+}
+EOF
+}
+
+check_guard() {
+  local port rules
+  port=$(port_from_config)
+  rules=$("$NFT" list chain inet "$TABLE" output 2>/dev/null) || exit 1
+  grep -Fq "tcp dport $port" <<<"$rules"
+  grep -Fq "skuid != 0" <<<"$rules"
+}
+
+case "${1:-}" in
+  install) install_guard ;;
+  remove) remove_table ;;
+  check) check_guard ;;
+  *) echo "uso: loopback-guard-ctl install|remove|check" >&2; exit 2 ;;
+esac

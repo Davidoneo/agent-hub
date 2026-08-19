@@ -1,70 +1,68 @@
-# Home Server Agent Setup
+# Agent Hub
 
-Ansible playbook for preparing a Debian or Ubuntu home server to run agents
-and manage them remotely over SSH or Tailscale. It can also configure a laptop
-or a local development machine.
+Agent Hub is a private web interface for persistent Claude Code, Codex and
+OpenCode sessions on a Debian or Ubuntu host. Sessions run in per-user `tmux`
+servers, survive browser and backend restarts, and are separated into:
 
-Supported targets: Debian 13+ and Ubuntu 24.04+.
+- **PROJECT** — unprivileged project work with per-repository deploy keys;
+- **SERVER** — optional host administration, disabled by default.
+
+The repository is the single source of truth for the application, its
+root-owned privilege wrappers and the Ansible installer. Instance inventory,
+credentials, recovery snapshots and application-specific services do not
+belong here.
 
 ## Install
 
+Supported targets are Debian 13+ and Ubuntu 24.04+.
+
 ```bash
-git clone https://github.com/Davidoneo/debian-server-blueprint.git
-cd debian-server-blueprint
+git clone https://github.com/Davidoneo/agent-hub.git
+cd agent-hub
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements-dev.txt
 ansible-galaxy collection install -r requirements.yml
-cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
-```
-
-For the local machine:
-
-```bash
-cp inventory/local.example inventory/hosts
-ansible-playbook -i inventory/hosts site.yml --check --diff -K
-ansible-playbook -i inventory/hosts site.yml -K
-```
-
-For a remote server:
-
-```bash
 cp inventory/hosts.example inventory/hosts
+cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
 $EDITOR inventory/hosts inventory/group_vars/all.yml
 ansible-playbook -i inventory/hosts site.yml --check --diff
 ansible-playbook -i inventory/hosts site.yml
 ```
 
-Set `blueprint_profile` to `laptop` or `server`. Real inventory files are
-ignored by Git.
+Every state-changing role is opt-in. Agent Hub additionally requires an HTTPS
+origin and an explicit allow-list of Tailscale identities. Full SERVER sudo
+requires a second confirmation variable.
 
-## Remote access
+See [installation](docs/INSTALL.md), [the Agent Hub role](roles/agent_hub/README.md),
+[SSH access](docs/SSH.md) and [security](SECURITY.md).
 
-SSH setup is opt-in. Add public keys from trusted clients, test access in a
-second terminal, then enable SSH hardening and UFW. SSH can be limited to
-trusted CIDRs or the Tailscale interface. The playbook checks the admin key,
-`AllowUsers`, and firewall port before disabling password access.
+## Repository layout
 
-## Roles
-
-| Role | Default |
+| Path | Purpose |
 |---|---|
-| Base packages and system settings | enabled |
-| OpenSSH server and trusted keys | disabled |
-| Docker Engine | disabled |
-| Tailscale installation | disabled |
-| SSH hardening | disabled, confirmation required |
-| UFW firewall | disabled, confirmation required |
-| Agent Hub (agent sessions behind a private web UI) | disabled |
+| `app/` | FastAPI backend and browser UI |
+| `bin/` | Commands exposed to agent sessions |
+| `libexec/` | Root-owned privilege and health wrappers |
+| `roles/agent_hub/` | Ansible deployment of the canonical sources above |
+| `roles/{common,docker,tailscale,...}/` | Optional Debian host preparation |
+| `packaging/` | Optional host integration such as GitHub audit wrappers |
 
-The Agent Hub role installs a private web UI that drives persistent
-`tmux` agent sessions, with the web service separated from the agent
-accounts by root-owned wrappers; see
-[roles/agent_hub/README.md](roles/agent_hub/README.md).
+## Security model
 
-See [installation](docs/INSTALL.md), [SSH setup and recovery](docs/SSH.md),
-and [security](SECURITY.md). Other distributions require a fork with adjusted
-packages, services, paths, and tests.
+The backend binds only to loopback and is intended to sit behind Tailscale
+Serve. A separate nftables output guard prevents non-root local processes from
+connecting directly and forging Tailscale identity headers. The PROJECT user
+never receives an account-wide GitHub credential; root selects a deploy key
+from the verified Agent Hub session and project.
 
-MIT licensed. Run `--check --diff` before applying changes and keep another
-console open when changing SSH or firewall rules.
+SERVER administration and GitHub command auditing are deliberately disabled
+by default. Enabling passwordless root requires both:
+
+```yaml
+agent_hub_server_admin: true
+agent_hub_server_admin_confirm: true
+```
+
+MIT licensed. Review `--check --diff` before every first apply and keep an
+alternate console available while changing SSH, firewall or networking.

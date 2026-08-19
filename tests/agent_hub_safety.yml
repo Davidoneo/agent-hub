@@ -1,0 +1,34 @@
+---
+- name: Agent Hub public defaults stay least-privilege
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Load Agent Hub role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/agent_hub/defaults/main.yml"
+        name: hub
+
+    - name: Confirm public privilege defaults
+      ansible.builtin.assert:
+        that:
+          - not hub.agent_hub_install | bool
+          - not hub.agent_hub_server_admin | bool
+          - not hub.agent_hub_server_admin_confirm | bool
+          - hub.agent_hub_loopback_guard_enabled | bool
+          - not hub.agent_hub_github_audit_enabled | bool
+          - hub.agent_hub_service_deploy_profiles | length == 0
+
+    - name: Confirm canonical source layout
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ playbook_dir }}/../app/main.py"
+        - "{{ playbook_dir }}/../bin/agent-report"
+        - "{{ playbook_dir }}/../libexec/git-ssh-ctl"
+      register: canonical_sources
+
+    - name: Require every canonical source
+      ansible.builtin.assert:
+        that:
+          - canonical_sources.results | map(attribute='stat.exists') | min

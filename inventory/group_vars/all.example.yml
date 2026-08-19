@@ -116,3 +116,20 @@ ssh_hardening_service_action: reloaded   # "reloaded" (safe) or "restarted"
 # tailscale - base install; manual authentication
 # ------------------------------------------------------------
 tailscale_install: false
+
+# ------------------------------------------------------------
+# Agent Hub - private web UI, STRICT OPT-IN
+# ------------------------------------------------------------
+agent_hub_install: false
+agent_hub_origin: ""                 # e.g. https://host.tailnet.ts.net
+agent_hub_allowed_users: []          # exact Tailscale login identities
+agent_hub_loopback_guard_enabled: true
+
+# Full host administration requires BOTH flags. Keep false unless SERVER
+# sessions are intentionally allowed to become root.
+agent_hub_server_admin: false
+agent_hub_server_admin_confirm: false
+
+# Root-owned mappings for unattended services needing one deploy key.
+# Keep instance-specific profiles in private inventory.
+agent_hub_service_deploy_profiles: {}

@@ -36,17 +36,17 @@ two **agent accounts**:
   a rootless Docker daemon and has no account-wide GitHub credential. The
   root-owned `git-ssh-ctl` selects only the current project's deploy key from
   process ancestry; arbitrary root commands remain denied.
-- **server account** - runs sessions that administer the host. By default it
-  has passwordless full sudo (`agent_hub_server_admin: true`).
+- **server account** - runs sessions that may administer the host. Passwordless
+  root is disabled by default and requires both `agent_hub_server_admin: true`
+  and `agent_hub_server_admin_confirm: true`.
 
 A compromised project session therefore cannot escalate to the host, and the
 web service cannot run arbitrary commands even if it is compromised.
 
-The role also installs passive wrappers that append every `gh` invocation and
-every `git push` to `/var/log/agent-hub/github-usage.log`. They never log token
-values. Repository deletion is intentionally not provisioned: keep the
-`delete_repo` scope out of the standing token and grant it manually only when
-you explicitly need that operation.
+Optional passive wrappers append every `gh` invocation and every `git push` to
+`/var/log/agent-hub/github-usage.log`. They are disabled by default and never
+log token values. Repository deletion is not provisioned: keep `delete_repo`
+out of standing tokens and grant it only for an explicit operation.
 
 ## Required variables
 
@@ -89,23 +89,36 @@ tailscale serve --bg 127.0.0.1:8787
 Tailscale terminates TLS and injects the `Tailscale-User-Login` header, which
 the service checks against `agent_hub_allowed_users`. With
 `agent_hub_require_tailscale: true` (the default) a request without that
-header is refused, so a local process cannot bypass the identity check.
+header is refused. The loopback guard below protects the separate local
+caller boundary.
 
-## The vendored application
+Tailscale strips spoofed identity headers from remote requests, but processes
+on the same host could otherwise connect straight to loopback and provide
+their own value. `agent_hub_loopback_guard_enabled: true` installs an nftables
+output rule that allows only root-owned local proxies, including `tailscaled`,
+to reach the backend port. Keep it enabled whenever identity headers are used.
 
-`files/app/`, `files/libexec/` and `files/bin/` hold a copy of the application.
-Do not edit those files here: change them in the Agent Hub source repository,
-deploy, and then refresh the copy with
+Unattended host services may receive a single repository deploy key through
+`agent_hub_service_deploy_profiles`. Each private-inventory entry binds a
+profile name to the expected sudo caller, real systemd unit and project. The
+root-owned wrapper verifies the caller and process cgroup before selecting the
+key; the public defaults contain no profiles.
+
+## Canonical application sources
+
+`app/`, `libexec/` and `bin/` at the repository root are the source of truth.
+The role installs them directly, so there is no second vendored copy to drift.
+The sync helper exists only to import a deliberate emergency hotfix made on a
+running host:
 
 ```bash
 ./scripts/sync-agent-hub.sh
 ```
 
-The script also refuses to sync anything that looks like a credential, a
-personal email or a `*.ts.net` host. Instance configuration is never
-vendored: `config.env` is rendered from your Ansible variables.
+The script refuses to import anything that looks like a credential, personal
+email or `*.ts.net` host. Instance configuration is never copied into Git.
 
-`files/app/static/vendor/` contains xterm.js under the MIT licence; see the
+`app/static/vendor/` contains xterm.js under the MIT licence; see the
 `NOTICE` file next to it.
 
 ## Limits

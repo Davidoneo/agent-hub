@@ -38,6 +38,7 @@ LAST = os.path.join(STATE_DIR, "last.json")
 HISTORY = os.path.join(STATE_DIR, "history.jsonl")
 TEMPS = os.path.join(STATE_DIR, "temps.json")
 SESSION_CTL = "/usr/local/libexec/agent-hub/session-ctl"
+LOOPBACK_GUARD_CTL = "/usr/local/libexec/agent-hub/loopback-guard-ctl"
 def _cfg(key, default):
     """Legge una chiave da config.env: sudo filtra l'ambiente, quindi questo
     wrapper non puo' ereditare le variabili del servizio."""
@@ -58,6 +59,7 @@ AGENT_USERS = (PROJECT_UNIX_USER, SERVER_UNIX_USER)
 OK, WARN, CRIT = "OK", "WARNING", "CRITICAL"
 RANK = {OK: 0, WARN: 1, CRIT: 2}
 OWNER = _cfg("AGENT_HUB_SERVICE_USER", "agenthub")
+LOOPBACK_GUARD_ENABLED = _cfg("AGENT_HUB_LOOPBACK_GUARD_ENABLED", "1") == "1"
 
 DEFAULTS = {
     "temperature": {"consecutive": 2, "warn_fallback": 80.0, "crit_fallback": 95.0,
@@ -154,6 +156,20 @@ def check_tailscale_serve():
                  "proxy verso 127.0.0.1:8787 attivo" if proxied
                  else "serve attivo ma non verso la porta dell'Agent Hub",
                  output=out[:2000])
+
+
+def check_loopback_guard():
+    if not LOOPBACK_GUARD_ENABLED:
+        return check("loopback_guard", "Trusted proxy boundary", WARN,
+                     "guard locale disabilitato")
+    rc, out = run([LOOPBACK_GUARD_CTL, "check"])
+    rc2, active = run(["systemctl", "is-active",
+                       "agent-hub-loopback-guard.service"])
+    good = rc == 0 and active.strip() == "active"
+    detail = ("processi locali non-root bloccati" if good else
+              f"guard assente o inattivo: {out or active}")
+    return check("loopback_guard", "Trusted proxy boundary",
+                 OK if good else CRIT, detail)
 
 
 def check_docker_rootless():
@@ -587,6 +603,7 @@ def collect(cfg, save):
         check_service("agent-hub.service", "Agent Hub service"),
         check_service("tailscaled.service", "Tailscale daemon"),
         check_tailscale_serve(),
+        check_loopback_guard(),
         check_docker_rootless(),
         check_docker_rootful(),
         check_tmux(live, tmux_errors),

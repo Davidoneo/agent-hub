@@ -30,8 +30,8 @@ On the target host:
 ## 2. Clone the repository
 
 ```bash
-git clone https://github.com/Davidoneo/debian-server-blueprint.git
-cd debian-server-blueprint
+git clone https://github.com/Davidoneo/agent-hub.git
+cd agent-hub
 ```
 
 ## 3. Dependencies (collections)
@@ -120,6 +120,7 @@ Available tags:
 | `ssh_hardening` | ssh_hardening | SSH hardening drop-in (double opt-in, see `docs/SSH.md`) |
 | `firewall` | firewall | ufw with deny policy (double opt-in) |
 | `tailscale` | tailscale | verified install; manual auth |
+| `agent_hub` | agent_hub | private persistent agent UI (opt-in) |
 | `baseline` | all | all roles, with their opt-ins |
 
 You can restrict the run to one host with `--limit server1.example.invalid`.
@@ -133,8 +134,9 @@ The blueprint is designed not to lock the machine:
 - **No system files overwritten at random**: SSH hardening generates a
   *drop-in* in `/etc/ssh/sshd_config.d/` (the main file is untouched); the
   firewall uses ufw; Docker and Tailscale install standard packages.
-- **Mandatory double confirmation**: firewall and SSH hardening require
-  `*_enabled=true` **and** `*_confirm=true`; the other features stay opt-in.
+- **Mandatory double confirmation**: firewall, SSH hardening and full Agent
+  Hub SERVER administration require their enabling variable **and** the
+  matching confirmation variable; the other features stay opt-in.
 - **Manual rollback** (with access to the machine):
   - SSH: remove `/etc/ssh/sshd_config.d/99-baseline-hardening.conf` and run
     `systemctl reload ssh`.

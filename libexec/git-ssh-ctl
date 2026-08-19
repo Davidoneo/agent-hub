@@ -9,18 +9,19 @@ mappa la sessione tmux sul progetto tramite il database dell'Agent Hub, e usa
 soltanto la chiave di quel progetto.
 
 La chiave stessa e' il confinamento: una deploy key apre un solo repository.
-Una sessione lanciata su «lsar» ottiene la chiave di lsar e con quella non
-puo' toccare nessun altro repository.
+Una sessione lanciata su «my-project» ottiene soltanto la chiave di quel
+progetto e con quella non puo' toccare nessun altro repository.
 
 Uso (da core.sshCommand di git):  sudo -n git-ssh-ctl <argomenti ssh>
 Diagnostica:                      sudo -n git-ssh-ctl --whoami
 
-Il servizio host `lsar-auto-deploy.service` usa `--lsar-auto-deploy`. Questa
-eccezione non si basa su argomenti dichiarati dal chiamante: il wrapper accetta
-il flag soltanto se un antenato appartiene realmente al cgroup del servizio e
-il chiamante sudo e' `devagent`.
+I servizi host opzionali usano `--service-deploy <profilo>`. I profili sono
+root-owned e associano chiamante, unita' systemd e progetto; il wrapper accetta
+la richiesta soltanto se un antenato appartiene davvero al cgroup configurato.
 """
+import json
 import os
+import re
 import subprocess
 import sqlite3
 import sys
@@ -28,6 +29,9 @@ import sys
 KEYS = "/etc/agent-hub/repo-keys"
 DB = "/var/lib/agent-hub/agent-hub.sqlite3"
 SOCKET = "agenthub"
+SERVICE_DEPLOY_CONFIG = "/etc/agent-hub/service-deploy.json"
+SAFE_NAME = re.compile(r"^[A-Za-z0-9_.@-]+$")
+SAFE_SLUG = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def die(msg, code=2):
@@ -121,20 +125,51 @@ def in_named_service_cgroup(pid, service):
         return False
 
 
-def auto_deploy_key(caller):
-    """Chiave LSAR per il solo servizio host di auto-deploy."""
-    flag = "--lsar-auto-deploy"
-    if flag not in sys.argv[1:]:
+def service_deploy():
+    """Profilo root-owned per un servizio systemd che usa una deploy key.
+
+    Il nome passato dal processo seleziona soltanto una voce di configurazione;
+    caller, unita' systemd e progetto arrivano dal file root-owned e vengono
+    verificati contro le credenziali sudo e il cgroup reale del processo.
+    """
+    flag = "--service-deploy"
+    args = sys.argv[1:]
+    if flag not in args:
         return None
-    if caller != "devagent":
-        die(f"{flag} richiede il chiamante devagent.")
-    if not any(in_named_service_cgroup(pid, "lsar-auto-deploy.service")
+    if args.count(flag) != 1:
+        die(f"{flag} puo' comparire una sola volta.")
+    index = args.index(flag)
+    if index + 1 >= len(args):
+        die(f"{flag} richiede un nome profilo.")
+    name = args[index + 1]
+    if not SAFE_NAME.fullmatch(name):
+        die("nome profilo service-deploy non valido.")
+    try:
+        with open(SERVICE_DEPLOY_CONFIG, encoding="utf-8") as handle:
+            profiles = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"configurazione service-deploy non leggibile: {exc}")
+    profile = profiles.get(name) if isinstance(profiles, dict) else None
+    if not isinstance(profile, dict):
+        die(f"profilo service-deploy non autorizzato: {name}")
+    caller = profile.get("caller", "")
+    unit = profile.get("unit", "")
+    project = profile.get("project", "")
+    if not (isinstance(caller, str) and SAFE_NAME.fullmatch(caller)
+            and isinstance(unit, str) and SAFE_NAME.fullmatch(unit)
+            and unit.endswith(".service")
+            and isinstance(project, str) and SAFE_SLUG.fullmatch(project)):
+        die(f"profilo service-deploy non valido: {name}")
+    if os.environ.get("SUDO_USER", "") != caller:
+        die(f"il profilo {name} richiede il chiamante {caller}.")
+    if not any(in_named_service_cgroup(pid, unit)
                for pid in ancestors(os.getpid())):
-        die(f"{flag} e' riservato a lsar-auto-deploy.service.")
-    key = os.path.join(KEYS, "lsar", "id_ed25519")
+        die(f"il profilo {name} e' riservato a {unit}.")
+    key = os.path.join(KEYS, project, "id_ed25519")
     if not os.path.isfile(key):
-        die("nessuna deploy key per il progetto «lsar».")
-    return key
+        die(f"nessuna deploy key per il progetto «{project}».")
+    rest = args[:index] + args[index + 2:]
+    return key, rest
 
 
 def provisioning_slug():
@@ -154,9 +189,9 @@ def provisioning_slug():
 def main():
     caller = os.environ.get("SUDO_USER", "")
 
-    automatic_key = auto_deploy_key(caller)
-    if automatic_key:
-        rest = [a for a in sys.argv[1:] if a != "--lsar-auto-deploy"]
+    automatic = service_deploy()
+    if automatic:
+        automatic_key, rest = automatic
         os.execv("/usr/bin/ssh", [
             "ssh", "-i", automatic_key,
             "-o", "IdentitiesOnly=yes",

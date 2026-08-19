@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Agent Hub - protect the trusted Tailscale proxy boundary
+Documentation=https://tailscale.com/docs/features/tailscale-serve#identity-headers
+After=nftables.service
+Before=agent-hub.service
+
+[Service]
+Type=oneshot
+ExecStart={{ agent_hub_libexec }}/loopback-guard-ctl install
+ExecReload={{ agent_hub_libexec }}/loopback-guard-ctl install
+ExecStop={{ agent_hub_libexec }}/loopback-guard-ctl remove
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

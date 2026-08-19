@@ -12,7 +12,7 @@ Defaults!{{ agent_hub_libexec }}/session-ctl !requiretty
 # Report and document commands write through the Agent Hub database owner.
 {{ agent_hub_project_user }},{{ agent_hub_server_user }} ALL=({{ agent_hub_service_user }}) NOPASSWD: {{ agent_hub_libexec }}/report-ctl *, {{ agent_hub_libexec }}/meeting-report-ctl *, /usr/local/bin/agent-document *
 
-{% if agent_hub_server_admin | bool %}
+{% if agent_hub_server_admin | bool and agent_hub_server_admin_confirm | bool %}
 # SERVER is the dedicated administrative agent and may manage the full host.
 {{ agent_hub_server_user }} ALL=(ALL:ALL) NOPASSWD: ALL
 {% endif %}

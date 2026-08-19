@@ -5,6 +5,10 @@
 # Opt-in, like every role that installs a long-running service.
 agent_hub_install: false
 
+# Canonical application sources live at the repository root. Override this
+# only when embedding the role in a different playbook layout.
+agent_hub_source_root: "{{ playbook_dir }}"
+
 # Unix accounts. The service account owns the web process; the two agent
 # accounts run the agent sessions and are deliberately separated so that a
 # project agent cannot reach host privileges.
@@ -36,11 +40,21 @@ agent_hub_workspace: /srv/agent-workspace
 
 # The SERVER account is the dedicated host administrator. PROJECT remains
 # unprivileged and reaches GitHub only through per-project deploy keys.
-agent_hub_server_admin: true
+agent_hub_server_admin: false
+agent_hub_server_admin_confirm: false
+
+# Tailscale Serve strips spoofed identity headers from remote requests, but a
+# local process can connect directly to the backend. On Linux this nftables
+# guard permits only root-owned proxies (tailscaled) to reach the port.
+agent_hub_loopback_guard_enabled: true
+
+# Optional root-owned profiles for systemd services that need one project's
+# deploy key. Every profile requires caller, unit and project fields.
+agent_hub_service_deploy_profiles: {}
 
 # Audit use of the account-wide GitHub CLI and every `git push`. This never
 # stores credentials; it records command metadata in a group-writable log.
-agent_hub_github_audit_enabled: true
+agent_hub_github_audit_enabled: false
 agent_hub_github_log_dir: /var/log/agent-hub
 
 # Telegram notifier. Disabled by default: it is the only component that
