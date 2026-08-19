@@ -19,9 +19,11 @@ Nessuna connessione di rete, in nessun ramo.
 """
 import json
 import os
+import pwd
 import re
 import sqlite3
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 
@@ -56,10 +58,14 @@ def write_event(payload):
     except OSError as exc:
         return f"directory eventi non creabile: {exc}"
     final = os.path.join(REPORT_DIR, f"{payload['session_id']}.json")
-    tmp = final + f".tmp-{os.getpid()}"
+    tmp = ""
     data = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        # Nome imprevedibile e creazione O_EXCL, cosi' il file temporaneo non
+        # puo' essere pre-creato come symlink verso un file dell'account DB.
+        fd, tmp = tempfile.mkstemp(
+            prefix=f".{payload['session_id']}.", suffix=".tmp", dir=REPORT_DIR)
+        os.fchmod(fd, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(data)
             fh.flush()
@@ -69,7 +75,8 @@ def write_event(payload):
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except OSError as exc:
         try:
-            os.unlink(tmp)
+            if tmp:
+                os.unlink(tmp)
         except OSError:
             pass
         return f"evento non scritto: {exc}"
@@ -77,9 +84,16 @@ def write_event(payload):
 
 
 def cmd_report(argv):
-    """report <session> <status> <summary> [source] [unix_user] [waiting_for]"""
-    if len(argv) < 3:
-        die("uso: report <session-id> <status> <summary> [source] [unix-user]")
+    """report <session> <status> <summary> [waiting_for]."""
+    if len(argv) < 3 or len(argv) > 4:
+        die("uso: report <session-id> <status> <summary> [waiting-for]")
+    # Il client e' deliberatamente non fidato. sudo valorizza SUDO_USER con
+    # l'account Unix reale che ha ottenuto l'esecuzione come proprietario DB;
+    # nessun argomento puo' sostituire questa identita'.
+    caller = os.environ.get("SUDO_USER", "").strip()
+    effective_user = pwd.getpwuid(os.geteuid()).pw_name
+    if not caller or caller in ("root", effective_user):
+        die("chiamante sudo non determinabile", 3)
     sid = argv[0].strip()
     if sid.startswith("agenthub-"):
         sid = sid[len("agenthub-"):]
@@ -89,9 +103,9 @@ def cmd_report(argv):
     if status not in STATUSES:
         die(f"stato non ammesso: {argv[1]} — ammessi: {', '.join(STATUSES)}")
     summary = " ".join(argv[2].split())[:MAX_SUMMARY]
-    source = (argv[3] if len(argv) > 3 else "agent-report")[:40]
-    unix_user = (argv[4] if len(argv) > 4 else "")[:40]
-    waiting_for = (argv[5] if len(argv) > 5 else "").strip()
+    source = "agent-report"
+    unix_user = caller[:40]
+    waiting_for = (argv[3] if len(argv) > 3 else "").strip()
     if waiting_for.startswith("agenthub-"):
         waiting_for = waiting_for[len("agenthub-"):]
     if status == "WAITING_SESSION":
@@ -105,11 +119,13 @@ def cmd_report(argv):
     stamp = now()
     with db() as conn:
         row = conn.execute(
-            "SELECT id, name, report_status, report_summary, reported_at, "
+            "SELECT id, name, unix_user, report_status, report_summary, reported_at, "
             "waiting_for_session "
             "FROM sessions WHERE id=?", (sid,)).fetchone()
         if not row:
             die(f"sessione inesistente: {sid}", 3)
+        if row["unix_user"] != caller:
+            die(f"sessione non appartenente al chiamante {caller}", 3)
         if waiting_for and not conn.execute(
                 "SELECT 1 FROM sessions WHERE id=?", (waiting_for,)).fetchone():
             die(f"sessione attesa inesistente: {waiting_for}", 3)

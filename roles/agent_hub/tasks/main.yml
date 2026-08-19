@@ -92,7 +92,9 @@
     - { path: "{{ agent_hub_workspace }}", owner: root, group: "{{ agent_hub_agent_group }}", mode: "2775" }
     - { path: "{{ agent_hub_workspace }}/projects", owner: "{{ agent_hub_project_user }}", group: "{{ agent_hub_agent_group }}", mode: "2775" }
     - { path: "{{ agent_hub_workspace }}/logs", group: "{{ agent_hub_agent_group }}", mode: "2770" }
-    - { path: "{{ agent_hub_workspace }}/reports", group: "{{ agent_hub_agent_group }}", mode: "2775" }
+    # Gli agenti leggono gli eventi ma non devono poterli sostituire o
+    # pre-creare symlink per un writer che gira come service_user.
+    - { path: "{{ agent_hub_workspace }}/reports", group: "{{ agent_hub_agent_group }}", mode: "0755" }
     - { path: "{{ agent_hub_workspace }}/knowledge", group: "{{ agent_hub_agent_group }}", mode: "2775" }
     - { path: "{{ agent_hub_workspace }}/uploads", group: "{{ agent_hub_agent_group }}", mode: "2775" }
 

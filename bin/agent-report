@@ -114,8 +114,9 @@ def main():
             "comando dentro una sessione Agent Hub")
 
     me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
-    args = [REPORT_CTL, "report", sid, status, summary.strip(), "agent-report", me,
-            waiting_for.strip()]
+    # Identita' e sorgente non attraversano il confine sudo: report-ctl ricava
+    # il chiamante da SUDO_USER e verifica che possieda la sessione nel DB.
+    args = [REPORT_CTL, "report", sid, status, summary.strip(), waiting_for.strip()]
     if me not in (DB_OWNER, "root"):
         args = ["sudo", "-n", "-u", DB_OWNER] + args
     try:
