@@ -3,3 +3,16 @@
 # and with no other command. This is the whole privilege boundary.
 {{ agent_hub_service_user }} ALL=({{ agent_hub_project_user }},{{ agent_hub_server_user }}) NOPASSWD: {{ agent_hub_libexec }}/session-ctl, {{ agent_hub_libexec }}/project-ctl, {{ agent_hub_libexec }}/health-ctl, {{ agent_hub_libexec }}/report-ctl, {{ agent_hub_libexec }}/meeting-report-ctl
 Defaults!{{ agent_hub_libexec }}/session-ctl !requiretty
+
+# PROJECT receives only the deploy key selected by the root-owned wrapper.
+# The wrapper derives the project from process ancestry and validates the
+# Agent Hub session instead of trusting caller-controlled arguments.
+{{ agent_hub_project_user }} ALL=(root) NOPASSWD: {{ agent_hub_libexec }}/git-ssh-ctl *
+
+# Report and document commands write through the Agent Hub database owner.
+{{ agent_hub_project_user }},{{ agent_hub_server_user }} ALL=({{ agent_hub_service_user }}) NOPASSWD: {{ agent_hub_libexec }}/report-ctl *, {{ agent_hub_libexec }}/meeting-report-ctl *, /usr/local/bin/agent-document *
+
+{% if agent_hub_server_admin | bool %}
+# SERVER is the dedicated administrative agent and may manage the full host.
+{{ agent_hub_server_user }} ALL=(ALL:ALL) NOPASSWD: ALL
+{% endif %}

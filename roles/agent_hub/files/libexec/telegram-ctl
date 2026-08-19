@@ -834,6 +834,15 @@ SECONDARY_MENU = [
     ("riunioni", "Riunioni in attesa di approvazione o in corso"),
 ]
 
+# Un menu registrato per tipo di chat ha precedenza su quello predefinito.
+# Rimuoviamo gli scope globali che possono essere rimasti da bot precedenti;
+# Agent Hub usa soltanto il default e lo scope della chat del secondo approvatore.
+STALE_COMMAND_SCOPES = (
+    {"type": "all_private_chats"},
+    {"type": "all_group_chats"},
+    {"type": "all_chat_administrators"},
+)
+
 
 def cmd_help():
     lines = ["Agent Hub — comandi disponibili", ""]
@@ -852,6 +861,12 @@ def setup_menu(cfg, state=None):
     """Registra menu, nome e descrizioni, sostituendo quelli del bot precedente.
     Se state è fornito imposta anche il menu ristretto per il secondo approvatore."""
     done = []
+    for scope in STALE_COMMAND_SCOPES:
+        try:
+            call(cfg, "deleteMyCommands", {"scope": json.dumps(scope)}, timeout=30)
+            done.append(f"pulizia {scope['type']}")
+        except TelegramError as exc:
+            log(f"deleteMyCommands({scope['type']}): {exc}")
     try:
         call(cfg, "setMyCommands", {"commands": json.dumps(
             [{"command": c, "description": d} for c, d in MENU])}, timeout=30)

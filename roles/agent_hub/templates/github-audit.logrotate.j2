@@ -1,0 +1,10 @@
+{{ agent_hub_github_log_dir }}/github-usage.log {
+    su root {{ agent_hub_agent_group }}
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0664 root {{ agent_hub_agent_group }}
+}

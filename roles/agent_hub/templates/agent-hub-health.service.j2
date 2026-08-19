@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Agent Hub - deterministic host health check
+After=agent-hub.service tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart={{ agent_hub_libexec }}/health-ctl --save --quiet
+# 0=OK, 1=WARNING and 2=CRITICAL are health results, not unit failures.
+SuccessExitStatus=0 1 2
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-hub-health

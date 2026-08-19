@@ -27,7 +27,8 @@ from datetime import datetime, timezone
 
 DB = os.environ.get("AGENT_HUB_DB", "/var/lib/agent-hub/agent-hub.sqlite3")
 REPORT_DIR = os.environ.get("AGENT_HUB_REPORTS", "/srv/agent-workspace/reports")
-STATUSES = ("COMPLETED", "NEEDS_INPUT", "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
+STATUSES = ("COMPLETED", "NEEDS_INPUT", "WAITING_SESSION",
+            "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
 SESSION_RE = re.compile(r"^[0-9a-fA-F-]{6,40}$")
 MAX_SUMMARY = 4000
 
@@ -76,7 +77,7 @@ def write_event(payload):
 
 
 def cmd_report(argv):
-    """report <session> <status> <summary> [source] [unix_user]"""
+    """report <session> <status> <summary> [source] [unix_user] [waiting_for]"""
     if len(argv) < 3:
         die("uso: report <session-id> <status> <summary> [source] [unix-user]")
     sid = argv[0].strip()
@@ -90,31 +91,48 @@ def cmd_report(argv):
     summary = " ".join(argv[2].split())[:MAX_SUMMARY]
     source = (argv[3] if len(argv) > 3 else "agent-report")[:40]
     unix_user = (argv[4] if len(argv) > 4 else "")[:40]
+    waiting_for = (argv[5] if len(argv) > 5 else "").strip()
+    if waiting_for.startswith("agenthub-"):
+        waiting_for = waiting_for[len("agenthub-"):]
+    if status == "WAITING_SESSION":
+        if not SESSION_RE.match(waiting_for):
+            die("WAITING_SESSION richiede --waiting-for <session-id>")
+        if waiting_for == sid:
+            die("una sessione non puo' attendere se stessa")
+    else:
+        waiting_for = ""
 
     stamp = now()
     with db() as conn:
         row = conn.execute(
-            "SELECT id, name, report_status, report_summary, reported_at "
+            "SELECT id, name, report_status, report_summary, reported_at, "
+            "waiting_for_session "
             "FROM sessions WHERE id=?", (sid,)).fetchone()
         if not row:
             die(f"sessione inesistente: {sid}", 3)
+        if waiting_for and not conn.execute(
+                "SELECT 1 FROM sessions WHERE id=?", (waiting_for,)).fetchone():
+            die(f"sessione attesa inesistente: {waiting_for}", 3)
         duplicate = (row["report_status"] == status
-                     and (row["report_summary"] or "") == summary)
+                     and (row["report_summary"] or "") == summary
+                     and (row["waiting_for_session"] or "") == waiting_for)
         if duplicate:
             stamp = row["reported_at"] or stamp
         else:
             conn.execute(
-                "INSERT INTO session_reports (id,session_id,status,summary,reported_at,"
-                "source,unix_user) VALUES (?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), sid, status, summary, stamp, source, unix_user))
+                "INSERT INTO session_reports (id,session_id,status,summary,waiting_for_session,"
+                "reported_at,source,unix_user) VALUES (?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), sid, status, summary, waiting_for, stamp, source, unix_user))
             conn.execute(
-                "UPDATE sessions SET report_status=?, report_summary=?, reported_at=? "
-                "WHERE id=?", (status, summary, stamp, sid))
+                "UPDATE sessions SET report_status=?, report_summary=?, reported_at=?, "
+                "waiting_for_session=? "
+                "WHERE id=?", (status, summary, stamp, waiting_for, sid))
 
     payload = {
         "session_id": sid,
         "status": status,
         "summary": summary,
+        "waiting_for_session": waiting_for,
         "reported_at": stamp,
         "source": source,
         "unix_user": unix_user,
@@ -139,7 +157,8 @@ def cmd_show(argv):
     if not SESSION_RE.match(sid):
         die(f"identificatore di sessione non valido: {argv[0]}")
     with db() as conn:
-        row = conn.execute("SELECT id,name,status,report_status,report_summary,reported_at "
+        row = conn.execute("SELECT id,name,status,report_status,report_summary,reported_at,"
+                           "waiting_for_session "
                            "FROM sessions WHERE id=?", (sid,)).fetchone()
     if not row:
         die(f"sessione inesistente: {sid}", 3)

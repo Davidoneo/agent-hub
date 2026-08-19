@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Traccia d'uso della credenziale GitHub dell'account.
+#
+# NON e' un controllo: chi puo' leggere il token puo' usarlo comunque, anche
+# invocando /usr/bin/gh direttamente. Serve a rendere verificabile a posteriori
+# la regola "push e operazioni GitHub solo se la richiesta corrente lo chiede
+# esplicitamente" (vedi AGENTS.md).
+#
+# Il logging non deve mai far fallire il comando: ogni errore e' ignorato.
+REAL=/usr/bin/gh
+LOG=/var/log/agent-hub/github-usage.log
+
+{
+  sess="${AGENT_HUB_SESSION_ID:-${AGENT_HUB_SESSION:-${CLAUDE_CODE_SESSION_ID:--}}}"
+  # Non registrare mai un eventuale token passato come argomento.
+  args=$(printf '%s ' "$@" | sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/<REDACTED>/g')
+  printf '%s\tuser=%s\tsess=%s\ttty=%s\tcmd=gh %s\n' \
+    "$(date -Is)" "$(id -un)" "${sess:0:8}" "${TMUX_PANE:--}" "${args% }" >> "$LOG"
+} 2>/dev/null || true
+
+exec "$REAL" "$@"

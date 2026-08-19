@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""agent-report — registra lo stato finale di una sessione Agent Hub.
+
+Uso:
+    agent-report <STATO> --summary "testo breve" [--session <id>]
+    agent-report WAITING_SESSION --waiting-for <id> --summary "testo breve"
+"""
+import json
+import os
+import subprocess
+import sys
+
+REPORT_CTL = "/usr/local/libexec/agent-hub/report-ctl"
+
+
+def config_value(key, default):
+    """Legge config.env perche' sudo non conserva le variabili del servizio."""
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+DB_OWNER = config_value("AGENT_HUB_SERVICE_USER", "agenthub")
+STATUSES = ("COMPLETED", "NEEDS_INPUT", "WAITING_SESSION",
+            "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
+USAGE = (
+    'uso: agent-report <STATO> --summary "testo breve" [--session <id>] '
+    '[--waiting-for <session-id>]\n'
+    "stati: " + ", ".join(STATUSES)
+)
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def tmux_session_name():
+    if not os.environ.get("TMUX"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{session_name}"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def resolve_session(explicit):
+    for candidate in (explicit, os.environ.get("AGENT_HUB_SESSION_ID", ""),
+                      os.environ.get("AGENT_HUB_SESSION", ""), tmux_session_name()):
+        token = (candidate or "").strip()
+        if token:
+            return token[len("agenthub-"):] if token.startswith("agenthub-") else token
+    return ""
+
+
+def parse(argv):
+    status, summary, session, waiting_for = "", None, "", ""
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        if arg in ("--summary", "--session", "--waiting-for"):
+            i += 1
+            if i >= len(argv):
+                die(f"{arg} richiede un valore\n{USAGE}")
+            if arg == "--summary":
+                summary = argv[i]
+            elif arg == "--session":
+                session = argv[i]
+            else:
+                waiting_for = argv[i]
+        elif arg.startswith("--summary="):
+            summary = arg.split("=", 1)[1]
+        elif arg.startswith("--session="):
+            session = arg.split("=", 1)[1]
+        elif arg.startswith("--waiting-for="):
+            waiting_for = arg.split("=", 1)[1]
+        elif arg.startswith("-"):
+            die(f"opzione sconosciuta: {arg}\n{USAGE}")
+        elif not status:
+            status = arg
+        else:
+            die(f"argomento inatteso: {arg}\n{USAGE}")
+        i += 1
+    return status, summary, session, waiting_for
+
+
+def main():
+    status, summary, session, waiting_for = parse(sys.argv[1:])
+    status = status.strip().upper()
+    if status not in STATUSES:
+        die(f"stato non ammesso: {status or '(mancante)'}\n{USAGE}")
+    if summary is None or not summary.strip():
+        die('--summary e\' obbligatorio')
+    if status == "WAITING_SESSION" and not waiting_for.strip():
+        die("WAITING_SESSION richiede --waiting-for <session-id>")
+    if status != "WAITING_SESSION" and waiting_for.strip():
+        die("--waiting-for si usa soltanto con WAITING_SESSION")
+
+    sid = resolve_session(session)
+    if not sid:
+        die("SESSION_ID non determinabile: passa --session <id> oppure esegui il "
+            "comando dentro una sessione Agent Hub")
+
+    me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+    args = [REPORT_CTL, "report", sid, status, summary.strip(), "agent-report", me,
+            waiting_for.strip()]
+    if me not in (DB_OWNER, "root"):
+        args = ["sudo", "-n", "-u", DB_OWNER] + args
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        die(f"registrazione fallita: {exc}", 4)
+    out, err = (result.stdout or "").strip(), (result.stderr or "").strip()
+    if result.returncode != 0:
+        detail = err or out or f"rc={result.returncode}"
+        try:
+            detail = json.loads(err or out).get("error", detail)
+        except (ValueError, AttributeError):
+            pass
+        die(f"registrazione fallita: {detail}", 3 if result.returncode == 3 else 4)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        print(out)
+        return
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    note = "gia' registrato (nessun cambiamento)" if data.get("duplicate") else "registrato"
+    print(f"\nStato {data['status']} {note} per la sessione {data['session_id']}.",
+          file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

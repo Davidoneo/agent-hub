@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Agent Hub — registra il report di analisi di una riunione.
+
+L'agente di analisi esegue questo comando come ultima azione del turno per
+consegnare il JSON con riepilogo, decisioni, azioni, prompt operativo e
+target architecture.
+
+Uso:
+    agent-meeting-report --meeting <id> [--session <id>]
+
+Legge JSON da stdin (massimo 128 KiB) e lo passa al validatore server-side.
+La session id viene risolta dall'ambiente (AGENT_HUB_SESSION_ID) se non
+specificata esplicitamente.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+MAX_STDIN = 128 * 1024  # 128 KiB
+CTL = "/usr/local/libexec/agent-hub/meeting-report-ctl"
+
+
+def config_value(key: str, default: str) -> str:
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+def resolve_session(explicit: str) -> str:
+    candidates = [explicit, os.environ.get("AGENT_HUB_SESSION_ID", ""),
+                  os.environ.get("AGENT_HUB_SESSION", "")]
+    if os.environ.get("TMUX"):
+        try:
+            current = subprocess.run(
+                ["tmux", "display-message", "-p", "#{session_name}"],
+                capture_output=True, text=True, timeout=10)
+            if current.returncode == 0:
+                candidates.append(current.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for value in candidates:
+        value = (value or "").strip()
+        if value:
+            return value[len("agenthub-"):] if value.startswith("agenthub-") else value
+    return ""
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Registra il report di una riunione")
+    parser.add_argument("--meeting", required=True, help="ID della riunione (UUID)")
+    parser.add_argument("--session", default="",
+                        help="ID della sessione di analisi (default: $AGENT_HUB_SESSION_ID)")
+    args = parser.parse_args()
+
+    meeting_id = args.meeting.strip()
+    session_id = resolve_session(args.session)
+    if not session_id:
+        print("ERRORE: session ID non specificato. Usa --session o imposta "
+              "AGENT_HUB_SESSION_ID", file=sys.stderr)
+        return 3
+
+    # Leggi JSON da stdin
+    try:
+        raw = sys.stdin.buffer.read(MAX_STDIN + 1)
+    except (OSError, IOError):
+        print("ERRORE: impossibile leggere stdin", file=sys.stderr)
+        return 4
+
+    if len(raw) > MAX_STDIN:
+        print("ERRORE: input troppo grande (massimo 128 KiB)", file=sys.stderr)
+        return 5
+
+    # Validazione basilare: deve essere JSON
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"ERRORE: JSON non valido: {exc}", file=sys.stderr)
+        return 6
+
+    if not isinstance(data, dict):
+        print("ERRORE: il JSON deve essere un oggetto", file=sys.stderr)
+        return 7
+
+    unix_user = os.environ.get(
+        "USER", config_value("AGENT_HUB_PROJECT_USER", "devagent")
+    )
+
+    # Passa a meeting-report-ctl via sudo come proprietario del database.
+    db_owner = config_value("AGENT_HUB_SERVICE_USER", "agenthub")
+    cmd = [
+        "sudo", "-n", "-u", db_owner,
+        CTL, "submit", meeting_id, session_id, unix_user,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=raw,
+            capture_output=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        print(f"ERRORE: {CTL} non trovato", file=sys.stderr)
+        return 8
+    except subprocess.TimeoutExpired:
+        print("ERRORE: timeout del validatore", file=sys.stderr)
+        return 9
+    except OSError as exc:
+        print(f"ERRORE: impossibile eseguire il validatore: {exc}", file=sys.stderr)
+        return 10
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or b"errore sconosciuto").decode(
+            "utf-8", "replace").strip()
+        print(f"ERRORE: {err}", file=sys.stderr)
+        return 11
+
+    print(proc.stdout.decode("utf-8", "replace").strip() or "OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

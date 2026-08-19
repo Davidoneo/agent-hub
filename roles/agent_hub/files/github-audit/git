@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Traccia d'uso: registra i soli `git push`, che sono l'operazione coperta
+# dalla regola "push soltanto quando la richiesta corrente lo chiede
+# esplicitamente" (AGENTS.md). Tutto il resto passa senza toccare nulla.
+#
+# NON e' un controllo: /usr/bin/git resta invocabile direttamente.
+# Il logging non deve mai far fallire il comando.
+REAL=/usr/bin/git
+LOG=/var/log/agent-hub/github-usage.log
+
+# Il sottocomando non e' sempre $1: `git -C <dir> push` e simili.
+sub=""
+skip=0
+for a in "$@"; do
+  if (( skip )); then skip=0; continue; fi
+  case "$a" in
+    -C|-c|--git-dir|--work-tree|--namespace|--exec-path) skip=1 ;;
+    -*) ;;
+    *) sub="$a"; break ;;
+  esac
+done
+
+if [[ "$sub" == "push" ]]; then
+  {
+    sess="${AGENT_HUB_SESSION_ID:-${AGENT_HUB_SESSION:-${CLAUDE_CODE_SESSION_ID:--}}}"
+    args=$(printf '%s ' "$@" | sed -E 's#(https?://)[^/@ ]+:[^/@ ]+@#\1<REDACTED>@#g')
+    printf '%s\tuser=%s\tsess=%s\ttty=%s\tcmd=git %s\n' \
+      "$(date -Is)" "$(id -un)" "${sess:0:8}" "${TMUX_PANE:--}" "${args% }" >> "$LOG"
+  } 2>/dev/null || true
+fi
+
+exec "$REAL" "$@"

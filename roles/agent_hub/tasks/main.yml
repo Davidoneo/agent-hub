@@ -79,6 +79,7 @@
     - { path: "{{ agent_hub_root }}/app/static" }
     - { path: "{{ agent_hub_libexec }}", owner: root, group: root }
     - { path: "{{ agent_hub_config_dir }}", owner: root, group: root }
+    - { path: "{{ agent_hub_config_dir }}/repo-keys", owner: root, group: root, mode: "0700" }
     - { path: "{{ agent_hub_state_dir }}", mode: "0750" }
     - { path: "{{ agent_hub_workspace }}", owner: root, group: "{{ agent_hub_agent_group }}", mode: "2775" }
     - { path: "{{ agent_hub_workspace }}/projects", owner: "{{ agent_hub_project_user }}", group: "{{ agent_hub_agent_group }}", mode: "2775" }
@@ -104,6 +105,81 @@
     owner: root
     group: root
     mode: "0755"
+
+- name: Agent Hub | agent-facing CLI commands
+  ansible.builtin.copy:
+    src: "bin/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - agent-report
+    - agent-meeting-report
+    - agent-document
+
+- name: Agent Hub | GitHub audit directory
+  ansible.builtin.file:
+    path: "{{ agent_hub_github_log_dir }}"
+    state: directory
+    owner: root
+    group: "{{ agent_hub_agent_group }}"
+    mode: "0755"
+  when: agent_hub_github_audit_enabled | bool
+
+- name: Agent Hub | initialize GitHub audit log without truncation
+  ansible.builtin.copy:
+    content: ""
+    dest: "{{ agent_hub_github_log_dir }}/github-usage.log"
+    force: false
+    owner: root
+    group: "{{ agent_hub_agent_group }}"
+    mode: "0664"
+  when: agent_hub_github_audit_enabled | bool
+
+- name: Agent Hub | enforce GitHub audit log permissions
+  ansible.builtin.file:
+    path: "{{ agent_hub_github_log_dir }}/github-usage.log"
+    state: file
+    owner: root
+    group: "{{ agent_hub_agent_group }}"
+    mode: "0664"
+  when: agent_hub_github_audit_enabled | bool
+
+- name: Agent Hub | audit every git push
+  ansible.builtin.copy:
+    src: github-audit/git
+    dest: /usr/local/bin/git
+    owner: root
+    group: root
+    mode: "0755"
+  when: agent_hub_github_audit_enabled | bool
+
+- name: Agent Hub | detect the GitHub CLI
+  ansible.builtin.stat:
+    path: /usr/bin/gh
+  register: agent_hub_gh_binary
+  when: agent_hub_github_audit_enabled | bool
+
+- name: Agent Hub | audit GitHub CLI use when gh is installed
+  ansible.builtin.copy:
+    src: github-audit/gh
+    dest: /usr/local/bin/gh
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - agent_hub_github_audit_enabled | bool
+    - agent_hub_gh_binary.stat.exists | default(false)
+
+- name: Agent Hub | GitHub audit log rotation
+  ansible.builtin.template:
+    src: github-audit.logrotate.j2
+    dest: /etc/logrotate.d/agent-hub-github
+    owner: root
+    group: root
+    mode: "0644"
+  when: agent_hub_github_audit_enabled | bool
 
 - name: Agent Hub | virtualenv
   ansible.builtin.pip:
@@ -155,9 +231,28 @@
     - Reload systemd
     - Restart agent-hub-telegram
 
+- name: Agent Hub | health check units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - agent-hub-health.service
+    - agent-hub-health.timer
+  notify: Reload systemd
+
 - name: Agent Hub | enable the service
   ansible.builtin.systemd:
     name: agent-hub
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Agent Hub | enable the health timer
+  ansible.builtin.systemd:
+    name: agent-hub-health.timer
     enabled: true
     state: started
     daemon_reload: true

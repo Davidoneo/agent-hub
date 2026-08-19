@@ -177,7 +177,8 @@ PENDING, LAUNCHING, SENT, FAILED, RESENT = (
     "pending", "launching", "sent", "delivery_failed", "manually_resent")
 
 # Stati finali dichiarati dall'agente stesso con `agent-report`.
-REPORT_STATUSES = ("COMPLETED", "NEEDS_INPUT", "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
+REPORT_STATUSES = ("COMPLETED", "NEEDS_INPUT", "WAITING_SESSION",
+                   "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
 # Stati che il controller ricava da fatti osservabili, mai dal contenuto della TUI.
 CONTROLLER_STATUSES = ("RUNNING", "STARTING", "CRASHED", "ENDED_UNREPORTED",
                        "POSSIBLY_STALLED", "AUTH_REQUIRED", "USAGE_LIMIT")
@@ -394,8 +395,9 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS session_reports (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
-                status TEXT NOT NULL,       -- COMPLETED|NEEDS_INPUT|NEEDS_HOST_ACTION|FAILED|CANCELLED
+                status TEXT NOT NULL,       -- COMPLETED|NEEDS_INPUT|WAITING_SESSION|NEEDS_HOST_ACTION|FAILED|CANCELLED
                 summary TEXT NOT NULL DEFAULT '',
+                waiting_for_session TEXT NOT NULL DEFAULT '',
                 reported_at TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'agent-report',
                 unix_user TEXT DEFAULT ''
@@ -521,6 +523,8 @@ def migrate_db() -> None:
         for col in ("report_status", "report_summary", "reported_at",
                     "exit_code", "lifecycle", "lifecycle_at",
                     "effort", "harness_session_id",
+                    # dipendenza strutturata usata da WAITING_SESSION
+                    "waiting_for_session",
                     # ultimo mtime del log gia' contabilizzato come lavoro
                     "work_probe_mtime", "work_probe_at"):
             if col not in have:
@@ -529,6 +533,9 @@ def migrate_db() -> None:
         # elaborazione, non l'attesa di un input umano
         if "work_seconds" not in have:
             conn.execute("ALTER TABLE sessions ADD COLUMN work_seconds INTEGER NOT NULL DEFAULT 0")
+        have_reports = {r["name"] for r in conn.execute("PRAGMA table_info(session_reports)")}
+        if "waiting_for_session" not in have_reports:
+            conn.execute("ALTER TABLE session_reports ADD COLUMN waiting_for_session TEXT NOT NULL DEFAULT ''")
         # Executor esterni opzionali: configurazione per-sessione passata al
         # wrapper, senza credenziali nel database o negli argomenti della CLI.
         if "executor_enabled" not in have:
@@ -1241,6 +1248,12 @@ def decorate(row: dict, info: dict | None, last: dict | None = None) -> dict:
     row["last_delivered_at"] = last.get("delivered_at", "")
     row["state"] = observed_state(row, last)
     apply_lifecycle(row, last)
+    row["waiting_for_name"] = ""
+    if row.get("waiting_for_session"):
+        with db() as conn:
+            blocker = conn.execute(
+                "SELECT name FROM sessions WHERE id=?", (row["waiting_for_session"],)).fetchone()
+        row["waiting_for_name"] = blocker["name"] if blocker else "Sessione non trovata"
     return row
 
 
@@ -1287,6 +1300,7 @@ def observed_state(row: dict, last: dict) -> str:
 LIFECYCLE_LABEL = {
     "COMPLETED": "Completato",
     "NEEDS_INPUT": "Attende input",
+    "WAITING_SESSION": "In attesa di un'altra sessione",
     "NEEDS_HOST_ACTION": "Richiede azione host",
     "FAILED": "Fallito (dichiarato)",
     "CANCELLED": "Annullato",
@@ -1295,7 +1309,7 @@ LIFECYCLE_LABEL = {
     "POSSIBLY_STALLED": "Forse bloccato",
     "AUTH_REQUIRED": "Login richiesto",
     "USAGE_LIMIT": "Limite d'uso",
-    "RUNNING": "In esecuzione",
+    "RUNNING": "Al lavoro",
     "STARTING": "Avvio",
 }
 
@@ -1364,6 +1378,7 @@ def apply_lifecycle(row: dict, last: dict) -> str:
     row["report_status"] = row.get("report_status") or ""
     row["report_summary"] = row.get("report_summary") or ""
     row["reported_at"] = row.get("reported_at") or ""
+    row["waiting_for_session"] = row.get("waiting_for_session") or ""
     row["exit_code"] = row.get("exit_code") or ""
     stored = row.get("lifecycle") or ""
     current_report = report_is_current(row, last)
@@ -1450,9 +1465,10 @@ def nudge_text(row: dict) -> str:
         "Esegui adesso soltanto questo comando, con il riepilogo del lavoro:",
         f'agent-report COMPLETED --summary "..." --session {row["id"]}',
         "",
-        "Usa NEEDS_INPUT se attendi una mia risposta, NEEDS_HOST_ACTION se serve",
-        "un intervento sull'host, FAILED se non sei riuscito, CANCELLED se hai",
-        "abbandonato. Non serve altro output.",
+        "Usa NEEDS_INPUT se attendi una mia risposta; WAITING_SESSION con",
+        "--waiting-for <session-id> se dipendi da un'altra sessione;",
+        "NEEDS_HOST_ACTION se serve un intervento sull'host, FAILED se non sei",
+        "riuscito, CANCELLED se hai abbandonato. Non serve altro output.",
         "-" * len(CONTRACT_HEADER),
     ])
 
@@ -1464,7 +1480,7 @@ def maybe_nudge(row: dict, last: dict) -> bool:
         return False
     if not row["alive"] or row["status"] != "running":
         return False
-    if row["lifecycle"] in ("AUTH_REQUIRED", "USAGE_LIMIT", "STARTING"):
+    if row["lifecycle"] in ("WAITING_SESSION", "AUTH_REQUIRED", "USAGE_LIMIT", "STARTING"):
         return False               # l'agente e' fermo per un motivo noto
     age = inactivity_age(row, last)
     if age is None or age < cfg["nudge_seconds"] or age > cfg["stall_seconds"]:
@@ -1494,14 +1510,47 @@ def controller_sweep() -> int:
     live = sync_status()
     with db() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM sessions")]
+    by_id = {}
     for row in rows:
         decorate(row, live.get(row["tmux_name"]))
+        by_id[row["id"]] = row
         accumulate_work(row)
         try:
             maybe_nudge(row, row.get("last_message") or {})
         except Exception:  # noqa: BLE001
             pass       # un sollecito non riuscito non deve fermare lo sweep
+    for row in rows:
+        try:
+            release_dependency(row, by_id)
+        except Exception:  # noqa: BLE001
+            pass       # una ripresa non riuscita verra' ritentata o restera' visibile
     return len(rows)
+
+
+DEPENDENCY_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "CRASHED", "ENDED_UNREPORTED"}
+
+
+def release_dependency(row: dict, sessions: dict[str, dict]) -> bool:
+    """Riprende una sessione quando la sessione da cui dipende e' terminata.
+
+    La creazione del messaggio invalida immediatamente il report
+    WAITING_SESSION; questo rende l'operazione idempotente anche mentre la
+    consegna asincrona e' ancora in corso.
+    """
+    if row.get("lifecycle") != "WAITING_SESSION" or not row.get("alive"):
+        return False
+    blocker_id = row.get("waiting_for_session") or ""
+    blocker = sessions.get(blocker_id)
+    if not blocker or blocker.get("lifecycle") not in DEPENDENCY_TERMINAL:
+        return False
+    outcome = blocker["lifecycle"]
+    summary = blocker.get("report_summary") or "Nessun riepilogo disponibile."
+    text = (f"La sessione da cui dipendevi, {blocker.get('name') or blocker_id} "
+            f"({blocker_id}), ha raggiunto lo stato {outcome}.\n\n"
+            f"Riepilogo: {summary}\n\nRiprendi ora il lavoro rimasto in sospeso.")
+    mid = add_message(row["id"], text, kind="dependency")
+    deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
+    return True
 
 
 def sweep_loop() -> None:
@@ -1515,7 +1564,7 @@ def sweep_loop() -> None:
 
 def last_report_of(sid: str) -> dict:
     with db() as conn:
-        r = conn.execute("SELECT status, summary, reported_at, source, unix_user "
+        r = conn.execute("SELECT status, summary, waiting_for_session, reported_at, source, unix_user "
                          "FROM session_reports WHERE session_id=? "
                          "ORDER BY reported_at DESC, rowid DESC LIMIT 1", (sid,)).fetchone()
     return dict(r) if r else {}
@@ -1524,7 +1573,7 @@ def last_report_of(sid: str) -> dict:
 def session_reports(sid: str) -> list[dict]:
     with db() as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT status, summary, reported_at, source, unix_user FROM session_reports "
+            "SELECT status, summary, waiting_for_session, reported_at, source, unix_user FROM session_reports "
             "WHERE session_id=? ORDER BY reported_at, rowid", (sid,))]
 
 
@@ -1679,7 +1728,9 @@ async def session_state(sid: str):
             "lifecycle": row["lifecycle"], "lifecycle_label": row["lifecycle_label"],
             "lifecycle_reported": row["lifecycle_reported"],
             "report_status": row["report_status"], "report_summary": row["report_summary"],
-            "reported_at": row["reported_at"], "exit_code": row["exit_code"],
+            "reported_at": row["reported_at"], "waiting_for_session": row["waiting_for_session"],
+            "waiting_for_name": row["waiting_for_name"],
+            "exit_code": row["exit_code"],
             **counters}
 
 
@@ -1949,10 +2000,14 @@ def contract_block(row: dict) -> str:
         "",
         'agent-report COMPLETED --summary "..."',
         'agent-report NEEDS_INPUT --summary "..."',
+        'agent-report WAITING_SESSION --waiting-for <session-id> --summary "..."',
         'agent-report NEEDS_HOST_ACTION --summary "..."',
         'agent-report FAILED --summary "..."',
         'agent-report CANCELLED --summary "..."',
         "",
+        "WAITING_SESSION indica una dipendenza fra agenti e riprende automaticamente "
+        "questa sessione quando quella indicata termina; NEEDS_INPUT e' riservato a una "
+        "risposta dell'utente.",
         "Non concludere un turno senza registrare uno di questi stati: il riepilogo "
         "che scrivi e' il risultato che arriva a chi ha chiesto il lavoro, e senza "
         "di esso la sessione viene segnalata come bloccata.",
@@ -1978,8 +2033,9 @@ def contract_reminder(row: dict) -> str:
             "Obbligatorio: come ultima azione di QUESTO turno, prima di restituire "
             "il controllo, registra lo stato finale con\n"
             'agent-report COMPLETED --summary "cosa hai fatto"\n'
-            "(oppure NEEDS_INPUT se attendi una risposta, NEEDS_HOST_ACTION se serve "
-            "un intervento sull'host, FAILED, CANCELLED).\n"
+            "(oppure NEEDS_INPUT se attendi una risposta; WAITING_SESSION "
+            "--waiting-for <session-id> se attendi un'altra sessione; "
+            "NEEDS_HOST_ACTION se serve un intervento sull'host, FAILED, CANCELLED).\n"
             "Vale a ogni turno, anche per richieste brevi: senza questo comando il "
             "risultato del lavoro non arriva a chi lo ha chiesto.")
 
@@ -2009,6 +2065,10 @@ def add_message(sid: str, text: str, kind: str = "user", status: str = PENDING) 
             "INSERT INTO messages (id,session_id,kind,text,status,method,attempts,created_at,"
             "delivered_at,last_error) VALUES (?,?,?,?,?,'',0,?,'','')",
             (mid, sid, kind, text, status, now()))
+        if kind != "control":
+            # Un nuovo turno, automatico o umano, scioglie il vincolo corrente.
+            # Lo storico del report conserva comunque quale sessione si attendeva.
+            conn.execute("UPDATE sessions SET waiting_for_session='' WHERE id=?", (sid,))
     return mid
 
 

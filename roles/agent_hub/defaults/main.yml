@@ -9,8 +9,8 @@ agent_hub_install: false
 # accounts run the agent sessions and are deliberately separated so that a
 # project agent cannot reach host privileges.
 agent_hub_service_user: agenthub
-agent_hub_project_user: projectagent
-agent_hub_server_user: serveragent
+agent_hub_project_user: devagent
+agent_hub_server_user: hostagent
 agent_hub_agent_group: agentprojects
 
 # Bind address. Keep it on loopback: exposure is meant to happen through
@@ -33,6 +33,15 @@ agent_hub_libexec: /usr/local/libexec/agent-hub
 agent_hub_config_dir: /etc/agent-hub
 agent_hub_state_dir: /var/lib/agent-hub
 agent_hub_workspace: /srv/agent-workspace
+
+# The SERVER account is the dedicated host administrator. PROJECT remains
+# unprivileged and reaches GitHub only through per-project deploy keys.
+agent_hub_server_admin: true
+
+# Audit use of the account-wide GitHub CLI and every `git push`. This never
+# stores credentials; it records command metadata in a group-writable log.
+agent_hub_github_audit_enabled: true
+agent_hub_github_log_dir: /var/log/agent-hub
 
 # Telegram notifier. Disabled by default: it is the only component that
 # talks to the internet. Put the token in a vault, never in group_vars.

@@ -5,7 +5,7 @@
 # live installation changes, so regenerate it here instead of editing the
 # vendored files by hand.
 #
-#   ./scripts/sync-agent-hub.sh [/opt/agent-hub] [/usr/local/libexec/agent-hub]
+#   ./scripts/sync-agent-hub.sh [/opt/agent-hub] [/usr/local/libexec/agent-hub] [/usr/local/bin]
 #
 # Afterwards review `git diff` before committing: this repository is public
 # and the check below is a safety net, not a substitute for reading.
@@ -13,15 +13,20 @@ set -Eeuo pipefail
 
 APP_ROOT=${1:-/opt/agent-hub}
 LIBEXEC=${2:-/usr/local/libexec/agent-hub}
+BIN_ROOT=${3:-/usr/local/bin}
 DEST=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)/roles/agent_hub/files
 
 [[ -d "$APP_ROOT/app" ]] || { echo "not found: $APP_ROOT/app" >&2; exit 1; }
 [[ -d "$LIBEXEC" ]] || { echo "not found: $LIBEXEC" >&2; exit 1; }
 
-mkdir -p "$DEST/app/static" "$DEST/libexec"
+mkdir -p "$DEST/app/static" "$DEST/libexec" "$DEST/bin"
 cp -a "$APP_ROOT/app/main.py" "$APP_ROOT/app/transcript.py" "$DEST/app/"
 cp -a "$APP_ROOT/app/static/." "$DEST/app/static/"
 cp -a "$LIBEXEC/." "$DEST/libexec/"
+for command in agent-report agent-meeting-report agent-document; do
+  [[ -f "$BIN_ROOT/$command" ]] || { echo "not found: $BIN_ROOT/$command" >&2; exit 1; }
+  cp -a "$BIN_ROOT/$command" "$DEST/bin/$command"
+done
 find "$DEST" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 find "$DEST" -name '*.pyc' -delete
 

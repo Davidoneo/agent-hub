@@ -18,7 +18,9 @@ agent_hub_install: true
 |---|---|
 | `agent-hub.service` | FastAPI/uvicorn on loopback, serves the UI and the API |
 | `agent-hub-telegram.service` | Optional notifier, the only component reaching the internet |
+| `agent-hub-health.timer` | Deterministic host health snapshot every 30 minutes |
 | `/usr/local/libexec/agent-hub/*-ctl` | Root-owned wrappers, the privilege boundary |
+| `/usr/local/bin/agent-*` | Stable report, meeting and document commands for sessions |
 | Three Unix accounts | Service account plus two agent accounts, deliberately separated |
 
 ## The privilege split
@@ -31,11 +33,20 @@ agent commands itself: it may only call the wrappers under
 two **agent accounts**:
 
 - **project account** - runs agent sessions against your repositories, owns
-  a rootless Docker daemon. It cannot reach host privileges.
-- **server account** - runs sessions that administer the host.
+  a rootless Docker daemon and has no account-wide GitHub credential. The
+  root-owned `git-ssh-ctl` selects only the current project's deploy key from
+  process ancestry; arbitrary root commands remain denied.
+- **server account** - runs sessions that administer the host. By default it
+  has passwordless full sudo (`agent_hub_server_admin: true`).
 
 A compromised project session therefore cannot escalate to the host, and the
 web service cannot run arbitrary commands even if it is compromised.
+
+The role also installs passive wrappers that append every `gh` invocation and
+every `git push` to `/var/log/agent-hub/github-usage.log`. They never log token
+values. Repository deletion is intentionally not provisioned: keep the
+`delete_repo` scope out of the standing token and grant it manually only when
+you explicitly need that operation.
 
 ## Required variables
 
@@ -48,13 +59,13 @@ agent_hub_allowed_users:                             # Tailscale-User-Login
   - you@example.com
 ```
 
-Accounts default to `agenthub`, `projectagent` and `serveragent`. Override
+Accounts default to `agenthub`, `devagent` and `hostagent`. Override
 them if those names are taken:
 
 ```yaml
 agent_hub_service_user: agenthub
-agent_hub_project_user: projectagent
-agent_hub_server_user: serveragent
+agent_hub_project_user: devagent
+agent_hub_server_user: hostagent
 ```
 
 Telegram is off by default. Keep the token in a vault:
@@ -82,9 +93,9 @@ header is refused, so a local process cannot bypass the identity check.
 
 ## The vendored application
 
-`files/app/` and `files/libexec/` hold a copy of the application. Do not edit
-those files here: change them in the Agent Hub source repository, deploy, and
-then refresh the copy with
+`files/app/`, `files/libexec/` and `files/bin/` hold a copy of the application.
+Do not edit those files here: change them in the Agent Hub source repository,
+deploy, and then refresh the copy with
 
 ```bash
 ./scripts/sync-agent-hub.sh

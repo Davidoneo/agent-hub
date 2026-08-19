@@ -26,6 +26,11 @@ repository.
   (`-p` flag) go through the iptables `DOCKER` chains and **bypass ufw** in
   default configurations. For real isolation consider `iptables: false` in
   `docker_daemon_config` or an nftables backend.
+
+- If the host also loads a custom nftables file containing `flush ruleset`,
+  load that ruleset before Docker starts. Reloading it while Docker is running
+  removes Docker's NAT and masquerade chains; restart `docker.service`
+  immediately afterward and verify container egress.
 - An empty `docker_daemon_config` does not touch an existing
   `/etc/docker/daemon.json`: if one was generated in a previous run, manage
   it separately.

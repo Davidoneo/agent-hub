@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Register an agent-created file in Agent Hub's document catalog."""
+
+import argparse
+import hashlib
+import json
+import os
+import pwd
+import sqlite3
+import subprocess
+import sys
+import uuid
+
+
+DB = "/var/lib/agent-hub/agent-hub.sqlite3"
+PROJECT_CTL = "/usr/local/libexec/agent-hub/project-ctl"
+PROJECT_ROOT = "/srv/agent-workspace/projects"
+KNOWLEDGE_ROOT = "/srv/agent-workspace/knowledge/projects"
+
+
+def config_value(key: str, default: str) -> str:
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+def main() -> None:
+    db_owner = config_value("AGENT_HUB_SERVICE_USER", "agenthub")
+    project_user = config_value("AGENT_HUB_PROJECT_USER", "devagent")
+    db_path = config_value("AGENT_HUB_DB", DB)
+    project_root = config_value("AGENT_HUB_PROJECTS", PROJECT_ROOT)
+    knowledge_root = os.path.join(
+        config_value("AGENT_HUB_KNOWLEDGE", os.path.dirname(KNOWLEDGE_ROOT)),
+        "projects",
+    )
+    if pwd.getpwuid(os.getuid()).pw_name != db_owner:
+        os.execvp(
+            "sudo",
+            ["sudo", "-n", "-u", db_owner, sys.argv[0], *sys.argv[1:]],
+        )
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("add", choices=["add"])
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--file", required=True)
+    parser.add_argument("--scope", choices=["private", "repository"], default="private")
+    parser.add_argument("--name", default="")
+    args = parser.parse_args()
+
+    if not args.project or not all(c.isalnum() or c in "._-" for c in args.project):
+        raise SystemExit("invalid project slug")
+    source = os.path.realpath(args.file)
+    if not os.path.isfile(source):
+        raise SystemExit("file does not exist")
+    name = os.path.basename(args.name or source)
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise SystemExit("invalid document name")
+
+    command = "doc-import" if args.scope == "repository" else "knowledge-import"
+    knowledge_dest = os.path.realpath(os.path.join(knowledge_root, args.project, name))
+    project_dest = os.path.realpath(
+        os.path.join(project_root, args.project, "docs", "input", name)
+    )
+    expected = project_dest if args.scope == "repository" else knowledge_dest
+    if source == expected:
+        destination = source
+    else:
+        result = subprocess.run(
+            [
+                "sudo", "-n", "-u", project_user, PROJECT_CTL, command,
+                args.project, source, name,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            raise SystemExit((result.stderr or result.stdout).strip())
+        destination = json.loads(result.stdout)["path"]
+
+    digest = hashlib.sha256()
+    size = 0
+    with open(destination, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+
+    document_id = str(uuid.uuid4())
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO documents "
+            "(id,name,original_name,path,project_slug,scope,size,sha256,content_type,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))",
+            (
+                document_id,
+                os.path.basename(destination),
+                name,
+                destination,
+                args.project,
+                args.scope,
+                size,
+                digest.hexdigest(),
+                "text/markdown" if destination.lower().endswith((".md", ".markdown"))
+                else "application/octet-stream",
+            ),
+        )
+    print(json.dumps({
+        "id": document_id,
+        "path": destination,
+        "project_slug": args.project,
+        "scope": args.scope,
+    }))
+
+
+if __name__ == "__main__":
+    main()
