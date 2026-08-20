@@ -3332,6 +3332,15 @@ async def list_projects():
             paths = conn.execute(
                 "SELECT path FROM documents WHERE project_slug=?", (r["slug"],))
             r["documents"] = sum(Path(item["path"]).is_file() for item in paths)
+            r["meetings"] = conn.execute(
+                "SELECT COUNT(*) FROM meetings WHERE project_slug=?", (r["slug"],)
+            ).fetchone()[0]
+            context = conn.execute(
+                "SELECT updated_at,package_path FROM project_contexts WHERE project_slug=?",
+                (r["slug"],)).fetchone()
+            r["context_updated_at"] = (context["updated_at"] if context else "") or ""
+            r["context_ready"] = bool(
+                context and context["package_path"] and Path(context["package_path"]).is_file())
     known = {r["slug"] for r in rows}
     unregistered = []
     root = Path(CONFIG["projects"])
@@ -4408,6 +4417,10 @@ def _build_context_md(slug: str, target_architecture: str,
                 if isinstance(decision, dict):
                     lines.append(f"  Decisione: {decision.get('title', '')} — "
                                  f"{decision.get('detail', '')}")
+            for question in prop.get("open_questions", [])[:20]:
+                if isinstance(question, dict):
+                    lines.append(f"  Questione aperta: {question.get('title', '')} — "
+                                 f"{question.get('detail', '')}")
             for action in prop.get("actions", [])[:20]:
                 if isinstance(action, dict):
                     lines.append(f"  Azione: {action.get('title', '')} — "
@@ -4735,11 +4748,115 @@ def _transcript_document(m: dict) -> dict | None:
     return doc
 
 
+def _meeting_report_prompt(m: dict, *, feedback: str = "",
+                           previous: dict | None = None) -> str:
+    """Build one consistent decision-report contract for analysis and revision."""
+    mid = m["id"]
+    slug = m["project_slug"]
+    transcript_path = m.get("transcript_path") or ""
+    suggested_prompt = (m.get("operational_prompt") or "").strip()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT target_architecture FROM project_contexts WHERE project_slug=?",
+            (slug,)).fetchone()
+    current_target = ((row["target_architecture"] if row else "") or "").strip()
+
+    prompt = (
+        "# Prepare a meeting decision report for human approval\n\n"
+        f"Meeting: {m['title']}\n"
+        f"Project: {slug}\n\n"
+        "This is a decision report, not generic minutes. Read the attached transcript "
+        "in full before writing anything. Write the report in the language used by the "
+        "meeting.\n\n"
+        "## Evidence and classification rules\n\n"
+        "- The transcript is the only authority for what participants discussed, agreed, "
+        "rejected, assigned, or left unresolved. Project files may clarify names and the "
+        "current state, but they must never be promoted into meeting decisions.\n"
+        "- A `decision` requires explicit convergence, approval, or commitment in the "
+        "transcript. Write one atomic, self-contained outcome per item. Do not include "
+        "brainstorming, alternatives, status updates, assumptions, or follow-up tasks.\n"
+        "- Put unresolved alternatives, contradictions, missing confirmations, and topics "
+        "deferred to later in `open_questions`, never in `decisions`. If later speech clearly "
+        "resolves an earlier ambiguity, keep only the final outcome.\n"
+        "- Put concrete follow-up commitments in `actions`; an action is not a decision. "
+        "Record owner and due date only when explicitly stated, otherwise use empty strings.\n"
+        "- Deduplicate semantically equivalent items. Never invent consensus, rationale, "
+        "owners, deadlines, requirements, or architecture. An empty array is correct when "
+        "the meeting contains none.\n"
+        "- For each decision, `detail` states exactly what was chosen, `rationale` contains "
+        "only reasons actually stated, and `evidence` cites the shortest supporting "
+        "transcript timestamp range (for example `[012.0 - 038.5]`).\n\n"
+        "## Target architecture rule\n\n"
+    )
+    if current_target:
+        prompt += (
+            "The current target architecture is included below. If the meeting contains no "
+            "explicit architecture decision, return it unchanged. If it does, return the "
+            "complete consolidated target by applying only those explicit decisions; do not "
+            "rewrite or fill gaps speculatively.\n\n"
+            f"```text\n{current_target[:50000]}\n```\n\n"
+        )
+    else:
+        prompt += (
+            "No current target architecture is recorded. Return an empty string unless the "
+            "meeting explicitly establishes target architecture content; never reconstruct a "
+            "complete architecture from incidental discussion.\n\n"
+        )
+    prompt += (
+        "## Required JSON\n\n"
+        "Submit exactly one JSON object with:\n"
+        "- `summary`: concise context needed to review the outcomes;\n"
+        "- `decisions`: objects with `title`, `detail`, `rationale`, `evidence`;\n"
+        "- `open_questions`: objects with `title`, `detail`;\n"
+        "- `actions`: objects with `title`, `detail`, `owner`, `due_date`;\n"
+        "- `operational_prompt`: approved post-meeting documentation/roadmap instructions;\n"
+        "- `target_architecture`: the consolidated target governed by the rule above.\n\n"
+        "Do not create note, summary, or minutes files: Agent Hub generates the minutes from "
+        "the submitted JSON. Before your final status, submit the proposal with:\n\n"
+        f"`agent-meeting-report --meeting {mid}`\n\n"
+        "Example shape (replace every value; do not copy placeholders):\n\n"
+        "```json\n"
+        '{"summary":"...","decisions":[{"title":"...","detail":"...",'
+        '"rationale":"...","evidence":"[000.0 - 000.0]"}],'
+        '"open_questions":[{"title":"...","detail":"..."}],'
+        '"actions":[{"title":"...","detail":"...","owner":"","due_date":""}],'
+        '"operational_prompt":"","target_architecture":""}\n'
+        "```\n\n"
+    )
+    if suggested_prompt:
+        prompt += (
+            "## Requester-supplied post-approval instructions\n\n"
+            "These are explicit requester constraints, not evidence of a meeting decision. "
+            "Preserve them in `operational_prompt` unless the transcript explicitly amends or "
+            "rejects them; never duplicate them in `decisions`.\n\n"
+            f"{suggested_prompt[:20000]}\n\n"
+        )
+    if feedback:
+        prompt += (
+            "## Reviewer feedback for this revision\n\n"
+            f"{feedback[:6000]}\n\n"
+            "Apply the feedback while rechecking every changed item against the original "
+            "transcript. Reviewer feedback may request presentation changes, but it is not by "
+            "itself evidence that the meeting made a new decision.\n\n"
+        )
+    if previous:
+        prompt += (
+            "## Previous proposal\n\n"
+            "Revise this proposal; do not preserve an item merely because it appeared here.\n\n"
+            f"```json\n{json.dumps(previous, ensure_ascii=False, indent=2)[:12000]}\n```\n\n"
+        )
+    prompt += (
+        "## Transcript\n\n"
+        "The full text is the attached document. Open and read it completely.\n"
+        f"Path: {transcript_path or '(unavailable)'}\n"
+    )
+    return prompt
+
+
 def _start_analysis_session(m: dict) -> None:
     """Crea sessione PROJECT per analizzare la trascrizione."""
     mid = m["id"]
     slug = m["project_slug"]
-    transcript_path = m.get("transcript_path") or ""
     profile = m.get("profile_id") or ""
     model = m.get("model") or ""
     effort = m.get("effort") or ""
@@ -4748,39 +4865,7 @@ def _start_analysis_session(m: dict) -> None:
         return
     # la trascrizione arriva come documento allegato, mai dentro il prompt
     doc = _transcript_document(m)
-    operational_prompt = (m.get("operational_prompt") or "").strip()
-    prompt = (
-        "Analizza la trascrizione di una riunione di progetto.\n\n"
-        "## Istruzioni\n"
-        "1. Leggi per intero il file della trascrizione allegato a questa sessione.\n"
-        "2. Produci un riepilogo (summary) delle discussioni e decisioni prese.\n"
-        "3. Elenca le decisioni prese (decisions array).\n"
-        "4. Elenca le azioni da intraprendere (actions array).\n"
-        "5. Se c'e' un prompt operativo approvato, includilo.\n"
-        "6. Descrivi la target architecture completa del progetto risultante "
-        "dalle decisioni prese.\n\n"
-        "\nNon creare file di appunti, riepiloghi o minute: la minuta viene "
-        "generata dal sistema dal JSON che consegni. Il tuo unico output e' "
-        "quel JSON.\n\n"
-        "Prima dello stato finale, invia la proposta strutturata eseguendo:\n"
-        f'agent-meeting-report --meeting {mid}\n\n'
-        "Passando su stdin un JSON con questi campi:\n"
-        "- summary (string)\n"
-        "- decisions (array di oggetti)\n"
-        "- actions (array di oggetti)\n"
-        "- operational_prompt (string)\n"
-        "- target_architecture (string)\n\n"
-        "Esempio:\n"
-        '{"summary": "...", "decisions": [{"title": "...", "detail": "..."}], '
-        '"actions": [{"title": "...", "detail": "..."}], '
-        '"operational_prompt": "...", "target_architecture": "..."}\n\n'
-    )
-    if operational_prompt:
-        prompt += f"## Prompt operativo suggerito\n{operational_prompt}\n\n"
-    prompt += ("## Trascrizione\n"
-               "Il testo integrale non e' riportato qui: e' un file, elencato piu' sotto "
-               "fra i documenti allegati. Aprilo e leggilo tutto prima di rispondere.\n"
-               f"Percorso: {transcript_path or '(non disponibile)'}\n\n")
+    prompt = _meeting_report_prompt(m)
     try:
         body = {
             "name": f"Analisi riunione: {m['title'][:50]}",
@@ -4869,24 +4954,8 @@ def _action_revise(m: dict, act: dict) -> None:
     model = m.get("model") or ""
     effort = m.get("effort") or ""
     doc = _transcript_document(m)
-    tp = m.get("transcript_path") or ""
     prev_proposal = _decode_proposal(m.get("proposal_json") or "")
-    prompt = (
-        f"Revisione della proposta per la riunione: {m['title']}\n\n"
-        f"## Feedback ricevuto\n{feedback[:4000]}\n\n"
-        "## Istruzioni\n"
-        "Rivedi la proposta precedente in base al feedback, leggendo la trascrizione "
-        "originale e producendo un nuovo JSON. Non creare file: la minuta viene "
-        "rigenerata dal sistema dal JSON che consegni. Al termine esegui:\n"
-        f'agent-meeting-report --meeting {mid}\n\n'
-        "Con lo stesso formato JSON di prima (summary, decisions, actions, "
-        "operational_prompt, target_architecture).\n\n"
-    )
-    prompt += ("## Trascrizione originale\n"
-               "E' il file allegato elencato piu' sotto: rileggilo, non e' riportato qui.\n"
-               f"Percorso: {tp or '(non disponibile)'}\n\n")
-    if prev_proposal:
-        prompt += f"## Proposta precedente\n```json\n{json.dumps(prev_proposal, ensure_ascii=False, indent=2)[:6000]}\n```\n"
+    prompt = _meeting_report_prompt(m, feedback=feedback, previous=prev_proposal)
     if not profile:
         _action_error(act["id"], "profilo non configurato per la revisione")
         return
@@ -4936,6 +5005,8 @@ def _action_implement(m: dict, act: dict) -> None:
     op_prompt = proposal.get("operational_prompt", "") if isinstance(proposal, dict) else ""
     op_prompt = op_prompt or (m.get("operational_prompt") or "")
     decisions = proposal.get("decisions", []) if isinstance(proposal, dict) else []
+    open_questions = proposal.get("open_questions", []) if isinstance(proposal, dict) else []
+    actions = proposal.get("actions", []) if isinstance(proposal, dict) else []
     frozen_now = meeting_arch_frozen_now(slug)
     esempi = (", ".join(f"`{n}`" for n in frozen_now) if frozen_now
               else "(nessun file di dati as-is presente al momento)")
@@ -4995,6 +5066,31 @@ def _action_implement(m: dict, act: dict) -> None:
         for d in decisions:
             if isinstance(d, dict):
                 prompt += f"- {d.get('title', '?')}: {d.get('detail', '')}\n"
+        prompt += "\n"
+    if actions:
+        prompt += (
+            "## Azioni concordate\n"
+            "Sono work item da riportare nella roadmap, non decisioni aggiuntive. "
+            "Conserva responsabile e scadenza solo quando presenti.\n")
+        for action in actions:
+            if isinstance(action, dict):
+                metadata = ", ".join(
+                    value for value in (
+                        f"responsabile: {action.get('owner')}" if action.get("owner") else "",
+                        f"scadenza: {action.get('due_date')}" if action.get("due_date") else "",
+                    ) if value)
+                suffix = f" ({metadata})" if metadata else ""
+                prompt += f"- {action.get('title', '?')}: {action.get('detail', '')}{suffix}\n"
+        prompt += "\n"
+    if open_questions:
+        prompt += (
+            "## Questioni ancora aperte\n"
+            "Non sono decisioni approvate. Se la documentazione di pianificazione "
+            "tiene un decision backlog o dei blocker, registrale li' come irrisolte; "
+            "non scegliere una risposta e non inserirle nell'architettura target.\n")
+        for question in open_questions:
+            if isinstance(question, dict):
+                prompt += f"- {question.get('title', '?')}: {question.get('detail', '')}\n"
         prompt += "\n"
     if op_prompt:
         prompt += ("## Prompt operativo approvato\n"

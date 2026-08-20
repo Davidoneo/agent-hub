@@ -169,6 +169,28 @@ const MEETING_ACTIVE = new Set([
   "revision_requested", "revising", "approved", "implementing",
 ]);
 
+function meetingRow(m, opts = {}) {
+  const [label, cls] = MEETING_STATUS[m.status] || [m.status || "sconosciuto", "ended"];
+  const approvals = m.approval_count != null ? m.approval_count : 0;
+  const project = opts.showProject && m.project_slug
+    ? `<span class="tag ended">${esc(m.project_slug)}</span>` : "";
+  return `<div class="list-item meeting-row">
+    <div class="grow">
+      <div class="row">
+        <span class="tag ${cls}">${esc(label)}</span>${project}
+        <b>${esc(m.title || "senza titolo")}</b>
+      </div>
+      <div class="muted">${esc(m.meeting_date ? ts(m.meeting_date) : "—")} · Round ${
+        esc(String(m.round || 1))} · approvazioni ${approvals}/2</div>
+    </div>
+    <div class="row">
+      <a class="plain" href="#/meetings/${encodeURIComponent(m.id)}"><button class="small">Apri</button></a>
+      ${m.analysis_session_id ? `<a class="plain" href="#/session/${encodeURIComponent(m.analysis_session_id)}"><button class="small">Analisi</button></a>` : ""}
+      ${m.implementation_session_id ? `<a class="plain" href="#/session/${encodeURIComponent(m.implementation_session_id)}"><button class="small">Documentazione</button></a>` : ""}
+    </div>
+  </div>`;
+}
+
 // ------------------------------------------------------------------ router
 
 const ROUTES = [
@@ -191,7 +213,14 @@ async function route() {
   clearError();
   const hash = location.hash.replace(/^#/, "") || "/";
   const base = "#" + hash.split("?")[0];
-  $$("nav a").forEach(a => a.classList.toggle("active", a.getAttribute("href") === base));
+  // Le riunioni sono una sottosezione dei progetti, non una destinazione
+  // globale. Anche i dettagli progetto mantengono quindi attiva la tab padre.
+  const navBase = base.startsWith("#/meetings") ? "#/projects" : base;
+  $$("#nav a").forEach(a => {
+    const href = a.getAttribute("href");
+    const nested = href !== "#/" && navBase.startsWith(href + "/");
+    a.classList.toggle("active", href === navBase || nested);
+  });
   for (const [re, fn] of ROUTES) {
     const m = hash.split("?")[0].match(re);
     if (m) {
@@ -384,6 +413,7 @@ function envLabel(s) {
 const LIFECYCLE = {
   COMPLETED: ["Completato", "done"],
   NEEDS_INPUT: ["Attende input", "launching"],
+  WAITING_SESSION: ["Attende un'altra sessione", "idle"],
   NEEDS_HOST_ACTION: ["Richiede azione host", "server"],
   FAILED: ["Fallito (dichiarato)", "failed"],
   CANCELLED: ["Annullato", "ended"],
@@ -392,36 +422,46 @@ const LIFECYCLE = {
   POSSIBLY_STALLED: ["Forse bloccato", "stalled"],
   AUTH_REQUIRED: ["Login richiesto", "failed"],
   USAGE_LIMIT: ["Limite d'uso", "launching"],
-  RUNNING: ["In esecuzione", "running"],
+  RUNNING: ["Al lavoro", "running"],
   STARTING: ["Avvio", "starting"],
 };
 
 function lifecycleTag(s) {
   if (!s.lifecycle) return "";
-  const [label, cls] = LIFECYCLE[s.lifecycle] || [s.lifecycle, "ended"];
+  let [label, cls] = LIFECYCLE[s.lifecycle] || [s.lifecycle, "ended"];
+  // COMPLETED/CANCELLED con pane vivo descrivono il turno appena concluso,
+  // non la chiusura della sessione. La dicitura esplicita evita l'ambiguita'.
+  if (sessionIsOpen(s) && s.lifecycle === "COMPLETED") label = "Turno completato";
+  if (sessionIsOpen(s) && s.lifecycle === "CANCELLED") label = "Turno annullato";
   const origin = s.lifecycle_reported
     ? "dichiarato dall'agente con agent-report"
     : "dedotto dal controller da fatti osservabili";
   const mark = s.lifecycle_reported ? "◆" : "◇";
-  const sum = s.lifecycle_reported && s.report_summary ? " — " + s.report_summary : "";
-  return `<span class="tag life ${cls}" title="${esc(origin + sum)}">${mark} ${esc(label)}</span>`;
+  return `<span class="tag life ${cls}" title="${esc(origin)}">${mark} ${esc(label)}</span>`;
 }
 
-// In modalita' compatta (schede della dashboard) restano solo i tag che dicono
-// se la sessione richiede attenzione; il dettaglio tecnico del pane sta sotto
-// «Dettagli» nella scheda o nella vista sessione.
-function stateTags(s, compact) {
-  const [label, cls] = STATE_LABEL[s.state] || ["—", "ended"];
-  const out = [lifecycleTag(s),
-    `<span class="tag ${cls}" title="stato osservato da tmux e dal registro dei messaggi">${esc(label)}</span>`].filter(Boolean);
-  if (!compact && s.alive) {
-    out.push(s.agent_busy
-      ? `<span class="tag running" title="processo ${esc(s.pane_command)} in esecuzione nel pane">${esc(s.pane_command)}</span>`
-      : '<span class="tag idle" title="il pane esiste ma l\'harness non è in esecuzione">shell nel pane</span>');
-  }
+function sessionIsOpen(s) {
+  return !!s.alive || s.status === "running";
+}
+
+function sessionOpenTag(s) {
+  return sessionIsOpen(s)
+    ? '<span class="tag session-open" title="Il pane tmux esiste ancora">Sessione aperta</span>'
+    : '<span class="tag ended" title="Il pane tmux non esiste più">Sessione chiusa</span>';
+}
+
+// Processo/sessione e risultato del turno sono due assi diversi: entrambi si
+// vedono, senza esporre il comando tecnico del pane come se fosse uno stato.
+function stateTags(s) {
+  const out = [sessionOpenTag(s), lifecycleTag(s)].filter(Boolean);
   if (s.undelivered) out.push(`<span class="tag delivery_failed">${s.undelivered} testo/i non consegnati</span>`);
   if (s.kind === "login") out.push('<span class="tag login">LOGIN</span>');
   return out.join(" ");
+}
+
+function compactResult(text, max = 180) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  return clean.length > max ? clean.slice(0, max - 1).trimEnd() + "…" : clean;
 }
 
 // Prima vista: nome, stato, tre dati di orientamento e il riassunto dell'agente.
@@ -437,7 +477,7 @@ function sessionCard(s) {
       </div>
       <label class="inline"><input type="checkbox" class="sel-session" value="${esc(s.id)}"> seleziona</label>
     </div>
-    <div class="row" style="margin:6px 0">${stateTags(s, true)}</div>
+    <div class="row" style="margin:6px 0">${stateTags(s)}</div>
     <div class="summary-line">
       <span>Progetto <b>${esc(s.project_slug || "—")}</b></span>
       <span title="Tempo in cui l'harness ha davvero elaborato: le attese di un input non contano">Lavoro <b>${esc(s.work_label || "—")}</b></span>
@@ -445,7 +485,8 @@ function sessionCard(s) {
       <span>Ultimo output <b>${esc(s.output_age_label || "—")}</b></span>
       <span>Modello <b>${esc(s.model || "default")}${s.effort ? " · " + esc(s.effort) : ""}</b></span>
     </div>
-    ${s.report_summary ? `<div class="muted" style="margin:4px 0">${esc(s.report_summary)}</div>` : ""}
+    ${s.report_summary ? `<div class="session-result" title="Il riepilogo completo è nel dettaglio della sessione">${
+      esc(compactResult(s.report_summary))}</div>` : ""}
     <details class="more">
       <summary>Dettagli</summary>
       <div class="kv">
@@ -459,9 +500,8 @@ function sessionCard(s) {
         <div>Avvio</div><div>${esc(ts(s.created_at))}</div>
         <div>Ultimo input</div><div>${esc(ts(s.last_input_at) || "—")}${
           s.last_delivered_at ? " · consegnato " + esc(ts(s.last_delivered_at)) : ""}</div>
-        ${s.alive ? `<div>Pane tmux</div><div>${s.agent_busy
-          ? `<span class="tag running">${esc(s.pane_command)}</span>`
-          : '<span class="tag idle">shell nel pane</span>'}</div>` : ""}
+        ${s.waiting_for_session ? `<div>Dipende da</div><div><a href="#/session/${
+          encodeURIComponent(s.waiting_for_session)}">${esc(s.waiting_for_name || s.waiting_for_session)}</a></div>` : ""}
         ${s.report_status ? `<div>Report agente</div><div><b>${esc(s.report_status)}</b> ·
           ${esc(ts(s.reported_at))}</div>` : ""}
         ${s.exit_code && s.exit_code !== "?" ? `<div>Exit code</div><div class="mono">${esc(s.exit_code)}</div>` : ""}
@@ -476,26 +516,32 @@ function sessionCard(s) {
 
 async function viewDashboard() {
   const d = await api("/api/sessions", {}, "elenco sessioni");
-  const running = d.sessions.filter(s => s.status === "running");
-  const ended = d.sessions.filter(s => s.status !== "running");
+  // La collocazione dipende esclusivamente dal pane tmux. Un report COMPLETED
+  // chiude il turno, ma non archivia una sessione ancora viva.
+  const open = d.sessions.filter(sessionIsOpen);
+  const ended = d.sessions.filter(s => !sessionIsOpen(s));
   view().innerHTML = `
     <div class="row spread"><h2>Dashboard</h2>
       <a class="plain" href="#/new"><button class="primary small">+ Nuova sessione</button></a></div>
     ${help("PROJECT gira come devagent con Docker rootless e resta dentro /srv/agent-workspace/projects. " +
            "SERVER gira come hostagent con sudo senza password: usalo solo per operazioni sul server. " +
-           "«agente attivo» significa che il processo dell'harness è in esecuzione nel pane tmux; " +
-           "«agente in attesa» che il pane esiste ma l'harness è uscito.")}
-    <h3>Sessioni attive (${running.length})</h3>
-    ${running.map(sessionCard).join("") || '<div class="card muted">Nessuna sessione attiva.</div>'}
-    <h3>Sessioni concluse (${ended.length})</h3>
-    ${ended.map(sessionCard).join("") || '<div class="card muted">Nessuna sessione conclusa.</div>'}
+           "«Sessione aperta» indica che il pane tmux esiste; «Turno completato» è invece " +
+           "l'esito dell'ultima richiesta e non chiude il processo.")}
+    <h3>Sessioni aperte (${open.length})</h3>
+    ${open.map(sessionCard).join("") || '<div class="card muted">Nessuna sessione aperta.</div>'}
+    <details class="card more concluded-sessions">
+      <summary><b>Sessioni chiuse (${ended.length})</b></summary>
+      <div style="margin-top:10px">
+        ${ended.map(sessionCard).join("") || '<div class="muted">Nessuna sessione chiusa.</div>'}
+      </div>
+    </details>
     ${ended.length ? `<div class="card">
       <div class="row">
         <button class="small danger" id="dash-del-sel">Elimina selezionate</button>
-        <button class="small danger" id="dash-del-ended">Elimina tutte le sessioni concluse</button>
+        <button class="small danger" id="dash-del-ended">Elimina tutte le sessioni chiuse</button>
       </div>
       ${help("L'eliminazione rimuove la riga dal database, i messaggi salvati, il log raw e la trascrizione. " +
-             "Le sessioni ancora vive non vengono toccate dall'eliminazione in blocco.")}
+             "Le sessioni ancora aperte non vengono toccate dall'eliminazione in blocco.")}
     </div>` : ""}`;
 
   $$("[data-del]").forEach(b => {
@@ -518,7 +564,7 @@ async function viewDashboard() {
       } catch (e) { showError(e); }
     };
     $("#dash-del-ended").onclick = async () => {
-      if (!confirm("Eliminare TUTTE le sessioni concluse con i relativi log?")) return;
+      if (!confirm("Eliminare TUTTE le sessioni chiuse con i relativi log?")) return;
       try {
         const r = await post("/api/sessions/cleanup", {}, "pulizia sessioni concluse");
         toast(`Eliminate ${r.count} sessioni`); route();
@@ -529,29 +575,64 @@ async function viewDashboard() {
 
 // ---------------------------------------------------------------- progetti
 
+const PROJECT_VISUALS = [
+  { icon: "✦", tone: "violet", label: "Esplora" },
+  { icon: "◈", tone: "blue", label: "Costruisci" },
+  { icon: "●", tone: "coral", label: "Segui" },
+  { icon: "▲", tone: "green", label: "Cresci" },
+  { icon: "◆", tone: "gold", label: "Organizza" },
+];
+
+function projectVisual(index) {
+  const visual = PROJECT_VISUALS[index % PROJECT_VISUALS.length];
+  const hue = (index * 67 + 258) % 360;
+  return Object.assign({}, visual, {
+    style: `--tile:hsl(${hue} 62% 47%);--tile-soft:color-mix(in srgb, hsl(${hue} 62% 47%) 16%, var(--panel));`,
+  });
+}
+
+function projectTile(p, index) {
+  const visual = projectVisual(index);
+  const target = `#/projects/${encodeURIComponent(p.slug)}`;
+  return `<article class="project-tile project-tile--${visual.tone}" style="${visual.style}">
+    <a class="project-tile-main" href="${target}" aria-label="Apri progetto ${esc(p.slug)}">
+      <span class="project-tile-icon" aria-hidden="true">${visual.icon}</span>
+      <span class="project-tile-label">${esc(visual.label)}</span>
+      <span class="project-tile-name">${esc(p.slug)}</span>
+      <span class="project-tile-path mono">${esc(p.path)}</span>
+    </a>
+    <div class="project-tile-meta">
+      <span>${p.documents || 0} document${p.documents === 1 ? "o" : "i"}</span>
+      <span>${p.meetings || 0} riunion${p.meetings === 1 ? "e" : "i"}</span>
+      <span>${p.context_ready ? "contesto pronto" : "contesto da generare"}</span>
+    </div>
+    <div class="project-tile-actions">
+      <a href="${target}">Apri <span aria-hidden="true">→</span></a>
+      <a href="#/new?project=${encodeURIComponent(p.slug)}">Nuova sessione</a>
+    </div>
+  </article>`;
+}
+
 async function viewProjects() {
   const d = await api("/api/projects", {}, "elenco progetti");
-  const list = d.projects.map(p => `<div class="card project">
-      <div class="row spread"><b>${esc(p.slug)}</b><span class="muted">${esc(p.source)}</span></div>
-      <div class="mono muted">${esc(p.path)}</div>
-      ${p.repo_url ? `<div class="mono muted">${esc(p.repo_url)}</div>` : ""}
-      ${p.local_url ? `<div class="muted">URL locale: <span class="mono">${esc(p.local_url)}</span></div>` : ""}
-      <div class="muted">Documenti associati: ${p.documents || 0}</div>
-      <div class="row" style="margin-top:8px">
-        <a class="plain" href="#/projects/${encodeURIComponent(p.slug)}"><button class="small">Apri</button></a>
-        <a class="plain" href="#/new?project=${encodeURIComponent(p.slug)}"><button class="small primary">Nuova sessione</button></a>
-      </div></div>`).join("");
+  const list = d.projects.map(projectTile).join("");
 
   const unreg = d.unregistered.map(s => `<div class="card">
       <div class="row spread"><b class="mono">${esc(s)}</b>
       <button class="small" data-register="${esc(s)}">Registra</button></div>
       <div class="muted">Directory presente sotto projects/ ma non registrata.</div></div>`).join("");
 
-  view().innerHTML = `<h2>Progetti</h2>
-    ${list || '<div class="card muted">Nessun progetto registrato.</div>'}
-    ${unreg ? "<h3>Directory non registrate</h3>" + unreg : ""}
-    <h3>Nuovo progetto</h3>
-    <div class="card">
+  view().innerHTML = `<div class="projects-heading">
+      <div><h2>I tuoi progetti</h2><p class="muted">Apri un progetto per accedere alle sue schede, comprese le riunioni.</p></div>
+      <span class="projects-count">${d.projects.length}</span>
+    </div>
+    ${list ? `<section class="project-grid" aria-label="Progetti registrati">${list}</section>`
+      : '<div class="card muted">Nessun progetto registrato.</div>'}
+    ${unreg ? `<details class="card"><summary><b>Directory non registrate</b></summary>
+      <div style="margin-top:10px">${unreg}</div></details>` : ""}
+    <details class="card project-admin">
+      <summary><b>Aggiungi o registra un progetto</b></summary>
+      <h3>Nuovo progetto</h3>
       <label>Slug (minuscole, cifre, trattini)</label>
       <input id="np-slug" placeholder="mio-progetto">
       <label>Documenti da caricare subito nel progetto (opzionale)</label>
@@ -559,9 +640,7 @@ async function viewProjects() {
       <div class="row" style="margin-top:10px"><button class="primary" id="np-go">Crea progetto</button></div>
       ${help("Crea la directory come devagent, inizializza Git e copia il template (AGENTS.md, CLAUDE.md, " +
              ".agent/HANDOFF.md, docs/DECISIONS.md, .gitignore). I documenti finiscono in docs/input/.")}
-    </div>
-    <h3>Clona progetto</h3>
-    <div class="card">
+      <h3>Clona progetto</h3>
       <label>Slug</label><input id="cl-slug" placeholder="repo-clonato">
       <label>URL repository</label>
       <input id="cl-url" placeholder="https://github.com/owner/repo.git oppure github-&lt;slug&gt;:owner/repo.git">
@@ -574,13 +653,11 @@ async function viewProjects() {
       ${help("Repository pubblici: HTTPS senza credenziali. Repository privati: genera la deploy key, " +
              "aggiungila su GitHub SENZA write access, poi clona con github-<slug>:owner/repo.git.")}
       <pre id="cl-out" style="display:none"></pre>
-    </div>
-    <h3>Registra directory esistente</h3>
-    <div class="card">
+      <h3>Registra directory esistente</h3>
       <label>Slug della directory sotto /srv/agent-workspace/projects</label>
       <input id="rg-slug" placeholder="directory-esistente">
       <div class="row" style="margin-top:10px"><button id="rg-go">Registra</button></div>
-    </div>`;
+    </details>`;
 
   $("#np-go").onclick = async () => {
     const slug = $("#np-slug").value.trim();
@@ -865,8 +942,21 @@ async function copyText(text, okMsg) {
 
 async function viewProject(slug) {
   slug = decodeURIComponent(slug);
-  const d = await api("/api/projects/" + encodeURIComponent(slug), {}, "dettaglio progetto");
+  const [d, meetingData, contextData] = await Promise.all([
+    api("/api/projects/" + encodeURIComponent(slug), {}, "dettaglio progetto"),
+    api("/api/meetings?project=" + encodeURIComponent(slug), {}, "riunioni progetto"),
+    api("/api/projects/" + encodeURIComponent(slug) + "/context", {}, "contesto progetto"),
+  ]);
   const st = d.status || {};
+  const meetings = meetingData.meetings || [];
+  const context = contextData.context || {};
+  const packageReady = !!contextData.package_ready;
+  const requestedTab = qparams().get("tab") || "overview";
+  const projectTabs = new Set(["overview", "documents", "meetings", "context"]);
+  const activeTab = projectTabs.has(requestedTab) ? requestedTab : "overview";
+  const panelClass = tab => `project-panel${activeTab === tab ? " active" : ""}`;
+  const tabLink = (tab, label) => `<a role="tab" aria-selected="${activeTab === tab}" class="${
+    activeTab === tab ? "active" : ""}" href="#/projects/${encodeURIComponent(slug)}?tab=${tab}">${label}</a>`;
   const composeBtns = st.compose ? `
     <div class="row" style="margin-top:8px">
       ${["build-up", "pull-up", "restart", "stop", "down", "ps", "logs"].map(a =>
@@ -878,56 +968,112 @@ async function viewProject(slug) {
 
   view().innerHTML = `<div class="row spread"><h2>${esc(slug)}</h2>
       <a class="plain" href="#/projects"><button class="small">← Progetti</button></a></div>
-    <div class="card project">
-      <div class="kv">
-        <div>Percorso</div><div class="mono">${esc(d.project.path)}</div>
-        <div>Origine</div><div>${esc(d.project.source)}</div>
-        <div>Repo</div><div class="mono">${esc(d.project.repo_url || "—")}</div>
-        <div>Branch</div><div class="mono">${esc(st.branch || "—")}</div>
-        <div>Dati</div><div class="mono">/srv/agent-workspace/data/${esc(slug)}</div>
-        <div>Compose project</div><div class="mono">agentapp-${esc(slug)}</div>
+    <nav class="project-tabs" aria-label="Sezioni progetto" role="tablist">
+      ${tabLink("overview", "Panoramica")}
+      ${tabLink("documents", `Documenti (${(d.documents || []).length})`)}
+      ${tabLink("meetings", `Riunioni (${meetings.length})`)}
+      ${tabLink("context", "Contesto")}
+    </nav>
+
+    <section class="${panelClass("overview")}" role="tabpanel">
+      <div class="card project">
+        <div class="kv">
+          <div>Percorso</div><div class="mono">${esc(d.project.path)}</div>
+          <div>Origine</div><div>${esc(d.project.source)}</div>
+          <div>Repo</div><div class="mono">${esc(d.project.repo_url || "—")}</div>
+          <div>Branch</div><div class="mono">${esc(st.branch || "—")}</div>
+          <div>Dati</div><div class="mono">/srv/agent-workspace/data/${esc(slug)}</div>
+          <div>Compose project</div><div class="mono">agentapp-${esc(slug)}</div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <a class="plain" href="#/new?project=${encodeURIComponent(slug)}"><button class="primary small">Apri nuova sessione</button></a>
+          <button class="small" id="pj-init">Inizializza istruzioni agenti</button>
+        </div>
       </div>
-      <div class="row" style="margin-top:10px">
-        <a class="plain" href="#/new?project=${encodeURIComponent(slug)}"><button class="primary small">Apri nuova sessione</button></a>
-        <button class="small" id="pj-init">Inizializza istruzioni agenti</button>
+      <h3>Stato Git</h3>
+      <div class="card"><pre>${esc(st.short || "(working tree pulito o non un repo git)")}</pre>
+        <div class="muted mono">${esc(st.remote || "nessun remote")}</div></div>
+      <h3>Deployment</h3>
+      <div class="card">
+        <div class="muted">Docker rootless di devagent · porte host previste 12000-12999 · binding 127.0.0.1</div>
+        ${composeBtns}
+        <label>URL locale dichiarato</label>
+        <div class="row"><input id="pj-url" value="${esc(d.project.local_url || "")}" placeholder="http://127.0.0.1:12000">
+          <button class="small" id="pj-url-go">Salva</button></div>
+        <label>Registro porte</label>
+        <div class="row"><input id="pj-port" placeholder="12000" inputmode="numeric" style="max-width:130px">
+          <input id="pj-portdesc" placeholder="descrizione" style="flex:1">
+          <button class="small" id="pj-port-go">Aggiungi</button></div>
+        <div style="margin-top:8px">${(d.ports || []).map(p =>
+          `<div class="row spread"><span class="mono">${p.port}</span>
+           <span class="muted">${esc(p.description)}</span>
+           <button class="small danger" data-delport="${p.port}">Rimuovi</button></div>`).join("") ||
+          '<span class="muted">Nessuna porta registrata.</span>'}</div>
       </div>
-    </div>
-    <h3>Documenti del progetto</h3>
-    <div class="card">
-      <div class="dropzone" id="pj-drop">Trascina qui i file oppure
-        <input type="file" id="pj-files" multiple style="margin-top:8px"></div>
-      <div class="row" style="margin-top:8px"><button class="small primary" id="pj-upload">Carica nel progetto</button></div>
-      ${help("I file caricati finiscono in " + esc(d.project.path) + "/docs/input/ e appartengono a devagent:agentprojects. " +
-             "Nessun file viene eseguito o interpretato automaticamente.")}
-      <div style="margin-top:10px" id="pj-docs">${(d.documents || []).map(x => docRow(x)).join("") ||
-        '<span class="muted">Nessun documento associato.</span>'}</div>
-    </div>
-    <h3>Stato Git</h3>
-    <div class="card"><pre>${esc(st.short || "(working tree pulito o non un repo git)")}</pre>
-      <div class="muted mono">${esc(st.remote || "nessun remote")}</div></div>
-    <h3>Deployment</h3>
-    <div class="card">
-      <div class="muted">Docker rootless di devagent · porte host previste 12000-12999 · binding 127.0.0.1</div>
-      ${composeBtns}
-      <label>URL locale dichiarato</label>
-      <div class="row"><input id="pj-url" value="${esc(d.project.local_url || "")}" placeholder="http://127.0.0.1:12000">
-        <button class="small" id="pj-url-go">Salva</button></div>
-      <label>Registro porte</label>
-      <div class="row"><input id="pj-port" placeholder="12000" inputmode="numeric" style="max-width:130px">
-        <input id="pj-portdesc" placeholder="descrizione" style="flex:1">
-        <button class="small" id="pj-port-go">Aggiungi</button></div>
-      <div style="margin-top:8px">${(d.ports || []).map(p =>
-        `<div class="row spread"><span class="mono">${p.port}</span>
-         <span class="muted">${esc(p.description)}</span>
-         <button class="small danger" data-delport="${p.port}">Rimuovi</button></div>`).join("") ||
-        '<span class="muted">Nessuna porta registrata.</span>'}</div>
-    </div>
-    <h3>.agent/HANDOFF.md</h3>
-    <div class="card"><pre>${esc(st.handoff || "(assente)")}</pre></div>`;
+      <h3>.agent/HANDOFF.md</h3>
+      <div class="card"><pre>${esc(st.handoff || "(assente)")}</pre></div>
+    </section>
+
+    <section class="${panelClass("documents")}" role="tabpanel">
+      <div class="card">
+        <div class="dropzone" id="pj-drop">Trascina qui i file oppure
+          <input type="file" id="pj-files" multiple style="margin-top:8px"></div>
+        <div class="row" style="margin-top:8px"><button class="small primary" id="pj-upload">Carica nel progetto</button></div>
+        ${help("I file caricati finiscono in " + esc(d.project.path) + "/docs/input/ e appartengono a devagent:agentprojects. " +
+               "Nessun file viene eseguito o interpretato automaticamente.")}
+        <div style="margin-top:10px" id="pj-docs">${(d.documents || []).map(x => docRow(x)).join("") ||
+          '<span class="muted">Nessun documento associato.</span>'}</div>
+      </div>
+    </section>
+
+    <section class="${panelClass("meetings")}" role="tabpanel">
+      <div class="row spread section-heading project-panel-heading">
+        <div><h3>Riunioni del progetto</h3><div class="muted">Crea una riunione o riapri lo storico di ${esc(slug)}.</div></div>
+        <a class="plain" href="#/meetings?project=${encodeURIComponent(slug)}&action=new"><button class="primary small">+ Nuova riunione</button></a>
+      </div>
+      <div class="card">
+        ${meetings.length ? meetings.map(m => meetingRow(m)).join("")
+          : '<div class="muted">Nessuna riunione per questo progetto.</div>'}
+      </div>
+    </section>
+
+    <section class="${panelClass("context")}" role="tabpanel">
+      <div class="card">
+        <label>Architettura target consolidata</label>
+        <textarea id="pj-target-arch" class="mtg-target" placeholder="Descrivi architettura, tecnologie e vincoli target…"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button class="small primary" id="pj-pkg-update">Aggiorna package</button>
+          ${packageReady
+            ? `<a class="plain" href="/api/projects/${encodeURIComponent(slug)}/context/download" download><button class="small">Scarica package</button></a>`
+            : '<button class="small" disabled title="Il package non è ancora stato generato">Scarica package</button>'}
+        </div>
+        <div class="muted" style="margin-top:8px">Il package riunisce sorgenti filtrati, decisioni approvate, target e brief LLM. Non contiene audio.</div>
+        ${context.updated_at ? `<div class="muted">Ultimo aggiornamento: ${esc(ts(context.updated_at))}${
+          context.trigger === "approved_meeting" ? " · da riunione approvata" : ""}</div>` : ""}
+        <div id="pj-ctx-err"></div>
+      </div>
+    </section>`;
 
   const docsById = {};
   (d.documents || []).forEach(item => { docsById[item.id] = item; });
   wireDocActions(view(), [{ slug }], docsById);
+  $("#pj-target-arch").value = context.target_architecture || "";
+  $("#pj-pkg-update").onclick = async () => {
+    const button = $("#pj-pkg-update");
+    const errorBox = $("#pj-ctx-err");
+    button.disabled = true;
+    errorBox.innerHTML = "";
+    try {
+      await api(`/api/projects/${encodeURIComponent(slug)}/context`, {
+        method: "POST", body: { target_architecture: $("#pj-target-arch").value || "" },
+      }, "aggiornamento contesto");
+      toast("Contesto aggiornato");
+      route();
+    } catch (e) {
+      showError(e, errorBox);
+      button.disabled = false;
+    }
+  };
   setupDrop($("#pj-drop"), $("#pj-files"));
   $("#pj-upload").onclick = async () => {
     const files = $("#pj-files").files;
@@ -1533,26 +1679,13 @@ function msgCard(m) {
   </div>`;
 }
 
-const STATE_LABEL = {
-  starting: ["Starting", "starting"],
-  running: ["Process running", "running"],
-  prompt_pending: ["Prompt pending", "launching"],
-  delivery_failed: ["Message delivery failed", "delivery_failed"],
-  no_recent_output: ["No recent output", "idle"],
-  ended: ["Ended", "ended"],
-  failed: ["Failed", "failed"],
-};
-
-// Solo dati verificabili: processo vivo secondo tmux, età dell'ultimo output,
-// ultimo input registrato e ultimo input consegnato. Nessuna inferenza sulla TUI.
+// Stato del turno e apertura della sessione restano separati anche nel
+// dettaglio; il comando del pane rimane nella diagnostica tecnica.
 function statusStrip(st) {
-  const [label, cls] = STATE_LABEL[st.state] || ["—", "ended"];
   const lm = st.last_message || {};
   const bits = [
+    sessionOpenTag(st),
     lifecycleTag(st),
-    `<span class="tag ${cls}">${esc(label)}</span>`,
-    st.alive ? `<span class="tag ${st.agent_busy ? "running" : "idle"}">${st.agent_busy
-      ? "processo " + esc(st.pane_command) : "shell nel pane (harness uscito)"}</span>` : "",
     `<span class="muted">ultimo output <b>${esc(st.output_age_label || "—")}</b></span>`,
     lm.created_at ? `<span class="muted">ultimo input <b>${esc(ts(lm.created_at))}</b></span>` : "",
     lm.delivered_at ? `<span class="muted">consegnato <b>${esc(ts(lm.delivered_at))}</b></span>` : "",
@@ -1573,6 +1706,8 @@ function statusStrip(st) {
 // nulla: il testo del riquadro deriva soltanto dallo stato calcolato.
 const LIFECYCLE_NOTE = {
   NEEDS_INPUT: ["warnbox", "L'agente ha dichiarato di attendere una tua risposta."],
+  WAITING_SESSION: ["warnbox", "L'agente attende il completamento di un'altra sessione. " +
+    "Agent Hub lo riprenderà automaticamente quando la dipendenza termina."],
   NEEDS_HOST_ACTION: ["warnbox", "L'agente ha dichiarato che serve un'azione amministrativa " +
     "sull'host: valuta «Escalate to hostagent»."],
   FAILED: ["errbox compact", "L'agente ha dichiarato di aver fallito."],
@@ -1829,6 +1964,8 @@ async function viewSession(sid) {
       ${(d.reports || []).length ? `<div class="kv">${(d.reports || []).map(r =>
         `<div><span class="tag ${(LIFECYCLE[r.status] || ["", "ended"])[1]}">${esc(r.status)}</span></div>
          <div>${esc(ts(r.reported_at))}${r.unix_user ? " · " + esc(r.unix_user) : ""}
+           ${r.waiting_for_session ? `<div>Dipende da <a href="#/session/${encodeURIComponent(
+             r.waiting_for_session)}">${esc(r.waiting_for_session)}</a></div>` : ""}
            <div>${esc(r.summary || "(nessun riepilogo)")}</div></div>`).join("")}</div>`
         : '<span class="muted">Nessuno stato finale registrato per questa sessione.</span>'}
       <div class="muted mono" style="margin-top:8px">agent-report COMPLETED --summary "…" · SESSION_ID ${esc(sid)}</div>
@@ -2568,7 +2705,7 @@ function renderStatus({ s, dk, health, meta }) {
   wireHealth($("#health"), health);
 }
 
-// ---------------------------------------------------------- riunioni e contesto
+// ------------------------------------------------------------------- riunioni
 
 let _meetingPoll = null;
 
@@ -2618,6 +2755,7 @@ async function viewMeetings() {
   const selSlug = known(qslug) ? qslug
     : (known(saved) ? saved : (projects.length ? projects[0].slug : ""));
   rememberMeetingProject(selSlug);
+  let mode = qparams().get("action") === "new" ? "new" : "history";
 
   // Data e ora sono precompilate con l'istante di apertura e restano
   // modificabili; il valore digitato sopravvive ai re-render del polling.
@@ -2625,9 +2763,6 @@ async function viewMeetings() {
 
   let currentSlug = selSlug;
   let meetings = allMeetings.filter(m => m.project_slug === currentSlug);
-  // Il contesto si carica solo quando esiste uno slug (ri-caricato dopo POST).
-  let context = null;
-  let contextLoaded = false;
 
   const profiles = BOOT.profiles || [];
 
@@ -2647,42 +2782,26 @@ async function viewMeetings() {
         `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("");
     };
 
-    // --- lista riunioni ---
-    const mtgRows = meetings.map(m => {
-      const [label, cls] = MEETING_STATUS[m.status] || [m.status || "sconosciuto", "ended"];
-      const approvals = m.approval_count != null ? m.approval_count : 0;
-      const dateStr = m.meeting_date ? ts(m.meeting_date) : "—";
-      const round = m.round != null ? `Round ${m.round}` : "";
-      return `<div class="list-item meeting-row">
-        <div class="grow">
-          <div class="row">
-            <span class="tag ${cls}">${esc(label)}</span>
-            <b>${esc(m.title || "senza titolo")}</b>
-          </div>
-          <div class="muted">${esc(dateStr)}${round ? " · " + esc(round) : ""} · approvazioni ${approvals}/2</div>
-        </div>
-        <div class="row">
-          ${m.id ? `<a class="plain" href="#/meetings/${encodeURIComponent(m.id)}"><button class="small">Dettaglio</button></a>` : ""}
-          ${m.analysis_session_id ? `<a class="plain" href="#/session/${encodeURIComponent(m.analysis_session_id)}"><button class="small">Analisi</button></a>` : ""}
-          ${m.implementation_session_id ? `<a class="plain" href="#/session/${encodeURIComponent(m.implementation_session_id)}"><button class="small">Implementazione</button></a>` : ""}
-        </div>
-      </div>`;
-    }).join("") || '<div class="muted">Nessuna riunione per questo progetto.</div>';
-
-    // --- contesto ---
-    const ctxArch = (context && context.target_architecture) || "";
-    const pkgReady = context && context.package_ready;
+    const mtgRows = meetings.map(m => meetingRow(m)).join("") ||
+      '<div class="muted">Nessuna riunione per questo progetto.</div>';
 
     // --- HTML ---
-    view().innerHTML = `<h2>Riunioni e contesto</h2>
+    view().innerHTML = `<div class="row spread"><h2>Riunioni · ${esc(currentSlug || "nessun progetto")}</h2>
+        <a class="plain" href="#/projects/${encodeURIComponent(currentSlug)}?tab=meetings"><button class="small" ${noProj ? "disabled" : ""}>← Scheda riunioni</button></a>
+      </div>
       ${noProj ? '<div class="card muted">Nessun progetto registrato. Creane uno dalla pagina Progetti.</div>' : ""}
+
+      <div class="row meeting-tabs">
+        <button class="small ${mode === "history" ? "primary" : ""}" id="mtg-tab-history">Riunioni precedenti</button>
+        <button class="small ${mode === "new" ? "primary" : ""}" id="mtg-tab-new" ${noProj ? "disabled" : ""}>Nuova riunione</button>
+      </div>
 
       <div class="card">
         <label>Progetto</label>
         <select id="mtg-project">${projOpts}</select>
       </div>
 
-      <div class="card">
+      ${mode === "new" ? `<div class="card">
         <h3 style="margin-top:0">Nuova riunione</h3>
         ${noProj ? '<div class="muted">Registra un progetto per creare riunioni.</div>' : ""}
         <div id="mtg-new-fields" ${noProj ? 'style="display:none"' : ""}>
@@ -2708,60 +2827,25 @@ async function viewMeetings() {
             <div class="muted" id="mtg-effort-note" style="margin-top:4px"></div>
           </div>
           <label>Istruzioni aggiuntive post-approvazione (opzionali)</label>
-          <textarea id="mtg-prompt" placeholder="Attività o vincoli aggiuntivi da eseguire dopo l'approvazione (può restare vuoto)"></textarea>
+          <textarea id="mtg-prompt" placeholder="Vincoli o indicazioni da riportare nella roadmap dopo l'approvazione (può restare vuoto)"></textarea>
           <label class="inline" style="margin-top:12px">
             <input type="checkbox" id="mtg-context" checked>
             <span>Aggiorna contesto dopo doppia approvazione</span>
           </label>
           ${help("Trascrizione, analisi e notifiche Telegram avvengono comunque. " +
-                 "Dopo la doppia approvazione parte la sessione operativa con queste istruzioni aggiuntive " +
-                 "e, se la casella è spuntata, aggiorna anche il package di contesto del progetto.")}
+                 "Dopo la doppia approvazione una sessione dedicata aggiorna solo roadmap e documentazione futura; " +
+                 "non modifica il codice. Se la casella è spuntata, rigenera anche il package di contesto.")}
           <div class="row" style="margin-top:14px">
             <button class="primary" id="mtg-go">Crea riunione</button>
             <span id="mtg-progress" class="muted" style="display:none"></span>
           </div>
           <div id="mtg-err"></div>
         </div>
-      </div>
-
-      <div class="card">
-        <h3 style="margin-top:0">Contesto progetto</h3>
-        ${noProj ? '<div class="muted">Seleziona un progetto.</div>' : `
-          ${!contextLoaded ? '<div class="muted">Caricamento contesto…</div>' : `
-            <label>Architettura target (modifica e premi Aggiorna package)</label>
-            <textarea id="mtg-target-arch" class="mtg-target" placeholder="Descrivi l'architettura, le tecnologie, i vincoli…"></textarea>
-            <div class="row" style="margin-top:10px">
-              <button class="small primary" id="mtg-pkg-update">Aggiorna package</button>
-              ${pkgReady
-                ? `<a class="plain" href="/api/projects/${esc(currentSlug)}/context/download" download><button class="small">Scarica package</button></a>`
-                : `<button class="small" disabled title="Il package non è ancora stato generato">Scarica package</button>`}
-            </div>
-            <div class="muted" style="margin-top:8px">Il package ZIP contiene sorgenti, decisioni, target e prompt per roadmap — filtrato per revisione LLM. Non contiene audio.</div>
-            <div id="mtg-ctx-err"></div>
-          `}
-        `}
-      </div>
-
-      <h3>Riunioni del progetto</h3>
-      <div class="card" id="mtg-list">
-        ${mtgRows}
-      </div>`;
+      </div>` : `<div class="card" id="mtg-list">${mtgRows}</div>`}`;
 
     // --- bindings ---
     wireMeetings();
   };
-
-  async function loadContext() {
-    if (!currentSlug) { contextLoaded = true; return; }
-    try {
-      const result = await api(`/api/projects/${encodeURIComponent(currentSlug)}/context`, {}, "contesto progetto");
-      context = Object.assign({}, result.context || result,
-        { package_ready: !!result.package_ready });
-    } catch (e) {
-      context = null;
-    }
-    contextLoaded = true;
-  }
 
   async function refreshMeetings() {
     if (!currentSlug) { meetings = []; return; }
@@ -2776,7 +2860,7 @@ async function viewMeetings() {
   // Polling ogni 5 secondi se ci sono riunioni attive.
   function syncPoll() {
     stopMeetingPoll();
-    if (meetings.some(m => MEETING_ACTIVE.has(m.status))) {
+    if (mode === "history" && meetings.some(m => MEETING_ACTIVE.has(m.status))) {
       _meetingPoll = setInterval(async () => {
         await refreshMeetings();
         if (!_meetingPoll) return;   // cleanup intervenuto durante la fetch
@@ -2790,15 +2874,17 @@ async function viewMeetings() {
     currentSlug = slug;
     rememberMeetingProject(slug);
     meetings = [];
-    context = null;
-    contextLoaded = false;
     stopMeetingPoll();
     render();
-    await Promise.all([refreshMeetings(), loadContext()]);
+    await refreshMeetings();
     render();
   }
 
   function wireMeetings() {
+    const historyTab = $("#mtg-tab-history");
+    const newTab = $("#mtg-tab-new");
+    if (historyTab) historyTab.onclick = () => { mode = "history"; render(); };
+    if (newTab) newTab.onclick = () => { mode = "new"; render(); };
     const projSel = $("#mtg-project");
     if (projSel) {
       projSel.onchange = () => switchProject(projSel.value);
@@ -2817,7 +2903,7 @@ async function viewMeetings() {
     const modelSel = $("#mtg-model");
     const modelOther = $("#mtg-model-other");
 
-    if (!profSel) return;    // DOM non ancora disponibile
+    if (!profSel) { syncPoll(); return; } // nello storico il form non e' nel DOM
 
     const hasProfiles = devProfiles.length > 0;
 
@@ -2943,39 +3029,13 @@ async function viewMeetings() {
       };
     }
 
-    // --- contesto ---
-    if (contextLoaded && currentSlug) {
-      const ta = $("#mtg-target-arch");
-      if (ta && context) ta.value = context.target_architecture || "";
-
-      const upBtn = $("#mtg-pkg-update");
-      if (upBtn) {
-        upBtn.onclick = async () => {
-          const arch = ($("#mtg-target-arch") || {}).value || "";
-          upBtn.disabled = true;
-          const ctxErr = $("#mtg-ctx-err");
-          if (ctxErr) ctxErr.innerHTML = "";
-          try {
-            await api(`/api/projects/${encodeURIComponent(currentSlug)}/context`,
-                      { method: "POST", body: { target_architecture: arch } }, "aggiornamento contesto");
-            toast("Contesto aggiornato");
-            await loadContext();
-            render();
-          } catch (e) {
-            showError(e, ctxErr || undefined);
-            upBtn.disabled = false;
-          }
-        };
-      }
-    }
-
     // --- polling ---
     syncPoll();
   }
 
   // Avvio
   render();
-  await Promise.all([refreshMeetings(), loadContext()]);
+  await refreshMeetings();
   render();
 
   // cleanup
@@ -3001,12 +3061,14 @@ async function viewMeeting(id) {
   const m = d.meeting || {};
   const transcript = d.transcript || "";
   const proposal = m.proposal || {};
-  const proposalList = items => (Array.isArray(items) ? items : []).map(item => {
+  const proposalList = (items, meta = []) => (Array.isArray(items) ? items : []).map(item => {
     if (item && typeof item === "object") {
       const title = item.title || item.decision || item.action || "";
       const detail = item.detail || item.description || "";
+      const extras = meta.map(([key, label]) => item[key]
+        ? `<div class="muted"><b>${esc(label)}:</b> ${esc(item[key])}</div>` : "").join("");
       return `<li>${title ? `<b>${esc(title)}</b>` : ""}${
-        title && detail ? " — " : ""}${esc(detail)}</li>`;
+        title && detail ? " — " : ""}${esc(detail)}${extras}</li>`;
     }
     return `<li>${esc(item)}</li>`;
   }).join("");
@@ -3014,7 +3076,7 @@ async function viewMeeting(id) {
 
   view().innerHTML = `<div class="row spread">
       <h2>${esc(m.title || "Riunione")}</h2>
-      <a class="plain" href="#/meetings?project=${encodeURIComponent(m.project_slug || "")}"><button class="small">← Riunioni</button></a></div>
+      <a class="plain" href="#/projects/${encodeURIComponent(m.project_slug || "")}?tab=meetings"><button class="small">← Scheda riunioni</button></a></div>
 
     <div class="card meeting-detail">
       <div class="row">
@@ -3042,25 +3104,31 @@ async function viewMeeting(id) {
 
       ${help("L'approvazione e le modifiche alla proposta di riunione avvengono via Telegram. " +
              "Servono due chat Telegram distinte e autorizzate perché la riunione passi allo stato «Approvato». " +
-             "Dopo la doppia approvazione il backend esegue il prompt operativo in una sessione Agent Hub dedicata.")}
+             "Dopo la doppia approvazione una sessione Agent Hub dedicata aggiorna roadmap e documentazione futura, non il codice.")}
     </div>
 
     ${proposal.summary || proposal.decisions || proposal.actions
-      || proposal.operational_prompt || proposal.target_architecture ? `
-    <h3>Proposta</h3>
+      || proposal.open_questions || proposal.operational_prompt || proposal.target_architecture ? `
+    <h3>Report da approvare</h3>
     <div class="card">
       ${proposal.summary ? `<div style="margin-bottom:10px"><b>Riepilogo</b><div>${esc(proposal.summary)}</div></div>` : ""}
       ${Array.isArray(proposal.decisions) && proposal.decisions.length
-        ? `<div style="margin-bottom:10px"><b>Decisioni</b><ul>${proposalList(proposal.decisions)}</ul></div>` : ""}
+        ? `<div style="margin-bottom:10px"><b>Decisioni effettivamente prese</b><ul>${proposalList(
+            proposal.decisions, [["rationale", "Razionale"], ["evidence", "Evidenza"]])}</ul></div>` : ""}
+      ${Array.isArray(proposal.open_questions) && proposal.open_questions.length
+        ? `<div style="margin-bottom:10px"><b>Questioni ancora aperte</b>
+             <div class="muted">Sono informative: non diventano decisioni con l'approvazione del report.</div>
+             <ul>${proposalList(proposal.open_questions)}</ul></div>` : ""}
       ${Array.isArray(proposal.actions) && proposal.actions.length
-        ? `<div style="margin-bottom:10px"><b>Azioni</b><ul>${proposalList(proposal.actions)}</ul></div>` : ""}
+        ? `<div style="margin-bottom:10px"><b>Azioni concordate</b><ul>${proposalList(
+            proposal.actions, [["owner", "Responsabile"], ["due_date", "Scadenza"]])}</ul></div>` : ""}
       ${proposal.operational_prompt
-        ? `<div style="margin-bottom:10px"><b>Prompt operativo</b>
-             <div class="muted">Verrà eseguito nella sessione operativa dopo la doppia approvazione.</div>
+        ? `<div style="margin-bottom:10px"><b>Istruzioni documentali post-approvazione</b>
+             <div class="muted">Saranno usate per aggiornare roadmap e documentazione futura.</div>
              <div class="proposal-text">${esc(proposal.operational_prompt)}</div></div>` : ""}
       ${proposal.target_architecture
-        ? `<div><b>Architettura target</b>
-             <div class="muted">Finirà nel contesto del progetto se la casella era spuntata.</div>
+        ? `<div><b>Architettura target consolidata</b>
+             <div class="muted">Finirà nel contesto del progetto se l'aggiornamento automatico era attivo.</div>
              <div class="proposal-text">${esc(proposal.target_architecture)}</div></div>` : ""}
     </div>` : ""}
 

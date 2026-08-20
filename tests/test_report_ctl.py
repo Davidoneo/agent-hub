@@ -87,6 +87,29 @@ class ReportCtlBoundaryTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(status, "")
 
+    def test_waiting_session_records_structured_dependency(self):
+        result = self.run_ctl(
+            "devagent", "report", "aaaaaa", "WAITING_SESSION",
+            "attendo la sessione server", "bbbbbb",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["waiting_for_session"], "bbbbbb")
+        with sqlite3.connect(self.db) as conn:
+            row = conn.execute(
+                "SELECT report_status,waiting_for_session FROM sessions "
+                "WHERE id='aaaaaa'"
+            ).fetchone()
+        self.assertEqual(row, ("WAITING_SESSION", "bbbbbb"))
+
+    def test_waiting_session_rejects_missing_target(self):
+        result = self.run_ctl(
+            "devagent", "report", "aaaaaa", "WAITING_SESSION",
+            "attendo una sessione assente", "cccccc",
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("sessione attesa inesistente", result.stderr)
+
     def test_report_requires_sudo_identity(self):
         result = self.run_ctl(
             None, "report", "aaaaaa", "COMPLETED", "senza identita'", "",

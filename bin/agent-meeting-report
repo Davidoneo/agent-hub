@@ -2,8 +2,8 @@
 """Agent Hub — registra il report di analisi di una riunione.
 
 L'agente di analisi esegue questo comando come ultima azione del turno per
-consegnare il JSON con riepilogo, decisioni, azioni, prompt operativo e
-target architecture.
+consegnare il JSON con riepilogo, decisioni, questioni aperte, azioni,
+istruzioni documentali e target architecture.
 
 Uso:
     agent-meeting-report --meeting <id> [--session <id>]

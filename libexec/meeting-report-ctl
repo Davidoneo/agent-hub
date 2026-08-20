@@ -50,19 +50,31 @@ DB = os.environ.get("AGENT_HUB_DB", "/var/lib/agent-hub/agent-hub.sqlite3")
 
 MAX_STDIN = 128 * 1024
 
-# Campi ammessi nella proposal
-ALLOWED_FIELDS = {"summary", "decisions", "actions", "operational_prompt", "target_architecture"}
+# Campi ammessi nella proposal. Le questioni ancora aperte restano separate
+# dalle decisioni: approvare un report non deve trasformare un dubbio in una
+# scelta progettuale.
+ALLOWED_FIELDS = {
+    "summary", "decisions", "open_questions", "actions",
+    "operational_prompt", "target_architecture",
+}
 
 # Limiti
 MAX_SUMMARY = 5000
 MAX_DECISIONS = 50
+MAX_OPEN_QUESTIONS = 50
 MAX_ACTIONS = 50
 MAX_OP_PROMPT = 20000
 MAX_TARGET_ARCH = 50000
 MAX_DECISION_TITLE = 500
 MAX_DECISION_DETAIL = 3000
+MAX_DECISION_RATIONALE = 2000
+MAX_DECISION_EVIDENCE = 500
+MAX_OPEN_QUESTION_TITLE = 500
+MAX_OPEN_QUESTION_DETAIL = 3000
 MAX_ACTION_TITLE = 500
 MAX_ACTION_DETAIL = 3000
+MAX_ACTION_OWNER = 300
+MAX_ACTION_DUE_DATE = 100
 
 
 def now():
@@ -108,7 +120,7 @@ def minutes_markdown(meeting, proposal: dict) -> str:
     lines.append(f"- Minuta generata: {now()}")
     lines.append("")
 
-    def section(title, items):
+    def section(title, items, extra_fields=()):
         if not items:
             return
         lines.append(f"## {title}")
@@ -120,10 +132,18 @@ def minutes_markdown(meeting, proposal: dict) -> str:
             if detail:
                 lines.append("")
                 lines.append(detail)
+            for key, label in extra_fields:
+                value = (item.get(key) or "").strip()
+                if value:
+                    lines.append("")
+                    lines.append(f"**{label}:** {value}")
             lines.append("")
 
-    section("Decisioni", proposal.get("decisions") or [])
-    section("Azioni", proposal.get("actions") or [])
+    section("Decisioni", proposal.get("decisions") or [],
+            (("rationale", "Razionale"), ("evidence", "Evidenza nella trascrizione")))
+    section("Questioni aperte", proposal.get("open_questions") or [])
+    section("Azioni", proposal.get("actions") or [],
+            (("owner", "Responsabile"), ("due_date", "Scadenza")))
     for title, body in (("Prompt operativo", proposal.get("operational_prompt")),
                         ("Architettura target", proposal.get("target_architecture")),
                         ("Riepilogo della discussione", proposal.get("summary"))):
@@ -181,8 +201,37 @@ def is_uuid(val: str) -> bool:
         return False
 
 
+def _item_key(item: dict) -> str:
+    """Chiave conservativa per eliminare duplicati letterali dal report."""
+    text = "\n".join((item.get("title") or "", item.get("detail") or ""))
+    text = text.strip().casefold()
+    return re.sub(r"\s+", " ", text)
+
+
+def _canonical_items(value, limit: int, fields: tuple[tuple[str, int], ...]) -> list[dict]:
+    items = value if isinstance(value, list) else []
+    clean = []
+    seen = set()
+    for raw in items[:limit]:
+        if isinstance(raw, str):
+            raw = {"title": raw}
+        if not isinstance(raw, dict):
+            continue
+        item = {name: str(raw.get(name, "") or "").strip()[:size]
+                for name, size in fields}
+        if not item.get("title") and not item.get("detail"):
+            continue
+        key = _item_key(item)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        clean.append(item)
+    return clean
+
+
 def canonicalize(data: dict) -> dict:
-    """Mantiene solo i campi ammessi e li tronca ai limiti."""
+    """Mantiene solo i campi ammessi, tronca e deduplica gli elenchi."""
     out = {}
     for field in ALLOWED_FIELDS:
         if field not in data:
@@ -195,29 +244,24 @@ def canonicalize(data: dict) -> dict:
         elif field == "target_architecture":
             out[field] = str(val)[:MAX_TARGET_ARCH] if val else ""
         elif field == "decisions":
-            items = val if isinstance(val, list) else []
-            clean = []
-            for d in items[:MAX_DECISIONS]:
-                if isinstance(d, dict):
-                    clean.append({
-                        "title": str(d.get("title", ""))[:MAX_DECISION_TITLE],
-                        "detail": str(d.get("detail", ""))[:MAX_DECISION_DETAIL],
-                    })
-                elif isinstance(d, str):
-                    clean.append({"title": d[:MAX_DECISION_TITLE], "detail": ""})
-            out[field] = clean
+            out[field] = _canonical_items(val, MAX_DECISIONS, (
+                ("title", MAX_DECISION_TITLE),
+                ("detail", MAX_DECISION_DETAIL),
+                ("rationale", MAX_DECISION_RATIONALE),
+                ("evidence", MAX_DECISION_EVIDENCE),
+            ))
+        elif field == "open_questions":
+            out[field] = _canonical_items(val, MAX_OPEN_QUESTIONS, (
+                ("title", MAX_OPEN_QUESTION_TITLE),
+                ("detail", MAX_OPEN_QUESTION_DETAIL),
+            ))
         elif field == "actions":
-            items = val if isinstance(val, list) else []
-            clean = []
-            for a in items[:MAX_ACTIONS]:
-                if isinstance(a, dict):
-                    clean.append({
-                        "title": str(a.get("title", ""))[:MAX_ACTION_TITLE],
-                        "detail": str(a.get("detail", ""))[:MAX_ACTION_DETAIL],
-                    })
-                elif isinstance(a, str):
-                    clean.append({"title": a[:MAX_ACTION_TITLE], "detail": ""})
-            out[field] = clean
+            out[field] = _canonical_items(val, MAX_ACTIONS, (
+                ("title", MAX_ACTION_TITLE),
+                ("detail", MAX_ACTION_DETAIL),
+                ("owner", MAX_ACTION_OWNER),
+                ("due_date", MAX_ACTION_DUE_DATE),
+            ))
     return out
 
 
@@ -260,6 +304,7 @@ def cmd_submit(meeting_id: str, session_id: str, unix_user: str) -> None:
         if not proposal.get("summary", "").strip():
             fail("summary obbligatorio e non vuoto")
         proposal.setdefault("decisions", [])
+        proposal.setdefault("open_questions", [])
         proposal.setdefault("actions", [])
         proposal.setdefault("operational_prompt", "")
         proposal.setdefault("target_architecture", "")

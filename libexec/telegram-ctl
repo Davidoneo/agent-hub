@@ -54,7 +54,8 @@ ALERT_LIFECYCLES = ("CRASHED", "ENDED_UNREPORTED", "AUTH_REQUIRED",
                     "USAGE_LIMIT", "POSSIBLY_STALLED")
 
 ICON = {
-    "COMPLETED": "✅", "NEEDS_INPUT": "❓", "NEEDS_HOST_ACTION": "🛠",
+    "COMPLETED": "✅", "NEEDS_INPUT": "❓", "WAITING_SESSION": "⏸",
+    "NEEDS_HOST_ACTION": "🛠",
     "FAILED": "❌", "CANCELLED": "⚪", "CRASHED": "💥",
     "ENDED_UNREPORTED": "⚠️", "POSSIBLY_STALLED": "🐢",
     "AUTH_REQUIRED": "🔑", "USAGE_LIMIT": "⏳", "RUNNING": "▶️", "STARTING": "🚀",
@@ -62,11 +63,12 @@ ICON = {
 }
 LABEL = {
     "COMPLETED": "Completato", "NEEDS_INPUT": "Attende input",
+    "WAITING_SESSION": "In attesa di un'altra sessione",
     "NEEDS_HOST_ACTION": "Richiede azione host", "FAILED": "Fallito",
     "CANCELLED": "Annullato", "CRASHED": "Crash",
     "ENDED_UNREPORTED": "Concluso senza report", "POSSIBLY_STALLED": "Forse bloccato",
     "AUTH_REQUIRED": "Login richiesto", "USAGE_LIMIT": "Limite d'uso",
-    "RUNNING": "In esecuzione", "STARTING": "Avvio",
+    "RUNNING": "Al lavoro", "STARTING": "Avvio",
 }
 
 
@@ -569,8 +571,12 @@ def meeting_decisions_text(proposal_json_str):
     except (json.JSONDecodeError, TypeError):
         proposal = {}
     decisions = proposal.get("decisions") or []
+    open_questions = proposal.get("open_questions") or []
     if not decisions:
-        return "Nessuna decisione nella proposta: vedi la minuta allegata."
+        lines = ["Nessuna decisione esplicita rilevata nella proposta."]
+        if open_questions:
+            lines.append(f"Questioni ancora aperte nella minuta: {len(open_questions)} (non vengono approvate).")
+        return "\n".join(lines)
     lines = [f"Decisioni da approvare ({len(decisions)}):", ""]
     for index, item in enumerate(decisions, start=1):
         if isinstance(item, str):
@@ -585,6 +591,8 @@ def meeting_decisions_text(proposal_json_str):
         detail = clip((detail or "").strip(), MEETING_DECISION_DETAIL)
         if detail:
             lines.append(" " * len(marker) + detail)
+    if open_questions:
+        lines.extend(["", f"Questioni ancora aperte nella minuta: {len(open_questions)} (non vengono approvate)."])
     return "\n".join(lines)
 
 
@@ -712,7 +720,7 @@ def handle_meeting_approve(cfg, state, chat_id, meeting_id, meeting_round):
                 for aid in approvers:
                     send(cfg, aid,
                          f"\u2705 Riunione \u00ab{meeting['title']}\u00bb "
-                         "approvata da entrambi. L'implementazione parte.")
+                         "approvata da entrambi. Parte l'aggiornamento della documentazione.")
             else:
                 conn.commit()
                 send(cfg, chat_id,
@@ -815,7 +823,7 @@ def handle_callback(cfg, state, cb_chat_id, cb_data):
 # quello dell'orchestrator precedente (/request /pause /stop /resume), i cui
 # comandi erano tutti di controllo e non hanno posto in un bot in sola lettura.
 MENU = [
-    ("stato", "Sessioni attive, quelle che richiedono attenzione e salute del server"),
+    ("stato", "Sessioni aperte, quelle che richiedono attenzione e salute del server"),
     ("sessioni", "Elenco delle sessioni con lo stato di ciascuna"),
     ("sessione", "Dettaglio di una sessione: /sessione <id o prime cifre>"),
     ("report", "Ultimi stati finali registrati dagli agenti"),
@@ -1040,8 +1048,11 @@ def cmd_health():
 
 def cmd_status():
     with db(readonly=True) as conn:
-        running = conn.execute(
+        opened = conn.execute(
             "SELECT COUNT(*) FROM sessions WHERE status='running'").fetchone()[0]
+        waiting = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE status='running' "
+            "AND lifecycle='WAITING_SESSION'").fetchone()[0]
         # Solo sessioni ancora running meritano attenzione; le sessioni
         # ended/chiuse non compaiono, qualunque sia il lifecycle residuo.
         attention = conn.execute(
@@ -1049,7 +1060,9 @@ def cmd_status():
             "AND lifecycle IN "
             "('NEEDS_INPUT','NEEDS_HOST_ACTION','FAILED','CRASHED','AUTH_REQUIRED',"
             "'USAGE_LIMIT','POSSIBLY_STALLED','ENDED_UNREPORTED')").fetchall()
-    lines = [f"▶️ Sessioni attive: {running}"]
+    lines = [f"▶️ Sessioni aperte: {opened}"]
+    if waiting:
+        lines.append(f"⏸ In attesa di altre sessioni: {waiting}")
     if attention:
         lines.append(f"Richiedono attenzione: {len(attention)}")
         for r in attention[:10]:
