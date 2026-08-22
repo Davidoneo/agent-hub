@@ -94,8 +94,21 @@ for path in "${MANAGED_PATHS[@]}"; do
   backup_path "$path"
 done
 
-tailscale serve get-config "$BACKUP_DIR/tailscale-serve.hujson" --all
 tailscale serve status --json >"$BACKUP_DIR/tailscale-serve-before.json"
+OLD_ROOT_PROXY=$(python3 - "$BACKUP_DIR/tailscale-serve-before.json" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+targets = [spec.get("Handlers", {}).get("/", {}).get("Proxy", "")
+           for spec in document.get("Web", {}).values()]
+targets = [target for target in targets if target]
+if len(targets) != 1:
+    raise SystemExit(f"atteso un solo handler root Tailscale, trovati: {targets!r}")
+print(targets[0])
+PY
+)
+printf '%s\n' "$OLD_ROOT_PROXY" >"$BACKUP_DIR/tailscale-root-before.txt"
 if systemctl is-enabled --quiet agent-hub-loopback-guard.service 2>/dev/null; then
   echo enabled >"$BACKUP_DIR/guard-state"
 else
@@ -197,7 +210,7 @@ rollback() {
   fi
   systemctl enable agent-hub.service
   systemctl restart agent-hub.service
-  tailscale serve set-config "$BACKUP_DIR/tailscale-serve.hujson" --all
+  tailscale serve --bg --yes --set-path / "$OLD_ROOT_PROXY"
   echo "Rollback completato; backup conservato in $BACKUP_DIR" >&2
   exit "$original_rc"
 }
