@@ -50,9 +50,10 @@ See [installation](docs/INSTALL.md), [the Agent Hub role](roles/agent_hub/README
 
 ## Security model
 
-The backend binds only to loopback and is intended to sit behind Tailscale
-Serve. A separate nftables output guard prevents non-root local processes from
-connecting directly and forging Tailscale identity headers. The PROJECT user
+The backend listens on a private Unix socket and is intended to sit behind
+Tailscale Serve. The socket and its runtime directory are inaccessible to the
+agent accounts, so they cannot connect directly and forge Tailscale identity
+headers. The PROJECT user
 never receives an account-wide GitHub credential; root selects a deploy key
 from the verified Agent Hub session and project.
 

@@ -1,0 +1,19 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Agent Hub - private systemd-owned Unix socket
+Documentation=file://{{ agent_hub_root }}/README.md
+Before=agent-hub.service
+After=systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream={{ agent_hub_socket }}
+SocketUser={{ agent_hub_service_user }}
+SocketGroup={{ agent_hub_service_user }}
+SocketMode=0600
+DirectoryMode=0750
+RemoveOnStop=true
+Service=agent-hub.service
+
+[Install]
+WantedBy=sockets.target

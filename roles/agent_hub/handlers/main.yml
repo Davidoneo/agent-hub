@@ -4,6 +4,11 @@
   ansible.builtin.systemd:
     daemon_reload: true
 
+- name: Restart agent-hub socket
+  ansible.builtin.systemd:
+    name: agent-hub.socket
+    state: restarted
+
 - name: Restart agent-hub
   ansible.builtin.systemd:
     name: agent-hub
@@ -13,10 +18,3 @@
   ansible.builtin.systemd:
     name: agent-hub-telegram
     state: restarted
-
-- name: Reload agent-hub-loopback-guard
-  ansible.builtin.systemd:
-    name: agent-hub-loopback-guard.service
-    state: reloaded
-    daemon_reload: true
-  when: agent_hub_loopback_guard_enabled | bool

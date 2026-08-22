@@ -15,7 +15,9 @@
           - not hub.agent_hub_install | bool
           - not hub.agent_hub_server_admin | bool
           - not hub.agent_hub_server_admin_confirm | bool
-          - hub.agent_hub_loopback_guard_enabled | bool
+          - hub.agent_hub_socket == '/run/agent-hub/agent-hub.sock'
+          - hub.agent_hub_socket is match('^/run/[^/]+/[^/]+[.]sock$')
+          - hub.agent_hub_manage_tailscale_serve | bool
           - not hub.agent_hub_github_audit_enabled | bool
           - hub.agent_hub_service_deploy_profiles | length == 0
 

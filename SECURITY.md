@@ -13,10 +13,12 @@ open while changing SSH or the firewall. Review external repositories and
 their signing keys periodically.
 
 Agent Hub treats PROJECT sessions as hostile local processes. Tailscale
-identity headers are trusted only together with the installed loopback output
-guard, which prevents non-root processes from reaching the backend directly.
-Do not disable `agent_hub_loopback_guard_enabled` unless another mechanism
-provides an equivalent trusted-proxy boundary.
+identity headers are trusted only on the private Unix socket under
+`/run/agent-hub`. Its directory and socket permissions prevent the PROJECT and
+SERVER accounts from reaching the backend directly. systemd creates the socket
+at mode `0600` and passes its open file descriptor to Uvicorn, so Uvicorn never
+widens those permissions; root-owned Tailscale Serve is the only HTTP proxy
+allowed through that boundary.
 
 Passwordless SERVER administration is disabled by default and requires two
 explicit variables. Keep private inventory, per-host overrides, recovery

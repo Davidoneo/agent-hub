@@ -11,12 +11,15 @@ euristica, nessuna soglia nascosta nel codice (stanno in
 /etc/agent-hub/controller.json) e nessuna notifica esterna.
 
 Uso:
-    health-ctl [--json] [--save] [--quiet]
+    health-ctl [--json] [--save] [--quiet] [--backend-only]
 
     --json   stampa il risultato completo in JSON invece della sintesi testuale
     --save   aggiorna /var/lib/agent-hub/health/last.json e registra nello
              storico *solo* i cambi di stato
     --quiet  non stampa nulla (per il timer)
+    --backend-only
+              attende il socket e verifica soltanto il backend HTTP; usato da
+              systemd come smoke test dopo ogni avvio
 
 Uscita: 0 se OK, 1 se WARNING, 2 se CRITICAL, 3 in caso di errore interno.
 """
@@ -25,10 +28,12 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 CONFIG = "/etc/agent-hub/controller.json"
 PROFILES = "/etc/agent-hub/profiles.json"
@@ -38,7 +43,8 @@ LAST = os.path.join(STATE_DIR, "last.json")
 HISTORY = os.path.join(STATE_DIR, "history.jsonl")
 TEMPS = os.path.join(STATE_DIR, "temps.json")
 SESSION_CTL = "/usr/local/libexec/agent-hub/session-ctl"
-LOOPBACK_GUARD_CTL = "/usr/local/libexec/agent-hub/loopback-guard-ctl"
+
+
 def _cfg(key, default):
     """Legge una chiave da config.env: sudo filtra l'ambiente, quindi questo
     wrapper non puo' ereditare le variabili del servizio."""
@@ -59,7 +65,8 @@ AGENT_USERS = (PROJECT_UNIX_USER, SERVER_UNIX_USER)
 OK, WARN, CRIT = "OK", "WARNING", "CRITICAL"
 RANK = {OK: 0, WARN: 1, CRIT: 2}
 OWNER = _cfg("AGENT_HUB_SERVICE_USER", "agenthub")
-LOOPBACK_GUARD_ENABLED = _cfg("AGENT_HUB_LOOPBACK_GUARD_ENABLED", "1") == "1"
+SOCKET = _cfg("AGENT_HUB_SOCKET", "/run/agent-hub/agent-hub.sock")
+ORIGIN = _cfg("AGENT_HUB_ORIGIN", "").rstrip("/")
 
 DEFAULTS = {
     "temperature": {"consecutive": 2, "warn_fallback": 80.0, "crit_fallback": 95.0,
@@ -143,6 +150,53 @@ def check_service(unit, label, critical=True):
                  f"{out.strip()} ({info.get('SubState', '?')})", **info)
 
 
+def check_backend_resources():
+    """FD e figli zombie: systemd 'active' non rende visibili questi esaurimenti."""
+    rc, out = run(["systemctl", "show", "agent-hub.service", "-p", "MainPID",
+                   "--value"])
+    try:
+        pid = int(out.strip())
+    except ValueError:
+        pid = 0
+    if rc != 0 or pid <= 0:
+        return check("backend_resources", "Agent Hub process resources", CRIT,
+                     "PID principale non disponibile")
+    try:
+        fd_count = len(os.listdir(f"/proc/{pid}/fd"))
+        with open(f"/proc/{pid}/limits", encoding="utf-8") as fh:
+            limit_line = next((line for line in fh if line.startswith("Max open files")), "")
+        limit_parts = limit_line.split()
+        fd_limit = int(limit_parts[3]) if len(limit_parts) >= 4 else 0
+    except (OSError, ValueError):
+        fd_count, fd_limit = -1, 0
+    zombies = []
+    try:
+        proc_entries = os.listdir("/proc")
+    except OSError:
+        proc_entries = []
+    for entry in proc_entries:
+        if not entry.isdigit():
+            continue
+        try:
+            fields = {}
+            with open(f"/proc/{entry}/status", encoding="utf-8") as fh:
+                for line in fh:
+                    key, _, value = line.partition(":")
+                    if key in ("Name", "State", "PPid"):
+                        fields[key] = value.strip()
+            if int(fields.get("PPid", "-1")) == pid and fields.get("State", "").startswith("Z"):
+                zombies.append({"pid": int(entry), "name": fields.get("Name", "?")})
+        except (OSError, ValueError):
+            continue
+    ratio = fd_count / fd_limit if fd_count >= 0 and fd_limit > 0 else 0.0
+    status = CRIT if ratio >= 0.90 else (WARN if ratio >= 0.70 or zombies else OK)
+    fd_detail = (f"fd {fd_count}/{fd_limit} ({ratio:.0%})" if fd_limit
+                 else "conteggio FD non disponibile")
+    detail = f"{fd_detail}, figli zombie {len(zombies)}"
+    return check("backend_resources", "Agent Hub process resources", status, detail,
+                 pid=pid, fd_count=fd_count, fd_limit=fd_limit, zombies=zombies[:50])
+
+
 def check_tailscale_serve():
     rc, out = run(["tailscale", "serve", "status"], timeout=30)
     if rc != 0:
@@ -151,25 +205,87 @@ def check_tailscale_serve():
     if not out.strip() or "no serve config" in out.lower():
         return check("tailscale_serve", "Tailscale Serve", CRIT,
                      "nessuna configurazione di serve attiva", output=out[:2000])
-    proxied = "127.0.0.1:8787" in out or "localhost:8787" in out
+    proxied = f"unix:{SOCKET}" in out
     return check("tailscale_serve", "Tailscale Serve", OK if proxied else WARN,
-                 "proxy verso 127.0.0.1:8787 attivo" if proxied
-                 else "serve attivo ma non verso la porta dell'Agent Hub",
+                 f"proxy verso unix:{SOCKET} attivo" if proxied
+                 else "serve attivo ma non verso il socket Unix dell'Agent Hub",
                  output=out[:2000])
 
 
-def check_loopback_guard():
-    if not LOOPBACK_GUARD_ENABLED:
-        return check("loopback_guard", "Trusted proxy boundary", WARN,
-                     "guard locale disabilitato")
-    rc, out = run([LOOPBACK_GUARD_CTL, "check"])
-    rc2, active = run(["systemctl", "is-active",
-                       "agent-hub-loopback-guard.service"])
-    good = rc == 0 and active.strip() == "active"
-    detail = ("processi locali non-root bloccati" if good else
-              f"guard assente o inattivo: {out or active}")
-    return check("loopback_guard", "Trusted proxy boundary",
-                 OK if good else CRIT, detail)
+def check_socket_boundary():
+    """Il socket e la directory devono essere inaccessibili agli agent account."""
+    try:
+        import pwd
+        owner = pwd.getpwnam(OWNER)
+        expected_uid, expected_gid = owner.pw_uid, owner.pw_gid
+        sock = os.stat(SOCKET)
+        parent = os.stat(os.path.dirname(SOCKET))
+    except (KeyError, OSError) as exc:
+        return check("socket_boundary", "Trusted proxy boundary", CRIT,
+                     f"socket Unix non verificabile: {exc}")
+    socket_mode = stat.S_IMODE(sock.st_mode)
+    parent_mode = stat.S_IMODE(parent.st_mode)
+    good = (stat.S_ISSOCK(sock.st_mode) and sock.st_uid == expected_uid
+            and sock.st_gid == expected_gid and socket_mode & 0o077 == 0
+            and parent.st_uid == expected_uid and parent.st_gid == expected_gid
+            and parent_mode & 0o007 == 0)
+    detail = (f"socket privato {SOCKET} mode {socket_mode:04o}"
+              if good else
+              f"confine non sicuro: socket uid={sock.st_uid} mode={socket_mode:04o}, "
+              f"directory uid={parent.st_uid} mode={parent_mode:04o}")
+    return check("socket_boundary", "Trusted proxy boundary",
+                 OK if good else CRIT, detail, socket=SOCKET,
+                 socket_mode=f"{socket_mode:04o}", directory_mode=f"{parent_mode:04o}")
+
+
+def check_backend_http(attempts=1, delay=0.25, request_timeout=5):
+    """Prova ASGI e file statici sul socket, non soltanto l'esistenza del PID."""
+    command = ["curl", "--silent", "--show-error", "--max-time",
+               str(request_timeout),
+               "--unix-socket", SOCKET, "--output", "/dev/null",
+               "--write-out", "%{http_code}",
+               "http://localhost/static/index.html"]
+    rc, out = 1, "socket non ancora pronto"
+    for attempt in range(max(1, attempts)):
+        rc, out = run(command, timeout=request_timeout + 2)
+        if rc == 0 and out.strip() == "200":
+            return check("backend_http", "Agent Hub HTTP backend", OK,
+                         "HTTP 200 sul socket Unix", socket=SOCKET)
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return check("backend_http", "Agent Hub HTTP backend", CRIT,
+                 f"backend senza risposta valida: rc={rc}, risposta={out[:200]}",
+                 socket=SOCKET)
+
+
+def check_end_to_end():
+    """Attraversa TLS, Tailscale Serve, identita', middleware e pagina radice."""
+    parsed = urlsplit(ORIGIN)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return check("agent_hub_end_to_end", "Agent Hub HTTPS end-to-end", CRIT,
+                     "AGENT_HUB_ORIGIN non e' un URL HTTPS valido")
+    rc, ip_out = run(["tailscale", "ip", "-4"], timeout=15)
+    ip = next((line.strip() for line in ip_out.splitlines() if line.strip()), "")
+    if rc != 0 or not ip:
+        return check("agent_hub_end_to_end", "Agent Hub HTTPS end-to-end", CRIT,
+                     f"IP Tailscale non disponibile: {ip_out[:200]}")
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return check("agent_hub_end_to_end", "Agent Hub HTTPS end-to-end", CRIT,
+                     "AGENT_HUB_ORIGIN contiene una porta non valida")
+    command = ["curl", "--silent", "--show-error", "--max-time", "10",
+               "--resolve", f"{parsed.hostname}:{port}:{ip}",
+               "--output", "/dev/null", "--write-out", "%{http_code}",
+               ORIGIN + "/"]
+    rc, out = run(command, timeout=12)
+    code = out.strip()
+    good = rc == 0 and code == "200"
+    return check("agent_hub_end_to_end", "Agent Hub HTTPS end-to-end",
+                 OK if good else CRIT,
+                 "HTTPS 200 attraverso Tailscale Serve" if good
+                 else f"percorso pubblico guasto: rc={rc}, risposta={out[:200]}",
+                 origin=ORIGIN, ip=ip)
 
 
 def check_docker_rootless():
@@ -601,9 +717,13 @@ def collect(cfg, save):
     rows, db_error = db_sessions()
     checks = [
         check_service("agent-hub.service", "Agent Hub service"),
+        check_service("agent-hub.socket", "Agent Hub private socket"),
+        check_backend_resources(),
         check_service("tailscaled.service", "Tailscale daemon"),
         check_tailscale_serve(),
-        check_loopback_guard(),
+        check_socket_boundary(),
+        check_backend_http(),
+        check_end_to_end(),
         check_docker_rootless(),
         check_docker_rootful(),
         check_tmux(live, tmux_errors),
@@ -635,10 +755,18 @@ def main():
     as_json = "--json" in args
     save = "--save" in args
     quiet = "--quiet" in args
+    backend_only = "--backend-only" in args
     for a in args:
-        if a not in ("--json", "--save", "--quiet"):
+        if a not in ("--json", "--save", "--quiet", "--backend-only"):
             print(f"opzione sconosciuta: {a}\n{__doc__}", file=sys.stderr)
             return 3
+
+    if backend_only:
+        result = check_backend_http(attempts=12, delay=0.5, request_timeout=2)
+        if not quiet:
+            print(json.dumps(result, ensure_ascii=False) if as_json
+                  else f"[{result['status']}] {result['label']}: {result['detail']}")
+        return RANK[result["status"]]
 
     started = time.time()
     cfg = load_config()

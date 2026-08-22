@@ -25,6 +25,7 @@ done < <(find scripts libexec packaging/github-audit -type f \
 
 node --check app/static/app.js
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
-  tests/test_report_ctl.py tests/test_meeting_report_ctl.py tests/test_static_ui.py
+  tests/test_report_ctl.py tests/test_meeting_report_ctl.py tests/test_static_ui.py \
+  tests/test_health_ctl.py
 git diff --check
 echo "Source checks: OK"

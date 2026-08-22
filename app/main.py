@@ -1,7 +1,7 @@
 """Agent Hub — servizio web privato per sessioni agentiche persistenti.
 
-Gira come l'account di servizio, ascolta solo su loopback ed e' esposto nella tailnet
-tramite Tailscale Serve. Le sessioni vivono in tmux sotto `devagent` o
+Gira come l'account di servizio, ascolta su un socket Unix privato ed e' esposto
+nella tailnet tramite Tailscale Serve. Le sessioni vivono in tmux sotto `devagent` o
 `hostagent`, avviate attraverso i wrapper root-owned in
 /usr/local/libexec/agent-hub/.
 
@@ -55,8 +55,7 @@ BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
 
 CONFIG = {
-    "bind": os.environ.get("AGENT_HUB_BIND", "127.0.0.1"),
-    "port": int(os.environ.get("AGENT_HUB_PORT", "8787")),
+    "socket": os.environ.get("AGENT_HUB_SOCKET", "/run/agent-hub/agent-hub.sock"),
     "allowed_users": [u.strip() for u in os.environ.get("AGENT_HUB_ALLOWED_USERS", "").split(",") if u.strip()],
     "origin": os.environ.get("AGENT_HUB_ORIGIN", "").rstrip("/"),
     "require_tailscale": os.environ.get("AGENT_HUB_REQUIRE_TAILSCALE", "1") == "1",
@@ -523,6 +522,10 @@ def migrate_db() -> None:
         for col in ("report_status", "report_summary", "reported_at",
                     "exit_code", "lifecycle", "lifecycle_at",
                     "effort", "harness_session_id",
+                    # modalita' di collaborazione (plan/normale) e obiettivo
+                    # richiesti: valgono all'avvio e restano il default del
+                    # prossimo restart
+                    "session_mode", "goal",
                     # dipendenza strutturata usata da WAITING_SESSION
                     "waiting_for_session",
                     # ultimo mtime del log gia' contabilizzato come lavoro
@@ -1778,6 +1781,16 @@ def runtime_capabilities(prof: dict) -> dict:
         # cambio a caldo: possibile solo se il profilo dichiara il comando TUI
         "live_model_change": bool(rt.get("model_command")),
         "live_effort_change": bool(rt.get("effort_command")),
+        # modalita' di collaborazione: dichiarate dal profilo, applicate
+        # leggendo la riga di stato della TUI (quindi verificabili a caldo)
+        "modes": [{"id": o["id"], "label": o.get("label", o["id"]),
+                   "note": o.get("note", "")} for o in profile_modes(prof)],
+        "default_mode": default_mode(prof),
+        "modes_note": (prof.get("modes") or {}).get("note", ""),
+        "live_mode_change": bool(profile_modes(prof)),
+        "supports_goal": bool((prof.get("goal") or {}).get("command")),
+        "goal_note": (prof.get("goal") or {}).get("note", ""),
+        "goal_max_length": int((prof.get("goal") or {}).get("max_length") or 500),
         "readable_state": bool(rt.get("source")),
         "note": rt.get("note", ""),
     }
@@ -1804,6 +1817,26 @@ def session_runtime_state(row: dict) -> dict:
         return {"state": "error", "reason": str(detail)[:300]}
 
 
+def session_mode_state(row: dict) -> dict:
+    """Modalita' che la TUI sta mostrando adesso, non quella richiesta.
+
+    Come per il modello, i due valori possono divergere legittimamente: basta
+    uno shift+tab battuto a mano nel terminale. Quello letto dalla riga di
+    stato e' il fatto; quello registrato e' l'intenzione.
+    """
+    try:
+        prof = profile_by_id(row["profile_id"])
+    except HTTPException:
+        return {}
+    if not profile_modes(prof) or not row.get("alive"):
+        return {}
+    try:
+        return wrapper_json(row["unix_user"], SESSION_CTL, "mode", row["tmux_name"],
+                            row["profile_id"], row["permission_mode"], timeout=30)
+    except (HTTPException, OSError, subprocess.SubprocessError):
+        return {}
+
+
 def runtime_payload(row: dict) -> dict:
     try:
         prof = profile_by_id(row["profile_id"])
@@ -1813,7 +1846,11 @@ def runtime_payload(row: dict) -> dict:
         "id": row["id"],
         # ciò che è stato chiesto all'avvio, così com'è registrato in SQLite
         "configured": {"model": row.get("model") or "",
-                       "effort": row.get("effort") or ""},
+                       "effort": row.get("effort") or "",
+                       "mode": row.get("session_mode") or "",
+                       "goal": row.get("goal") or ""},
+        # modalita' realmente mostrata dalla TUI, letta dalla riga di stato
+        "mode_live": session_mode_state(row).get("mode", ""),
         # ciò che l'harness sta davvero usando, letto dai suoi file di stato
         "live": session_runtime_state(row),
         "capabilities": runtime_capabilities(prof),
@@ -1854,8 +1891,13 @@ async def set_session_runtime(sid: str, request: Request):
     if model and not MODEL_NAME_RE.match(model):
         raise HTTPException(400, f"nome modello non valido: {model}")
     effort = validate_effort(prof, body.get("effort"))
-    if not model and not effort:
-        raise HTTPException(400, "indica almeno un modello o un livello di effort")
+    mode = validate_mode(prof, body.get("mode"))
+    goal_raw = body.get("goal")
+    clear_goal = bool(body.get("clear_goal"))
+    goal = validate_goal(prof, goal_raw)
+    if not model and not effort and not mode and not goal and not clear_goal:
+        raise HTTPException(400, "indica almeno un modello, un livello di effort, "
+                                 "una modalita' o un obiettivo")
 
     info = tmux_sessions(row["unix_user"]).get(row["tmux_name"])
     alive = bool(info) and not (info or {}).get("dead")
@@ -1886,8 +1928,48 @@ async def set_session_runtime(sid: str, request: Request):
         else:
             errors.append(f"{field}: {res.get('error', 'comando rifiutato')}")
 
+    # La modalita' e l'obiettivo non hanno un equivalente da riga di comando:
+    # esistono solo dentro la TUI, quindi senza processo vivo non c'e' nulla da
+    # applicare e resta soltanto il valore registrato per il prossimo avvio.
+    if mode:
+        if not alive:
+            pending.append("modalita'")
+        else:
+            try:
+                res = apply_session_mode(row, prof, mode)
+                if res.get("ok"):
+                    applied.append({"field": "modalita'", "value": mode,
+                                    "command": res.get("how", ""),
+                                    "confirmed": 1,
+                                    "pane_tail": res.get("pane_tail", "")})
+                else:
+                    errors.append("modalita': " + (res.get("error") or "cambio non riuscito"))
+            except HTTPException as exc:
+                errors.append(f"modalita': {exc.detail}")
+    if goal or clear_goal:
+        if not alive:
+            pending.append("obiettivo")
+        else:
+            try:
+                res = apply_session_goal(row, prof, "" if clear_goal else goal)
+                if res.get("ok"):
+                    applied.append({"field": "obiettivo",
+                                    "value": goal or "(azzerato)",
+                                    "command": "/goal", "confirmed": 1,
+                                    "pane_tail": res.get("pane_tail", "")})
+                else:
+                    errors.append("obiettivo: " + (res.get("error") or "non impostato"))
+            except HTTPException as exc:
+                errors.append(f"obiettivo: {exc.detail}")
+
     # il valore registrato vale comunque al prossimo avvio della sessione
     sets, params = [], []
+    if mode:
+        sets.append("session_mode=?")
+        params.append(mode)
+    if goal or clear_goal:
+        sets.append("goal=?")
+        params.append("" if clear_goal else goal)
     if model:
         sets.append("model=?")
         params.append(model)
@@ -1904,6 +1986,118 @@ async def set_session_runtime(sid: str, request: Request):
             "restart_required": pending,
             "detail": _runtime_detail(applied, pending, errors, alive),
             "runtime": runtime_payload(row)}
+
+
+def apply_session_mode(row: dict, prof: dict, mode: str) -> dict:
+    """Porta la sessione nella modalita' richiesta e rilegge la riga di stato.
+
+    La modalita' permessi della sessione viene passata al wrapper perche' per
+    Claude Code «normale» significa proprio quella: tornare da Plan a un valore
+    costante alzerebbe i permessi di una sessione avviata in modalita' standard.
+    """
+    r = wrapper(row["unix_user"], SESSION_CTL, "mode", row["tmux_name"],
+                row["profile_id"], row["permission_mode"], mode, timeout=120)
+    try:
+        data = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    if r.returncode != 0 and not data:
+        data = {"ok": False, "error": (r.stderr or r.stdout).strip()[:300]
+                                      or "cambio di modalita' fallito"}
+    return data
+
+
+def apply_session_goal(row: dict, prof: dict, goal: str, *, contract: bool = False) -> dict:
+    """Imposta o azzera l'obiettivo della sessione.
+
+    Il testo passa da un file nella runtime directory, come il prompt iniziale:
+    non finisce negli argomenti di un processo e non ha problemi di quoting.
+    """
+    path = ""
+    if goal:
+        path = write_input_file(goal + (goal_contract(row) if contract else ""))
+    try:
+        args = ["goal", row["tmux_name"], row["profile_id"]]
+        args += ["set", path] if goal else ["clear"]
+        r = wrapper(row["unix_user"], SESSION_CTL, *args, timeout=120)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    try:
+        data = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    if r.returncode != 0 and not data:
+        data = {"ok": False, "error": (r.stderr or r.stdout).strip()[:300]
+                                      or "obiettivo non impostato"}
+    return data
+
+
+def apply_launch_extras(row: dict, *, goal_contract_line: bool = False) -> dict:
+    """Modalita' e obiettivo richiesti all'avvio, applicati appena la TUI e' pronta.
+
+    Nessuno dei due ha un argomento da riga di comando in questi harness:
+    esistono solo come comandi della TUI, quindi vanno dati dopo l'avvio e
+    prima del prompt iniziale — altrimenti l'agente comincerebbe a lavorare
+    nella modalita' sbagliata, o farebbe due volte lo stesso lavoro.
+    """
+    prof = profile_by_id(row["profile_id"])
+    mode, goal = row.get("session_mode") or "", row.get("goal") or ""
+    out: dict = {"ready": False, "mode": {}, "goal": {}, "error": ""}
+    if not mode and not goal:
+        out["ready"] = True
+        return out
+    r = wrapper(row["unix_user"], SESSION_CTL, "await-ready", row["tmux_name"],
+                row["profile_id"], "", "1" if row.get("auto_trust", 1) else "0",
+                timeout=300)
+    ok, err, _method = _wrapper_result(r)
+    # harness avviato ma marcatori non riconosciuti: la TUI accetta comunque
+    # input, e rinunciare qui lascerebbe la sessione nella modalita' sbagliata
+    out["ready"] = bool(ok or _wrapper_data(r).get("started"))
+    out["error"] = err
+    if not out["ready"]:
+        return out
+    if mode and mode != default_mode(prof):
+        out["mode"] = apply_session_mode(row, prof, mode)
+    if goal:
+        out["goal"] = apply_session_goal(row, prof, goal, contract=goal_contract_line)
+    return out
+
+
+def launch_extras_async(row: dict, mid: str, prompt: str, *, as_goal: bool = False) -> None:
+    """Prontezza, modalita', obiettivo e prompt iniziale, nell'ordine, in background.
+
+    Attendere la prontezza della TUI dentro la richiesta di creazione avrebbe
+    reso l'avvio lento quanto l'harness piu' lento ad accendersi; il prompt e'
+    gia' al sicuro in SQLite, quindi la pagina puo' tornare subito e seguire lo
+    stato di consegna dagli aggiornamenti successivi.
+    """
+    def worker():
+        try:
+            res = apply_launch_extras(row, goal_contract_line=as_goal)
+            if not res.get("ready"):
+                if mid:
+                    set_message(mid, status=FAILED,
+                                last_error=(res.get("error") or
+                                            "la TUI non è diventata pronta")[:2000])
+                return
+            if as_goal:
+                g = res.get("goal") or {}
+                if g.get("ok"):
+                    set_message(mid, status=SENT, method="goal", delivered_at=now(),
+                                last_error="", note="")
+                else:
+                    set_message(mid, status=FAILED, method="goal",
+                                last_error=(g.get("error") or "obiettivo non impostato")[:2000])
+            elif mid:
+                deliver_text(row, mid, with_contract(row, prompt, initial=True), wait_ready=True)
+        except Exception as exc:  # noqa: BLE001
+            if mid:
+                set_message(mid, status=FAILED, last_error=f"errore interno: {exc}"[:2000])
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _runtime_detail(applied: list, pending: list, errors: list, alive: bool) -> str:
@@ -2256,6 +2450,80 @@ def confirm_argv_async(row: dict, mid: str) -> None:
     threading.Thread(target=worker, daemon=True).start()
 
 
+def profile_modes(prof: dict) -> list[dict]:
+    """Modalita' di collaborazione dichiarate dal profilo, se ne ha."""
+    return [o for o in ((prof.get("modes") or {}).get("options") or [])
+            if isinstance(o, dict) and o.get("id")]
+
+
+def default_mode(prof: dict) -> str:
+    spec = prof.get("modes") or {}
+    options = profile_modes(prof)
+    if not options:
+        return ""
+    wanted = spec.get("default", "")
+    return wanted if any(o["id"] == wanted for o in options) else options[0]["id"]
+
+
+def validate_mode(prof: dict, value) -> str:
+    """Modalita' accettata dal profilo, oppure stringa vuota.
+
+    Vuoto significa «quella di partenza dell'harness»: nessun comando viene
+    inviato alla TUI e la sessione resta com'e' nata.
+    """
+    mode = (str(value or "")).strip()
+    if not mode:
+        return ""
+    options = profile_modes(prof)
+    if not options:
+        raise HTTPException(400, f"il profilo {prof['id']} non dichiara modalita'")
+    if not any(o["id"] == mode for o in options):
+        raise HTTPException(400, f"modalita' non valida: {mode} — "
+                                 f"ammesse: {', '.join(o['id'] for o in options)}")
+    return mode
+
+
+def validate_goal(prof: dict, value, reserve: int = 0) -> str:
+    """Obiettivo su una riga sola, entro il limite dichiarato dal profilo.
+
+    Il testo viene ridotto a una riga perche' alla TUI arriva battuto: un a
+    capo a meta' sarebbe un Invio, e spezzerebbe l'obiettivo in due invii.
+    """
+    goal = (str(value or "")).strip()
+    if not goal:
+        return ""
+    spec = prof.get("goal") or {}
+    if not spec.get("command"):
+        raise HTTPException(400, f"il profilo {prof['id']} non supporta /goal")
+    goal = re.sub(r"\s+", " ", goal).strip()
+    # `reserve` e' lo spazio che il contratto di stato finale occupera' sulla
+    # stessa riga: senza tenerlo da parte il troncamento del wrapper taglierebbe
+    # proprio la parte che dice all'agente di registrare un esito.
+    limit = max(80, int(spec.get("max_length") or 500) - max(0, reserve))
+    if len(goal) > limit:
+        raise HTTPException(400, f"obiettivo troppo lungo: massimo {limit} caratteri "
+                                 f"(ne hai scritti {len(goal)})")
+    return goal
+
+
+def goal_contract(row: dict) -> str:
+    """Contratto di stato finale ridotto a una riga, per la modalita' obiettivo.
+
+    `/goal` accetta una riga sola, mentre il contratto completo e' un blocco
+    multilinea: senza questa versione compatta una sessione avviata come
+    obiettivo non saprebbe di dover registrare un esito, e resterebbe per
+    sempre «senza stato finale». E' l'unico posto in cui il contratto viene
+    abbreviato, e la differenza e' dichiarata nella pagina.
+    """
+    return (" — Al termine registra lo stato finale con `agent-report COMPLETED "
+            "--summary \"...\"` (oppure NEEDS_INPUT, WAITING_SESSION --waiting-for "
+            "<session-id>, NEEDS_HOST_ACTION, FAILED, CANCELLED). "
+            f"SESSION_ID {row['id']}.")
+
+
+GOAL_CONTRACT_RESERVE = 240
+
+
 def validate_effort(prof: dict, value) -> str:
     """Livello di effort accettato dal profilo, oppure stringa vuota.
 
@@ -2446,6 +2714,8 @@ def launch_diagnostics(row: dict) -> dict:
         "permission_args": prof.get("permission_modes", {}).get(perm, []),
         "model": row["model"] or "(default dell'harness)",
         "effort": row.get("effort") or "(default dell'harness)",
+        "session_mode": row.get("session_mode") or "(quella di partenza dell'harness)",
+        "goal": row.get("goal") or "",
         "unix_user": row["unix_user"],
         "workdir": row["workdir"],
         "argv": info.get("argv", []),
@@ -2529,6 +2799,9 @@ def _create_session(body: dict) -> dict:
 
     model = (body.get("model") or "").strip()
     effort = validate_effort(prof, body.get("effort"))
+    session_mode = validate_mode(prof, body.get("mode"))
+    goal = validate_goal(prof, body.get("goal"))
+    prompt_as_goal = bool(body.get("prompt_as_goal"))
     executor_enabled, executor_model, executor_max_agents = validate_executor(
         body, environment, prof)
     try:
@@ -2545,11 +2818,23 @@ def _create_session(body: dict) -> dict:
     if docs:
         prompt = (prompt.rstrip() + "\n\n" + documents_block(docs)).strip()
 
+    # Modalita' obiettivo: il prompt non e' un messaggio ma il testo di `/goal`.
+    # Non e' una modalita' dell'harness — Codex e Claude Code hanno solo Default
+    # e Plan — ma un modo diverso di consegnare lo stesso testo, e va detto cosi'
+    # invece di fingere una terza modalita' che non esiste.
+    if prompt_as_goal:
+        if not prompt.strip():
+            raise HTTPException(400, "modalità obiettivo: serve un testo da usare come obiettivo")
+        if goal:
+            raise HTTPException(400, "l'obiettivo è già il prompt: non indicarlo anche a parte")
+        goal = validate_goal(prof, prompt, reserve=GOAL_CONTRACT_RESERVE)
+
     sid = str(uuid.uuid4())
     row = {
         "id": sid, "name": name, "tmux_name": f"agenthub-{sid}", "project_slug": slug,
         "workdir": workdir, "environment": environment, "profile_id": prof["id"],
         "model": model, "effort": effort, "harness_session_id": "",
+        "session_mode": session_mode, "goal": goal,
         "executor_enabled": executor_enabled, "executor_model": executor_model,
         "executor_max_agents": executor_max_agents,
         "permission_mode": perm, "unix_user": unix_user, "kind": "agent",
@@ -2574,8 +2859,14 @@ def _create_session(body: dict) -> dict:
                              (sid, d["id"], now()))
 
     # 2. avvio dell'harness; alla CLI arriva il prompt con il contratto in coda
-    mode = prompt_mode_for(prof) if prompt.strip() else "paste"
-    launch_text = with_contract(row, prompt, initial=True) if prompt.strip() else ""
+    # Con una modalita' o un obiettivo da impostare il prompt non puo' viaggiare
+    # negli argomenti della CLI: l'agente partirebbe prima che la TUI abbia
+    # ricevuto `/plan` o `/goal`. In quel caso la consegna avviene dopo, in
+    # background, quando la TUI e' pronta e la modalita' e' quella giusta.
+    needs_setup = bool(goal) or (session_mode and session_mode != default_mode(prof))
+    mode = ("paste" if needs_setup else prompt_mode_for(prof)) if prompt.strip() else "paste"
+    launch_text = ("" if needs_setup
+                   else (with_contract(row, prompt, initial=True) if prompt.strip() else ""))
     try:
         started = start_tmux_session(row, launch_text, mode)
     except HTTPException as exc:
@@ -2590,10 +2881,20 @@ def _create_session(body: dict) -> dict:
     row["status"] = "running"
     save_launch_info(sid, started, row)
 
-    # 3. consegna del prompt; lo stato cambia solo dopo il tentativo reale
-    mid = register_initial_prompt(row, prompt, started)
-    return {"session": row, "message_id": mid,
-            "delivery": ("cli-arg" if started.get("argv_prompt") else ("paste" if mid else "none")),
+    # 3. consegna: modalita' e obiettivo sono comandi della TUI, quindi vanno
+    # dati dopo la prontezza e prima del prompt. Tutto in background: il testo
+    # e' gia' in SQLite e lo stato di consegna si legge dagli aggiornamenti.
+    if needs_setup:
+        mid = ""
+        if prompt.strip():
+            mid = add_message(sid, prompt, kind="initial")
+            bump_attempt(mid)
+        launch_extras_async(row, mid, prompt, as_goal=prompt_as_goal)
+        delivery = "goal" if prompt_as_goal else ("paste" if mid else "none")
+    else:
+        mid = register_initial_prompt(row, prompt, started)
+        delivery = "cli-arg" if started.get("argv_prompt") else ("paste" if mid else "none")
+    return {"session": row, "message_id": mid, "delivery": delivery,
             "cgroup": started.get("cgroup", "")}
 
 
@@ -2601,11 +2902,13 @@ def insert_session(row: dict) -> None:
     with db() as conn:
         conn.execute(
             "INSERT INTO sessions (id,name,tmux_name,project_slug,workdir,environment,"
-            "profile_id,model,effort,harness_session_id,executor_enabled,executor_model,"
+            "profile_id,model,effort,session_mode,goal,harness_session_id,"
+            "executor_enabled,executor_model,"
             "executor_max_agents,permission_mode,unix_user,kind,"
             "status,initial_prompt,parent_session,cols,rows,created_at,ended_at,auto_trust) VALUES "
             "(:id,:name,:tmux_name,:project_slug,:workdir,:environment,:profile_id,:model,"
-            ":effort,:harness_session_id,:executor_enabled,:executor_model,:executor_max_agents,"
+            ":effort,:session_mode,:goal,:harness_session_id,"
+            ":executor_enabled,:executor_model,:executor_max_agents,"
             ":permission_mode,:unix_user,:kind,:status,"
             ":initial_prompt,:parent_session,:cols,:rows,:created_at,:ended_at,:auto_trust)", row)
 
@@ -3885,14 +4188,35 @@ async def ws_session(ws: WebSocket, sid: str):
             os.close(fd)
         except OSError:
             pass
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
+        # waitpid(WNOHANG) una sola volta lasciava il client `sudo` zombie se
+        # non era gia' uscito in quell'esatto istante. Il reaping resta fuori
+        # dall'event loop, ma e' garantito e ha un'escalation limitata al solo
+        # figlio PTY di questa WebSocket.
+        threading.Thread(target=reap_pty_child, args=(pid,), daemon=True).start()
         try:
             await ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def reap_pty_child(pid: int) -> None:
+    """Raccoglie sempre il client tmux chiuso, senza trattenere l'event loop."""
+    for sig, attempts in ((None, 50), (signal.SIGTERM, 20), (signal.SIGKILL, 10)):
+        if sig is not None:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return
+        for _ in range(attempts):
+            try:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if waited == pid:
+                return
+            time.sleep(0.1)
 
 
 def set_winsize(fd: int, rows: int, cols: int) -> None:

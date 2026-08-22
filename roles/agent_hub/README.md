@@ -16,7 +16,8 @@ agent_hub_install: true
 
 | Component | Purpose |
 |---|---|
-| `agent-hub.service` | FastAPI/uvicorn on loopback, serves the UI and the API |
+| `agent-hub.socket` | systemd-owned Unix listener, mode `0600` |
+| `agent-hub.service` | FastAPI/uvicorn receives that listener by file descriptor and serves the UI/API |
 | `agent-hub-telegram.service` | Optional notifier, the only component reaching the internet |
 | `agent-hub-health.timer` | Deterministic host health snapshot every 30 minutes |
 | `/usr/local/libexec/agent-hub/*-ctl` | Root-owned wrappers, the privilege boundary |
@@ -79,24 +80,30 @@ See `defaults/main.yml` for the full list.
 
 ## Exposure
 
-The service binds `127.0.0.1` and is never published by opening a port. Put
-it behind Tailscale Serve:
+systemd creates `/run/agent-hub/agent-hub.sock` with no group/other access and
+passes the open listener to Uvicorn. This deliberately avoids Uvicorn's direct
+Unix-socket mode, which changes its socket to `0666`. No TCP port is opened.
+Put the socket behind Tailscale Serve:
 
 ```bash
-tailscale serve --bg 127.0.0.1:8787
+sudo tailscale serve --bg unix:/run/agent-hub/agent-hub.sock
 ```
+
+The role applies that root handler automatically when
+`agent_hub_manage_tailscale_serve` is true (the default), while preserving
+other paths already served by the node.
 
 Tailscale terminates TLS and injects the `Tailscale-User-Login` header, which
 the service checks against `agent_hub_allowed_users`. With
 `agent_hub_require_tailscale: true` (the default) a request without that
-header is refused. The loopback guard below protects the separate local
-caller boundary.
+header is refused.
 
 Tailscale strips spoofed identity headers from remote requests, but processes
-on the same host could otherwise connect straight to loopback and provide
-their own value. `agent_hub_loopback_guard_enabled: true` installs an nftables
-output rule that allows only root-owned local proxies, including `tailscaled`,
-to reach the backend port. Keep it enabled whenever identity headers are used.
+on the same host must not be able to reach the trusted backend directly. The
+runtime directory is owned by the Agent Hub service account, the systemd-owned
+socket stays at `0600`, and only root-owned Tailscale Serve can cross that
+boundary. The health controller verifies both permissions and a real HTTPS
+request through Tailscale instead of trusting process/configuration state.
 
 Unattended host services may receive a single repository deploy key through
 `agent_hub_service_deploy_profiles`. Each private-inventory entry binds a
@@ -124,7 +131,8 @@ email or `*.ts.net` host. Instance configuration is never copied into Git.
 ## Limits
 
 - Debian 13 and Ubuntu 24.04+ only; it assumes `systemd` and user lingering.
-- The role installs the service but does not configure Tailscale itself: use
-  the `tailscale` role, or bring your own tunnel.
+- The role configures only Agent Hub's root Tailscale Serve handler. It does
+  not install or enroll Tailscale: use the `tailscale` role, or bring your own
+  enrolled node.
 - `profiles.json` (which agent CLIs are offered) is not managed here: it is
   installation-specific and belongs to your private inventory.

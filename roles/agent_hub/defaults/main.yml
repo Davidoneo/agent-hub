@@ -17,15 +17,16 @@ agent_hub_project_user: devagent
 agent_hub_server_user: hostagent
 agent_hub_agent_group: agentprojects
 
-# Bind address. Keep it on loopback: exposure is meant to happen through
-# Tailscale Serve, never by binding a public interface.
-agent_hub_bind: 127.0.0.1
-agent_hub_port: 8787
+# Private Unix socket consumed by Tailscale Serve. systemd owns the listener
+# and passes its file descriptor to Uvicorn, preserving mode 0600 even though
+# Uvicorn's direct --uds mode would chmod the socket to 0666.
+agent_hub_socket: /run/agent-hub/agent-hub.sock
 
 # Identity check. The reverse proxy (Tailscale Serve) injects the
 # Tailscale-User-Login header; only these logins are accepted.
 agent_hub_allowed_users: []
 agent_hub_require_tailscale: true
+agent_hub_manage_tailscale_serve: true
 
 # Expected HTTPS origin for the CSRF and WebSocket checks. Without it the
 # browser session cannot be validated, so the role refuses to run.
@@ -42,11 +43,6 @@ agent_hub_workspace: /srv/agent-workspace
 # unprivileged and reaches GitHub only through per-project deploy keys.
 agent_hub_server_admin: false
 agent_hub_server_admin_confirm: false
-
-# Tailscale Serve strips spoofed identity headers from remote requests, but a
-# local process can connect directly to the backend. On Linux this nftables
-# guard permits only root-owned proxies (tailscaled) to reach the port.
-agent_hub_loopback_guard_enabled: true
 
 # Optional root-owned profiles for systemd services that need one project's
 # deploy key. Every profile requires caller, unit and project fields.

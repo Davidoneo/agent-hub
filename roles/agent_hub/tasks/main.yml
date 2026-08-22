@@ -7,10 +7,12 @@
     that:
       - agent_hub_origin | length > 0
       - agent_hub_allowed_users | length > 0
+      - agent_hub_socket is match('^/run/[A-Za-z0-9_-]+/[A-Za-z0-9._/-]+[.]sock$')
+      - "'..' not in agent_hub_socket"
     fail_msg: >-
-      agent_hub_origin and agent_hub_allowed_users must be set. Without them
-      the CSRF check has no expected origin and every Tailscale identity would
-      be accepted, which defeats the point of the private UI.
+      agent_hub_origin and agent_hub_allowed_users must be set, and
+      agent_hub_socket must be a nested socket path below /run. Without these,
+      the trusted proxy and CSRF boundaries are not safe.
 
 - name: Agent Hub | the Telegram token is set when the notifier is enabled
   ansible.builtin.assert:
@@ -33,9 +35,7 @@
 
 - name: Agent Hub | packages
   ansible.builtin.apt:
-    name: >-
-      {{ ['python3', 'python3-venv', 'tmux', 'sudo', 'git'] +
-         (['nftables'] if agent_hub_loopback_guard_enabled | bool else []) }}
+    name: [python3, python3-venv, tmux, sudo, git, curl]
     state: present
     update_cache: true
     cache_valid_time: 3600
@@ -207,7 +207,6 @@
     mode: "0644"
   notify:
     - Restart agent-hub
-    - Reload agent-hub-loopback-guard
 
 - name: Agent Hub | service deploy-key profiles
   ansible.builtin.template:
@@ -239,17 +238,67 @@
     - Reload systemd
     - Restart agent-hub
 
-- name: Agent Hub | loopback proxy guard unit
+- name: Agent Hub | systemd socket unit
   ansible.builtin.template:
-    src: agent-hub-loopback-guard.service.j2
-    dest: /etc/systemd/system/agent-hub-loopback-guard.service
+    src: agent-hub.socket.j2
+    dest: /etc/systemd/system/agent-hub.socket
     owner: root
     group: root
     mode: "0644"
-  when: agent_hub_loopback_guard_enabled | bool
   notify:
     - Reload systemd
-    - Reload agent-hub-loopback-guard
+    - Restart agent-hub socket
+    - Restart agent-hub
+
+- name: Agent Hub | runtime directory policy
+  ansible.builtin.template:
+    src: agent-hub-tmpfiles.conf.j2
+    dest: /etc/tmpfiles.d/agent-hub.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Agent Hub | inspect retired loopback guard unit
+  ansible.builtin.stat:
+    path: /etc/systemd/system/agent-hub-loopback-guard.service
+  register: agent_hub_retired_guard
+
+- name: Agent Hub | stop the TCP backend for the one-time transport migration
+  ansible.builtin.systemd:
+    name: agent-hub.service
+    state: stopped
+  when: agent_hub_retired_guard.stat.exists
+
+- name: Agent Hub | stop and disable retired loopback guard
+  ansible.builtin.systemd:
+    name: agent-hub-loopback-guard.service
+    enabled: false
+    state: stopped
+  when: agent_hub_retired_guard.stat.exists
+
+- name: Agent Hub | create the private socket directory
+  ansible.builtin.command:
+    argv:
+      - systemd-tmpfiles
+      - --create
+      - /etc/tmpfiles.d/agent-hub.conf
+  changed_when: false
+
+- name: Agent Hub | remove any stale loopback guard table
+  ansible.builtin.command: nft delete table inet agent_hub_guard
+  register: agent_hub_guard_table_removal
+  changed_when: agent_hub_guard_table_removal.rc == 0
+  failed_when: false
+
+- name: Agent Hub | remove retired loopback guard artifacts
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/agent-hub-loopback-guard.service
+    - /etc/systemd/system/agent-hub.service.d/20-loopback-guard.conf
+    - "{{ agent_hub_libexec }}/loopback-guard-ctl"
+  notify: Reload systemd
 
 - name: Agent Hub | Telegram notifier unit
   ansible.builtin.template:
@@ -275,13 +324,12 @@
     - agent-hub-health.timer
   notify: Reload systemd
 
-- name: Agent Hub | enable the loopback proxy guard
+- name: Agent Hub | enable the private socket
   ansible.builtin.systemd:
-    name: agent-hub-loopback-guard.service
+    name: agent-hub.socket
     enabled: true
     state: started
     daemon_reload: true
-  when: agent_hub_loopback_guard_enabled | bool
 
 - name: Agent Hub | enable the service
   ansible.builtin.systemd:
@@ -289,6 +337,46 @@
     enabled: true
     state: started
     daemon_reload: true
+
+# The socket must be live before switching Tailscale's root handler.  In an
+# upgrade the service may still be running the retired TCP unit until its
+# notified restart is flushed.
+- name: Agent Hub | apply service changes before routing traffic
+  ansible.builtin.meta: flush_handlers
+
+- name: Agent Hub | inspect Tailscale Serve backend
+  ansible.builtin.command:
+    argv: [tailscale, serve, status, --json]
+  register: agent_hub_serve_before
+  changed_when: false
+  when:
+    - agent_hub_require_tailscale | bool
+    - agent_hub_manage_tailscale_serve | bool
+
+- name: Agent Hub | route Tailscale Serve to the private socket
+  ansible.builtin.command:
+    argv:
+      - tailscale
+      - serve
+      - --bg
+      - --yes
+      - --set-path
+      - /
+      - "unix:{{ agent_hub_socket }}"
+  when:
+    - agent_hub_require_tailscale | bool
+    - agent_hub_manage_tailscale_serve | bool
+    - ('unix:' ~ agent_hub_socket) not in agent_hub_serve_before.stdout
+
+- name: Agent Hub | verify Tailscale Serve socket route
+  ansible.builtin.command:
+    argv: [tailscale, serve, status, --json]
+  register: agent_hub_serve_after
+  changed_when: false
+  failed_when: ('unix:' ~ agent_hub_socket) not in agent_hub_serve_after.stdout
+  when:
+    - agent_hub_require_tailscale | bool
+    - agent_hub_manage_tailscale_serve | bool
 
 - name: Agent Hub | enable the health timer
   ansible.builtin.systemd:

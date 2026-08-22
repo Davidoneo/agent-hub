@@ -123,7 +123,8 @@ tailscale_install: false
 agent_hub_install: false
 agent_hub_origin: ""                 # e.g. https://host.tailnet.ts.net
 agent_hub_allowed_users: []          # exact Tailscale login identities
-agent_hub_loopback_guard_enabled: true
+agent_hub_socket: /run/agent-hub/agent-hub.sock
+agent_hub_manage_tailscale_serve: true
 
 # Full host administration requires BOTH flags. Keep false unless SERVER
 # sessions are intentionally allowed to become root.

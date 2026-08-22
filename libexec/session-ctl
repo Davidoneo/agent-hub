@@ -1067,6 +1067,200 @@ def cmd_command(argv):
                       "confirmed": len(confirmed)}))
 
 
+# ------------------------------------------- modalita' di collaborazione
+#
+# Plan mode non funziona allo stesso modo in due harness: Codex ha un comando
+# slash per entrarci ma nessuno per uscirne, Claude Code non ne ha affatto e
+# cicla le posture con shift+tab. L'unico fatto comune e' la riga di stato
+# della TUI, che dichiara la modalita' attiva a ogni frame. E' quella che
+# viene letta prima e dopo ogni tentativo: nessun tasto viene premuto alla
+# cieca sperando che abbia avuto effetto.
+
+def _type_line(name, env, text):
+    """Batte una riga nella TUI e la invia. Battuta, non incollata: le TUI
+    trattano i blocchi di paste come testo normale e non come comandi."""
+    r = tmux("send-keys", "-t", name, "-l", text, env=env)
+    if r.returncode != 0:
+        return False, (r.stderr or "send-keys fallito").strip()
+    # la riga deve essere stata processata per intero (e l'eventuale menu di
+    # completamento chiuso) prima dell'Invio
+    time.sleep(0.8)
+    r = tmux("send-keys", "-t", name, "Enter", env=env)
+    if r.returncode != 0:
+        return False, (r.stderr or "Enter fallito").strip()
+    time.sleep(1.2)
+    return True, ""
+
+
+def _mode_options(prof):
+    return [o for o in ((prof.get("modes") or {}).get("options") or [])
+            if isinstance(o, dict) and o.get("id")]
+
+
+def _mode_pattern(opt, prof, perm):
+    """Espressione che riconosce una modalita' nella riga di stato.
+
+    Per Claude Code «normale» non e' una postura fissa ma quella scelta
+    all'avvio della sessione: tornare da Plan a un valore costante
+    significherebbe, per una sessione avviata in modalita' standard,
+    alzarne i permessi senza che nessuno l'abbia chiesto.
+    """
+    if opt.get("status_from_permission"):
+        pats = (prof.get("modes") or {}).get("permission_status_patterns") or {}
+        return pats.get(perm, "")
+    return opt.get("status_pattern", "")
+
+
+def _detect_mode(name, prof, env, perm):
+    """Modalita' attiva secondo la TUI, oppure "" se non e' riconoscibile.
+
+    Si guardano solo le ultime righe del pane: la modalita' e' scritta nella
+    cornice del compositore, mentre piu' in alto lo stesso testo puo'
+    comparire in un messaggio ormai passato («Model changed … for Plan mode»),
+    e prenderlo per stato corrente sarebbe leggere la cronologia come presente.
+    """
+    tail = "\n".join([l for l in _pane_text(name, env, lines=12).splitlines()
+                      if l.strip()][-4:])
+    fallback = ""
+    for opt in _mode_options(prof):
+        pat = _mode_pattern(opt, prof, perm)
+        if not pat:
+            if opt.get("fallback"):
+                fallback = opt["id"]
+            continue
+        try:
+            if re.search(pat, tail):
+                return opt["id"]
+        except re.error:
+            continue
+    return fallback
+
+
+def cmd_mode(argv):
+    """mode <session> <profile-id> <perm> [target] — legge o cambia la modalita'.
+
+    Senza `target` riporta soltanto quella attiva. Con un target si prova
+    prima il comando slash dichiarato dal profilo, poi il ciclo di tastiera,
+    rileggendo la riga di stato dopo ogni passo: la risposta dice quale
+    modalita' la TUI sta davvero mostrando, non quale e' stata chiesta.
+    """
+    if not 3 <= len(argv) <= 4:
+        die("uso: mode <session> <profile-id> <perm> [target]")
+    name = check_session(argv[0])
+    prof = load_profiles().get(argv[1]) or die("profilo sconosciuto")
+    perm = argv[2]
+    target = (argv[3] if len(argv) > 3 else "").strip()
+    spec = prof.get("modes") or {}
+    options = _mode_options(prof)
+    if not options:
+        print(json.dumps({"ok": False, "mode": "",
+                          "error": "questo profilo non dichiara modalita'"}))
+        sys.exit(3)
+    env = base_env()
+    if tmux("has-session", "-t", name, env=env).returncode != 0:
+        print(json.dumps({"ok": False, "mode": "",
+                          "error": "la sessione tmux non e' attiva"}))
+        sys.exit(4)
+
+    current = _detect_mode(name, prof, env, perm)
+    if not target:
+        print(json.dumps({"ok": True, "mode": current, "changed": False}))
+        return
+    opt = next((o for o in options if o["id"] == target), None)
+    if not opt:
+        die(f"modalita' non valida per {prof['id']}: {target}")
+    if current == target:
+        print(json.dumps({"ok": True, "mode": current, "requested": target,
+                          "changed": False, "steps": 0, "how": "era gia' attiva"}))
+        return
+
+    how, steps = "", 0
+    if opt.get("command"):
+        ok, err = _type_line(name, env, opt["command"])
+        if not ok:
+            print(json.dumps({"ok": False, "mode": current, "error": err}))
+            sys.exit(5)
+        how = opt["command"]
+        current = _detect_mode(name, prof, env, perm)
+
+    key = spec.get("cycle_key") or ""
+    if current != target and key:
+        # un giro completo e' il massimo utile: oltre, il ciclo si ripete
+        for step in range(1, len(options) + 6):
+            tmux("send-keys", "-t", name, key, env=env)
+            time.sleep(0.6)
+            current = _detect_mode(name, prof, env, perm)
+            if current == target:
+                steps = step
+                how = (how + " + " if how else "") + f"{step}x {key}"
+                break
+
+    ok = current == target
+    print(json.dumps({
+        "ok": ok, "mode": current, "requested": target, "changed": ok,
+        "how": how, "steps": steps,
+        "error": "" if ok else "la riga di stato non mostra la modalita' richiesta",
+        "pane_tail": "\n".join(_pane_text(name, env, lines=20).strip().splitlines()[-8:]),
+    }))
+    if not ok:
+        sys.exit(6)
+
+
+def cmd_goal(argv):
+    """goal <session> <profile-id> <set|clear> [file] — obiettivo del lavoro.
+
+    Il testo arriva da un file negli stessi percorsi controllati del prompt
+    iniziale: non passa dalla riga di comando, non ha problemi di quoting e
+    resta soggetto agli stessi permessi. Viene ridotto a una riga sola,
+    perche' un a capo a meta' testo lo spezzerebbe in due invii separati, e
+    ai soli caratteri stampabili.
+    """
+    if not 3 <= len(argv) <= 4:
+        die("uso: goal <session> <profile-id> <set|clear> [file]")
+    name = check_session(argv[0])
+    prof = load_profiles().get(argv[1]) or die("profilo sconosciuto")
+    action = argv[2]
+    spec = prof.get("goal") or {}
+    if not spec.get("command"):
+        print(json.dumps({"ok": False, "error": "questo profilo non dichiara /goal"}))
+        sys.exit(3)
+    if action == "clear":
+        text = spec.get("clear") or die("il profilo non dichiara come azzerare l'obiettivo")
+        shown = ""
+    elif action == "set":
+        path = argv[3] if len(argv) > 3 else die("manca il file con l'obiettivo")
+        if not any(path.startswith(p) for p in INPUT_DIRS):
+            die("percorso del file dell'obiettivo non consentito")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            die(f"file dell'obiettivo illeggibile: {exc}")
+        shown = re.sub(r"\s+", " ", "".join(
+            ch for ch in raw if ch == " " or ch.isprintable() or ch in "\t\n\r")).strip()
+        limit = int(spec.get("max_length") or 500)
+        shown = shown[:limit].strip()
+        if not shown:
+            die("obiettivo vuoto")
+        text = str(spec["command"]).replace("{value}", shown)
+    else:
+        die("azione non valida: usare set oppure clear")
+
+    env = base_env()
+    if tmux("has-session", "-t", name, env=env).returncode != 0:
+        print(json.dumps({"ok": False, "error": "la sessione tmux non e' attiva"}))
+        sys.exit(4)
+    ok, err = _type_line(name, env, text)
+    if not ok:
+        print(json.dumps({"ok": False, "error": err}))
+        sys.exit(5)
+    time.sleep(1.0)
+    print(json.dumps({
+        "ok": True, "action": action, "goal": shown,
+        "pane_tail": "\n".join(_pane_text(name, env, lines=20).strip().splitlines()[-8:]),
+    }))
+
+
 def cmd_info(argv):
     """info — versioni, stato auth, chiavi SSH dell'utente corrente (JSON)."""
     u = me()
@@ -1550,7 +1744,7 @@ COMMANDS = {
     "kill": cmd_kill, "has": cmd_has, "list": cmd_list, "capture": cmd_capture,
     "attach": cmd_attach, "resize": cmd_resize, "login": cmd_login, "info": cmd_info,
     "models": cmd_models, "usage": cmd_usage, "runtime": cmd_runtime,
-    "command": cmd_command,
+    "command": cmd_command, "mode": cmd_mode, "goal": cmd_goal,
     "server": cmd_server, "version": cmd_version,
 }
 

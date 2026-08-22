@@ -1313,17 +1313,6 @@ async function viewNewSession() {
         ${d.projects.length ? "" : '<div class="muted">Nessun progetto registrato: creane uno dalla pagina Progetti.</div>'}
       </div>
 
-      <label>Directory di lavoro
-        <span class="help-badge" title="Puoi lasciarla vuota: verrà usata la directory predefinita">?</span></label>
-      <div class="row">
-        <input id="s-workdir" placeholder="(vuoto = directory predefinita)" style="flex:1">
-        <button class="small" id="s-browse" type="button">Sfoglia…</button>
-      </div>
-      <div id="s-picker" class="picker" style="display:none;margin-top:8px"></div>
-      ${help("Non serve digitare il percorso a mano: apri «Sfoglia…» e naviga. " +
-             "Per PROJECT la directory resta sotto /srv/agent-workspace/projects; se lasci il campo vuoto " +
-             `viene usata la radice del progetto (o ${serverHome()} per SERVER).`)}
-
       <label>Profilo harness</label>
       <select id="s-profile">
         ${profiles.map(p => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("")}
@@ -1369,30 +1358,54 @@ async function viewNewSession() {
         <div class="muted" id="s-executor-note" style="margin-top:6px"></div>
       </div>
 
-      <label>Prompt iniziale (multilinea, opzionale)</label>
+      <label id="s-prompt-label">Prompt iniziale (multilinea, opzionale)</label>
       <textarea id="s-prompt" placeholder="Descrivi la macro-task…"></textarea>
-      ${help("Il prompt viene salvato nel database prima dell'avvio e consegnato all'harness. " +
-             "Quando la CLI lo supporta viene passato direttamente sulla riga di comando, " +
-             "altrimenti viene incollato nella TUI appena è pronta a ricevere input.")}
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:6px">
+        <span class="muted" style="font-size:12px">Modalità</span>
+        <select id="s-mode" style="width:auto;min-width:200px;padding:6px 8px;font-size:13px"></select>
+      </div>
+      <div class="muted" id="s-mode-note" style="margin-top:4px;font-size:12px;text-align:right"></div>
 
-      <label>Documenti da allegare</label>
-      <div id="s-docs" class="card" style="margin:0;max-height:200px;overflow:auto">
-        ${docs.documents.map(x => `<label class="inline" style="display:flex;margin:4px 0">
-          <input type="checkbox" class="sel-doc" value="${esc(x.id)}">
-          <span>${esc(x.name)} <span class="muted mono">${esc(x.path)}</span></span></label>`).join("") ||
+      <label>Documenti</label>
+      <div class="row">
+        <button class="small" id="s-docs-toggle" type="button">Allega documenti…</button>
+        <button class="small" id="s-files-pick" type="button">Carica dal dispositivo…</button>
+        <span class="muted" id="s-docs-count" style="font-size:13px"></span>
+      </div>
+      <input type="file" id="s-files" multiple style="display:none">
+      <div id="s-docs" class="picker" style="display:none;margin-top:8px;padding:8px 10px;
+           max-height:220px;overflow:auto;columns:2 240px;column-gap:16px">
+        ${docs.documents.map(x => `<label class="inline" style="display:flex;align-items:flex-start;
+            margin:0 0 6px;break-inside:avoid">
+          <input type="checkbox" class="sel-doc" value="${esc(x.id)}" style="margin-top:3px;flex:none">
+          <span style="min-width:0;overflow-wrap:anywhere">${esc(x.name)}<br>
+            <span class="muted mono" style="font-size:11px">${esc(x.path)}</span></span></label>`).join("") ||
           '<span class="muted">Nessun documento caricato. Vai su Documenti per aggiungerne.</span>'}
       </div>
-      <label>Oppure carica ora nuovi documenti</label>
-      <input type="file" id="s-files" multiple>
       ${help("I percorsi completi dei documenti selezionati vengono aggiunti in fondo al prompt iniziale.")}
 
-      <div class="row">
-        <div style="flex:1"><label>Colonne</label><input id="s-cols" value="100" inputmode="numeric"></div>
-        <div style="flex:1"><label>Righe</label><input id="s-rows" value="30" inputmode="numeric"></div>
-      </div>
       <div class="row" style="margin-top:14px"><button class="primary" id="s-go">Avvia sessione</button></div>
       <div class="muted" style="margin-top:8px" id="s-hint"></div>
       <div id="s-err"></div>
+
+      <details class="more" id="s-opts">
+        <summary>Opzioni</summary>
+        <label>Directory di lavoro
+          <span class="help-badge" title="Puoi lasciarla vuota: verrà usata la directory predefinita">?</span></label>
+        <div class="row">
+          <input id="s-workdir" placeholder="(vuoto = directory predefinita)" style="flex:1">
+          <button class="small" id="s-browse" type="button">Sfoglia…</button>
+        </div>
+        <div id="s-picker" class="picker" style="display:none;margin-top:8px"></div>
+        ${help("Non serve digitare il percorso a mano: apri «Sfoglia…» e naviga. " +
+               "Per PROJECT la directory resta sotto /srv/agent-workspace/projects; se lasci il campo vuoto " +
+               `viene usata la radice del progetto (o ${serverHome()} per SERVER).`)}
+        <div class="row">
+          <div style="flex:1"><label>Colonne</label><input id="s-cols" value="100" inputmode="numeric"></div>
+          <div style="flex:1"><label>Righe</label><input id="s-rows" value="30" inputmode="numeric"></div>
+        </div>
+        ${help("Dimensione del terminale della sessione: conta solo per come la TUI dispone il testo.")}
+      </details>
     </div>`;
 
   const envSel = $("#s-env"), profSel = $("#s-profile");
@@ -1438,6 +1451,49 @@ async function viewNewSession() {
           : `${p.harness} non espone un livello di effort: il campo resta disattivato.`);
   }
 
+  // Tre scelte, non due campi: «normale» non tocca la TUI, «plan» la porta in
+  // Plan mode, «obiettivo» usa il prompt come testo di /goal. Ciò che il
+  // profilo non dichiara non viene offerto: il backend lo rifiuterebbe.
+  function syncModes(p) {
+    const sel = $("#s-mode");
+    const opts = ((p.modes || {}).options || []);
+    const planNote = (opts.find(o => o.id === "plan") || {}).note || "";
+    const hasPlan = opts.some(o => o.id === "plan");
+    const hasGoal = !!((p.goal || {}).command);
+    const keep = sel.value;
+    const items = [["", "Normale"]];
+    if (hasPlan) items.push(["plan", "Plan"]);
+    if (hasGoal) items.push(["goal", "Obiettivo (/goal)"]);
+    sel.innerHTML = items.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("");
+    sel.value = items.some(i => i[0] === keep) ? keep : "";
+    sel.disabled = items.length < 2;
+    const notes = {
+      "": items.length < 2
+        ? `${p.harness} non espone modalità di collaborazione selezionabili.`
+        : "L'agente lavora e modifica come al solito.",
+      plan: planNote,
+      goal: "Il prompt qui sopra diventa l'obiettivo passato a /goal: l'agente ci lavora " +
+            "e lo verifica prima di fermarsi. Viene ridotto a una riga sola.",
+    };
+    $("#s-mode-note").textContent = notes[sel.value] || "";
+    $("#s-prompt-label").textContent = sel.value === "goal"
+      ? "Obiettivo della sessione (diventa il /goal)"
+      : "Prompt iniziale (multilinea, opzionale)";
+    $("#s-prompt").placeholder = sel.value === "goal"
+      ? "Che cosa deve essere vero perché il lavoro sia finito…"
+      : "Descrivi la macro-task…";
+  }
+
+  // Quanti documenti sono allegati: la lista resta chiusa, il conteggio no.
+  function syncDocs() {
+    const n = $$(".sel-doc:checked").length;
+    const files = $("#s-files").files;
+    const parts = [];
+    if (n) parts.push(`${n} document${n === 1 ? "o" : "i"} dal catalogo`);
+    if (files && files.length) parts.push(`${files.length} da caricare`);
+    $("#s-docs-count").textContent = parts.length ? parts.join(" · ") : "nessuno allegato";
+  }
+
   function syncExecutor() {
     const p = profiles.find(x => x.id === profSel.value);
     const models = executorModels();
@@ -1474,6 +1530,7 @@ async function viewNewSession() {
       `<option value="${esc(k)}"${k === p.default_permission_mode ? " selected" : ""}>${k === "full" ? "full — accesso completo (default)" : esc(k)}</option>`).join("");
     syncModelNote(p, user);
     syncEffort(p, user);
+    syncModes(p);
     syncExecutor();
     const allowed = (p.allowed_users || []).includes(user);
     $("#s-go").disabled = !allowed;
@@ -1494,6 +1551,17 @@ async function viewNewSession() {
   envSel.onchange = syncEnv;
   profSel.onchange = syncProfile;
   $("#s-executor-enabled").onchange = syncExecutor;
+  $("#s-mode").onchange = () => syncModes(profiles.find(x => x.id === profSel.value));
+  $("#s-docs-toggle").onclick = () => {
+    const box = $("#s-docs");
+    const open = box.style.display === "none";
+    box.style.display = open ? "" : "none";
+    $("#s-docs-toggle").textContent = open ? "Chiudi elenco documenti" : "Allega documenti…";
+  };
+  $("#s-files-pick").onclick = () => $("#s-files").click();
+  $("#s-files").onchange = syncDocs;
+  $$(".sel-doc").forEach(c => { c.onchange = syncDocs; });
+  syncDocs();
   $("#s-model").onchange = () => {
     const other = $("#s-model").value === "__other__";
     $("#s-model-other").style.display = other ? "" : "none";
@@ -1537,6 +1605,10 @@ async function viewNewSession() {
         model: selectedModel(),
         effort: $("#s-effort").disabled ? "" : $("#s-effort").value,
         permission_mode: $("#s-perm").value,
+        // «obiettivo» non è una modalità dell'harness: è il prompt usato come
+        // testo di /goal, e il backend lo tratta come tale
+        mode: $("#s-mode").value === "goal" ? "" : $("#s-mode").value,
+        prompt_as_goal: $("#s-mode").value === "goal",
         executor_enabled: supportsSubagents(profSel.value) &&
                           $("#s-executor-enabled").checked,
         executor_model: $("#s-executor-model").value,
@@ -1751,6 +1823,8 @@ function diagCard(g) {
         ${perm ? ` <span class="mono">${esc(perm)}</span>` : ' <span class="muted">(nessun argomento)</span>'}</div>
       <div>Modello</div><div class="mono">${esc(g.model)}${g.model && g.model !== "(default dell'harness)" ? esc(catalogModelNote(g.unix_user, g.profile_id, g.model)) : ""}</div>
       <div>Effort richiesto</div><div class="mono">${esc(g.effort || "(default dell'harness)")}</div>
+      <div>Modalità richiesta</div><div class="mono">${esc(g.session_mode || "—")}</div>
+      ${g.goal ? `<div>Obiettivo</div><div>${esc(g.goal)}</div>` : ""}
       <div>Utente Unix</div><div class="mono">${esc(g.unix_user)}</div>
       <div>Directory</div><div class="mono">${esc(g.workdir)}</div>
       <div>Prompt iniziale</div><div>${g.prompt_as_argv ? "passato come argomento della CLI" : "consegnato dopo l'avvio (paste)"}</div>
@@ -1796,6 +1870,15 @@ function runtimeTags(rt) {
     esc(model || "modello di default")}</span>`];
   if (effort) tags.push(`<span class="tag ${isLive && live.effort ? "running" : "idle"}"
     title="${esc(live.effort ? src : "effort richiesto all'avvio")}">effort ${esc(effort)}</span>`);
+  // La modalità è un fatto letto dalla riga di stato della TUI, quindi vale
+  // anche quando l'harness non ha ancora scritto uno stato verificabile.
+  const modeId = rt.mode_live || cfg.mode || "";
+  const modeOpt = ((rt.capabilities || {}).modes || []).find(m => m.id === modeId);
+  if (modeId && modeId !== ((rt.capabilities || {}).default_mode || "")) {
+    tags.push(`<span class="tag ${rt.mode_live ? "running" : "idle"}" title="${
+      esc(rt.mode_live ? "modalità mostrata adesso dalla TUI" : "modalità richiesta all'avvio")}">${
+      esc((modeOpt && modeOpt.label) || modeId)}</span>`);
+  }
   if (isLive && live.context_tokens) {
     tags.push(`<span class="tag ended" title="token del contesto all'ultima richiesta (input + cache)">ctx ${
       esc(fmtTokens(live.context_tokens))}</span>`);
@@ -1842,6 +1925,20 @@ function runtimeBody(rt) {
     ["Effort richiesto all'avvio", cfg.effort
       ? `<span class="mono">${esc(cfg.effort)}</span>` : '<span class="muted">default dell\'harness</span>'],
   ];
+  const modes = cap.modes || [];
+  const curMode = rt.mode_live || cfg.mode || "";
+  if (modes.length) {
+    const lbl = id => (modes.find(m => m.id === id) || {}).label || id;
+    rows.push(["Modalità secondo la TUI", rt.mode_live
+      ? `<b>${esc(lbl(rt.mode_live))}</b>`
+      : '<span class="muted">non leggibile (sessione non attiva)</span>']);
+    rows.push(["Modalità richiesta all'avvio", cfg.mode
+      ? esc(lbl(cfg.mode)) : '<span class="muted">quella di partenza dell\'harness</span>']);
+  }
+  if (cap.supports_goal) {
+    rows.push(["Obiettivo registrato", cfg.goal
+      ? esc(cfg.goal) : '<span class="muted">nessuno</span>']);
+  }
   if (live.state === "live") {
     rows.push(["Risposte osservate", esc(String(live.turns || 0))]);
     rows.push(["Contesto ultima richiesta", `${esc(fmtTokens(live.context_tokens))} token`]);
@@ -1873,8 +1970,18 @@ function runtimeBody(rt) {
         <select id="rt-effort"><option value="">(invariato)</option>${levels.map(l =>
           `<option value="${esc(l)}"${l === curEffort ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>
         </div>` : ""}
+      ${modes.length ? `<div style="flex:1;min-width:160px"><label>Modalità</label>
+        <select id="rt-mode"><option value="">(invariata)</option>${modes.map(m =>
+          `<option value="${esc(m.id)}"${m.id === curMode ? " selected" : ""}>${esc(m.label)}</option>`).join("")}</select>
+        </div>` : ""}
       <button class="primary small" id="rt-apply">Applica</button>
     </div>
+    ${cap.supports_goal ? `<div class="row" style="margin-top:10px;align-items:flex-end;gap:10px;flex-wrap:wrap">
+      <div style="flex:2;min-width:240px"><label>Obiettivo (/goal)</label>
+        <input id="rt-goal" maxlength="${cap.goal_max_length || 500}" value="${esc(cfg.goal || "")}"
+               placeholder="obiettivo che l'agente verifica prima di fermarsi"></div>
+      <button class="small" id="rt-goal-clear">Azzera obiettivo</button>
+    </div>` : ""}
     <div class="muted" style="margin-top:6px">${
       (hotModel || hotEffort)
         ? "Il cambio viene eseguito subito nella sessione con i comandi della TUI " +
@@ -1882,6 +1989,9 @@ function runtimeBody(rt) {
           "e registrato per i prossimi avvii."
         : "Questo harness non permette il cambio a caldo: il valore viene registrato e " +
           "diventa effettivo al prossimo avvio (pulsante «Restart»)."}</div>
+    ${modes.length ? `<div class="muted" style="margin-top:4px">${esc((cap.modes_note || "") +
+      " Il cambio di modalità viene verificato sulla riga di stato della TUI: se non compare, " +
+      "la risposta lo dice invece di darlo per fatto.")}</div>` : ""}
     <div id="rt-result"></div>` : '<div class="muted" style="margin-top:10px">Questo harness non permette di scegliere il modello.</div>';
 
   return `<div class="kv" style="margin-top:10px">${rows.map(
@@ -2217,6 +2327,23 @@ async function viewSession(sid) {
         if (other) $("#rt-model-other").focus();
       };
     }
+    const clear = $("#rt-goal-clear");
+    if (clear) {
+      clear.onclick = async () => {
+        const out = $("#rt-result");
+        clear.disabled = true;
+        out.innerHTML = '<div class="muted">azzeramento in corso…</div>';
+        try {
+          const r = await post(`/api/sessions/${encodeURIComponent(sid)}/runtime`,
+                               { clear_goal: true }, "azzeramento obiettivo");
+          out.innerHTML = `<div class="${r.errors && r.errors.length ? "errbox compact" : "okbox"}">${
+            esc(r.detail)}</div>`;
+          if ($("#rt-goal")) $("#rt-goal").value = "";
+          toast(r.ok ? "Obiettivo azzerato" : "Azzeramento parziale — leggi il dettaglio",
+                r.ok ? "ok" : "err");
+        } catch (e) { showError(e, out); } finally { clear.disabled = false; }
+      };
+    }
     const btn = $("#rt-apply");
     if (!btn) return;
     btn.onclick = async () => {
@@ -2224,13 +2351,17 @@ async function viewSession(sid) {
       const model = !sel ? ""
         : (sel.value === "__other__" ? $("#rt-model-other").value.trim() : sel.value);
       const effort = $("#rt-effort") ? $("#rt-effort").value : "";
+      const mode = $("#rt-mode") ? $("#rt-mode").value : "";
+      const goalEl = $("#rt-goal");
+      const goal = goalEl ? goalEl.value.trim() : "";
       const out = $("#rt-result");
-      if (!model && !effort) { toast("Scegli un modello o un livello di effort", "err"); return; }
+      if (!model && !effort && !mode && !goal) {
+        toast("Scegli un modello, un effort, una modalità o scrivi un obiettivo", "err"); return; }
       btn.disabled = true;
       out.innerHTML = '<div class="muted">applicazione in corso…</div>';
       try {
         const r = await post(`/api/sessions/${encodeURIComponent(sid)}/runtime`,
-                             { model, effort }, "cambio modello/effort");
+                             { model, effort, mode, goal }, "cambio modello/effort/modalità");
         // l'esito mostrato è quello riportato dal backend, comprese le ultime
         // righe del terminale: nessuna conferma ottimistica
         const tails = (r.applied || []).filter(a => a.pane_tail).map(a =>
