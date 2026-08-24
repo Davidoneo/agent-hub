@@ -12,6 +12,21 @@ root-owned privilege wrappers and the Ansible installer. Instance inventory,
 credentials, recovery snapshots and application-specific services do not
 belong here.
 
+## Interface
+
+The browser UI keeps routine controls compact while leaving diagnostics and
+advanced settings available on demand. These screenshots use a sanitized local
+view: identities, plan balances, session data and private repository names are
+not included.
+
+### Start a persistent session
+
+![Agent Hub new-session form](docs/images/new-session.png)
+
+### Review host health
+
+![Agent Hub status overview](docs/images/status-overview.png)
+
 ## Install
 
 Supported targets are Debian 13+ and Ubuntu 24.04+.
