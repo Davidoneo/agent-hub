@@ -1,5 +1,28 @@
 # Handoff
 
+## 2026-08-25 — Public screenshots and Ansible tooling patched
+
+Status: prepared and verified for the public repository.
+
+### Behavior
+
+- Added two sanitized README screenshots for the complete new-session form and
+  compact host-health overview. The capture omits identities, usage balances,
+  session data, host paths, and private repository names.
+- Updated the development-only `ansible-core` pin from 2.17.14 to 2.18.19,
+  the stable patched release for the high-severity `ansible-galaxy` argument
+  injection advisory reported by Dependabot. Agent Hub runtime dependencies
+  and the live service are unchanged.
+
+### Verification
+
+- A clean Python 3.13 virtual environment installed the exact development
+  requirements. Ansible lint, playbook syntax, SSH/firewall safety tests, and
+  Agent Hub least-privilege default tests all pass with ansible-core 2.18.19.
+- The full application source check passes with 21 tests. Screenshot source
+  DOM assertions and visual review found none of the excluded private fields.
+- The pinned CI Gitleaks scan covers the complete Git history before publish.
+
 ## 2026-08-25 — New-session advanced options clarified
 
 Status: implemented, deployed, and verified on the local Agent Hub instance.
