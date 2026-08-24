@@ -1,2 +1,5 @@
 # {{ ansible_managed }}
 d {{ agent_hub_socket | dirname }} 0750 {{ agent_hub_service_user }} {{ agent_hub_service_user }} -
+# I nomi casuali non sono elencabili dal gruppo; gli account agentici possono
+# attraversare la directory per leggere soltanto il file ricevuto dall'Hub.
+d /run/agent-hub-inputs 0710 {{ agent_hub_service_user }} {{ agent_hub_agent_group }} -

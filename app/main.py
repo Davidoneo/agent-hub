@@ -75,7 +75,11 @@ CONFIG = {
 SESSION_CTL = "/usr/local/libexec/agent-hub/session-ctl"
 PROJECT_CTL = "/usr/local/libexec/agent-hub/project-ctl"
 HEALTH_CTL = "/usr/local/libexec/agent-hub/health-ctl"
-RUNTIME_DIR = Path("/run/agent-hub")
+# Il socket resta in /run/agent-hub, una directory privata all'account del
+# servizio. I file di input devono invece essere attraversabili dagli account
+# che eseguono gli harness; tmpfiles crea questa directory con gruppo
+# agentprojects e senza permesso di elenco per il gruppo.
+INPUT_RUNTIME_DIR = Path("/run/agent-hub-inputs")
 # Gli account Unix sono configurabili: l'installazione di riferimento usa
 # devagent per i progetti e hostagent per l'host, ma il playbook di
 # provisioning puo' sceglierne altri passandoli da config.env.
@@ -179,8 +183,9 @@ PENDING, LAUNCHING, SENT, FAILED, RESENT = (
 REPORT_STATUSES = ("COMPLETED", "NEEDS_INPUT", "WAITING_SESSION",
                    "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
 # Stati che il controller ricava da fatti osservabili, mai dal contenuto della TUI.
-CONTROLLER_STATUSES = ("RUNNING", "STARTING", "CRASHED", "ENDED_UNREPORTED",
-                       "POSSIBLY_STALLED", "AUTH_REQUIRED", "USAGE_LIMIT")
+CONTROLLER_STATUSES = ("RUNNING", "STARTING", "LAUNCH_FAILED", "CRASHED",
+                       "ENDED_UNREPORTED", "POSSIBLY_STALLED", "AUTH_REQUIRED",
+                       "USAGE_LIMIT")
 
 ALLOWED_DOC_EXT = {
     ".pdf": "application/pdf",
@@ -963,7 +968,7 @@ def recover_pending() -> None:
 def sweep_runtime() -> None:
     """File di input rimasti orfani da una consegna interrotta."""
     try:
-        for p in RUNTIME_DIR.glob("input-*.txt"):
+        for p in INPUT_RUNTIME_DIR.glob("input-*.txt"):
             try:
                 if time.time() - p.stat().st_mtime > 3600:
                     p.unlink()
@@ -1130,7 +1135,8 @@ async def guard(request: Request, call_next):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Corpo JSON uniforme: il frontend mostra sempre un testo, mai un riquadro vuoto."""
-    return JSONResponse(error_body(exc, request.url.path), status_code=exc.status_code)
+    return JSONResponse(error_body(exc, request.url.path), status_code=exc.status_code,
+                        headers=exc.headers)
 
 
 # ------------------------------------------------------------------- API
@@ -1314,6 +1320,7 @@ LIFECYCLE_LABEL = {
     "USAGE_LIMIT": "Limite d'uso",
     "RUNNING": "Al lavoro",
     "STARTING": "Avvio",
+    "LAUNCH_FAILED": "Avvio fallito",
 }
 
 
@@ -1388,6 +1395,10 @@ def apply_lifecycle(row: dict, last: dict) -> str:
 
     if row.get("kind") == "login":
         life = "RUNNING" if row["alive"] else "ENDED_UNREPORTED"
+    elif row["status"] == "failed":
+        # L'harness non e' mai partito. Non e' una sessione terminata senza
+        # report e non deve quindi produrre il relativo avviso Telegram.
+        life = "LAUNCH_FAILED"
     elif not row["alive"]:
         if row["status"] == "starting":
             life = "STARTING"
@@ -1530,7 +1541,8 @@ def controller_sweep() -> int:
     return len(rows)
 
 
-DEPENDENCY_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "CRASHED", "ENDED_UNREPORTED"}
+DEPENDENCY_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "LAUNCH_FAILED",
+                       "CRASHED", "ENDED_UNREPORTED"}
 
 
 def release_dependency(row: dict, sessions: dict[str, dict]) -> bool:
@@ -2245,9 +2257,9 @@ def with_contract(row: dict, text: str, *, initial: bool) -> str:
 # ------------------------------------------------------ prompt e messaggi
 
 def write_input_file(text: str) -> str:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    path = RUNTIME_DIR / f"input-{uuid.uuid4().hex}.txt"
-    path.write_text(text)
+    INPUT_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    path = INPUT_RUNTIME_DIR / f"input-{uuid.uuid4().hex}.txt"
+    path.write_text(text, encoding="utf-8")
     path.chmod(0o644)
     return str(path)
 
@@ -2875,7 +2887,19 @@ def _create_session(body: dict) -> dict:
         if prompt.strip():
             mid = add_message(sid, prompt, kind="initial")
             set_message(mid, status=FAILED, last_error=str(exc.detail)[:2000])
-        raise
+        # La riga e il prompt esistono gia': il client deve poter aprire quella
+        # scheda invece di restare sul form dando l'impressione che non sia
+        # stato registrato nulla. Il dettaglio resta una stringa per non
+        # rompere i chiamanti interni che intercettano HTTPException.
+        raise HTTPException(
+            exc.status_code,
+            exc.detail,
+            headers={
+                **(exc.headers or {}),
+                "X-Agent-Hub-Error-Code": "launch_failed",
+                "X-Agent-Hub-Session-Id": sid,
+            },
+        ) from exc
     with db() as conn:
         conn.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
     row["status"] = "running"

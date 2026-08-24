@@ -44,12 +44,13 @@ function toast(msg, kind = "ok") {
 // suggerimento su cosa fare.
 
 class ApiError extends Error {
-  constructor(status, detail, operation, code) {
+  constructor(status, detail, operation, code, sessionId) {
     super(detail || `HTTP ${status}`);
     this.status = status;
     this.detail = detail;
     this.operation = operation;
     this.code = code || "";
+    this.sessionId = sessionId || "";
   }
   get hint() {
     if (this.code === "csrf") return "Ricarica la pagina: la sessione del backend è cambiata.";
@@ -113,7 +114,9 @@ async function rawApi(path, opts, operation) {
   const data = ct.includes("json") ? await r.json().catch(() => ({})) : await r.text();
   if (!r.ok) {
     const detail = (data && (data.detail || data.error)) || (typeof data === "string" ? data.slice(0, 300) : "");
-    throw new ApiError(r.status, detail, operation, data && data.code);
+    const code = (data && data.code) || r.headers.get("X-Agent-Hub-Error-Code") || "";
+    const sessionId = r.headers.get("X-Agent-Hub-Session-Id") || "";
+    throw new ApiError(r.status, detail, operation, code, sessionId);
   }
   return data;
 }
@@ -424,6 +427,7 @@ const LIFECYCLE = {
   USAGE_LIMIT: ["Limite d'uso", "launching"],
   RUNNING: ["Al lavoro", "running"],
   STARTING: ["Avvio", "starting"],
+  LAUNCH_FAILED: ["Avvio fallito", "failed"],
 };
 
 function lifecycleTag(s) {
@@ -1621,7 +1625,15 @@ async function viewNewSession() {
       const r = await post("/api/sessions", body, "creazione sessione");
       toast("Sessione avviata (consegna prompt: " + r.delivery + ")");
       location.hash = "#/session/" + r.session.id;
-    } catch (e) { showError(e, $("#s-err")); $("#s-go").disabled = false; }
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "launch_failed" && e.sessionId) {
+        toast("Avvio fallito: sessione e prompt sono stati salvati", "err");
+        location.hash = "#/session/" + encodeURIComponent(e.sessionId);
+      } else {
+        showError(e, $("#s-err"));
+        $("#s-go").disabled = false;
+      }
+    }
   };
 }
 
@@ -1777,6 +1789,8 @@ function statusStrip(st) {
 // Gli stati che chiedono un intervento dicono anche quale, senza inventare
 // nulla: il testo del riquadro deriva soltanto dallo stato calcolato.
 const LIFECYCLE_NOTE = {
+  LAUNCH_FAILED: ["errbox compact", "L'harness non è stato avviato. Il prompt è stato salvato " +
+    "e resta disponibile nei messaggi della sessione."],
   NEEDS_INPUT: ["warnbox", "L'agente ha dichiarato di attendere una tua risposta."],
   WAITING_SESSION: ["warnbox", "L'agente attende il completamento di un'altra sessione. " +
     "Agent Hub lo riprenderà automaticamente quando la dipendenza termina."],

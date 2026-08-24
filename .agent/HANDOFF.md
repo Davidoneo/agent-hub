@@ -1,5 +1,40 @@
 # Handoff
 
+## 2026-08-24 — Cross-account prompt handoff repaired
+
+Status: implemented, deployed, and verified on the local Agent Hub instance.
+
+### Behavior
+
+- Moved transient prompt files out of the service-private socket directory and
+  into `/run/agent-hub-inputs`, managed as `0710 agenthub:agentprojects`.
+  Agent accounts can traverse the directory for the exact random filename they
+  receive, while they cannot list other prompt files.
+- `session-ctl` accepts only the new input directory (plus the existing private
+  `/tmp/agent-hub-*` compatibility path). Launch failures are now classified as
+  `LAUNCH_FAILED`; the persisted session and prompt remain visible instead of
+  looking like a lost form submission.
+- The HTTP exception handler now preserves the diagnostic response headers
+  consumed by the UI, so a failed launch opens the saved session detail.
+
+### Verification
+
+- Source checks pass: 12 Python files compile, JavaScript parses, 18 unit tests
+  pass, `git diff --check` passes, and the Ansible safety playbook passes.
+- Existing explicit initial-prompt test delivered `PROMPT_HANDOFF_OK` and
+  recorded `COMPLETED`. A post-restart HTTPS/CSRF follow-up delivered by paste,
+  produced `FOLLOWUP_PROMPT_OK`, and recorded a second `COMPLETED` report.
+- Restarting only `agent-hub.service` preserved the two real tmux sessions.
+  The completed test pane was then closed through the API while its DB history
+  and transcript were retained.
+- Live/source files are aligned. The pre-audit backend is recoverable under
+  `/opt/agent-hub/backups/host/20260824-prompt-handoff-audit/`.
+
+### Residual work
+
+- No GitHub push was requested or performed; publish the local infrastructure
+  commits separately when desired.
+
 ## 2026-08-20 — Session status, project tiles, and nested meetings restored
 
 Status: implemented, tested, and deployed to the local Agent Hub instance.

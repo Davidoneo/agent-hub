@@ -90,6 +90,21 @@ class ServiceTemplateTests(unittest.TestCase):
         self.assertIn("SocketMode=0600", socket_unit)
         self.assertIn("ListenStream={{ agent_hub_socket }}", socket_unit)
 
+    def test_prompt_files_use_a_separate_cross_account_runtime_directory(self):
+        main = (ROOT / "app/main.py").read_text()
+        session_ctl = (ROOT / "libexec/session-ctl").read_text()
+        tmpfiles = (ROOT / "roles/agent_hub/templates/agent-hub-tmpfiles.conf.j2").read_text()
+        self.assertIn('INPUT_RUNTIME_DIR = Path("/run/agent-hub-inputs")', main)
+        self.assertIn('INPUT_DIRS = ("/run/agent-hub-inputs/",', session_ctl)
+        self.assertIn("d /run/agent-hub-inputs 0710", tmpfiles)
+        self.assertIn("{{ agent_hub_agent_group }}", tmpfiles)
+
+    def test_http_errors_preserve_launch_diagnostics_headers(self):
+        main = (ROOT / "app/main.py").read_text()
+        self.assertIn('"X-Agent-Hub-Error-Code": "launch_failed"', main)
+        self.assertIn('"X-Agent-Hub-Session-Id": sid', main)
+        self.assertIn("headers=exc.headers", main)
+
 
 if __name__ == "__main__":
     unittest.main()

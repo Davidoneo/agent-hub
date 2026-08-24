@@ -52,6 +52,12 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn(".project-tabs {", self.css)
         self.assertIn(".project-panel.active", self.css)
 
+    def test_launch_failure_opens_the_persisted_session(self):
+        self.assertIn('r.headers.get("X-Agent-Hub-Session-Id")', self.app)
+        self.assertIn('e.code === "launch_failed"', self.app)
+        self.assertIn('location.hash = "#/session/" + encodeURIComponent(e.sessionId)', self.app)
+        self.assertIn("LAUNCH_FAILED:", self.app)
+
 
 if __name__ == "__main__":
     unittest.main()

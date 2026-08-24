@@ -57,7 +57,7 @@ UPLOAD_ROOT = "/srv/agent-workspace/uploads"
 SESSION_RE = re.compile(r"^agenthub-[0-9a-f-]{6,40}$")
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-INPUT_DIRS = ("/run/agent-hub/", "/tmp/agent-hub-")
+INPUT_DIRS = ("/run/agent-hub-inputs/", "/tmp/agent-hub-")
 RATE_LIMIT_TITLE = "Approaching rate limits"
 RATE_LIMIT_QUESTION = "for lower credit usage?"
 
