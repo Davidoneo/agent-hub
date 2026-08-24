@@ -1,5 +1,35 @@
 # Handoff
 
+## 2026-08-25 — New-session advanced options clarified
+
+Status: implemented, deployed, and verified on the local Agent Hub instance.
+
+### Behavior
+
+- `Modalità permessi` now lives in the collapsed bottom panel instead of the
+  main new-session form, and that panel is named `Opzioni avanzate`.
+- Terminal sizing fields now read `Larghezza terminale (colonne)` and
+  `Altezza terminale (righe)`. Their help explains that columns are characters
+  per line, rows are visible lines, and both affect TUI layout only.
+- Added a static UI contract that keeps the permission selector inside the
+  advanced panel and preserves the clarified terminal labels.
+
+### Verification
+
+- JavaScript syntax, 21 unit tests, the complete source check, and
+  `git diff --check` pass.
+- Authenticated Chromium rendered the deployed new-session page at 1100x1800:
+  the main form no longer shows the permission selector and the collapsed
+  `Opzioni avanzate` panel is visible at the bottom.
+- Source and live `app.js` are byte-identical. Only that static asset was
+  installed; `agent-hub.service` was not restarted and retained PID 3301127.
+  The previous asset is recoverable under
+  `/opt/agent-hub/backups/host/20260825-new-session-advanced-options/`.
+
+### Residual work
+
+- No commit or GitHub push was requested or performed.
+
 ## 2026-08-25 — Health status and session actions simplified
 
 Status: implemented, deployed, and verified on the local Agent Hub instance.

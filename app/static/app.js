@@ -1331,9 +1331,6 @@ async function viewNewSession() {
       ${help("L'effort viene passato alla CLI all'avvio (Claude Code: --effort, Codex: " +
              "model_reasoning_effort). Più alto significa più ragionamento, più token e più tempo. " +
              "Resta modificabile a sessione avviata dal pannello «Modello ed effort».")}
-      <label>Modalità permessi</label>
-      <select id="s-perm"></select>
-      ${help("full = l'agente non chiede conferme (bypass approvazioni). standard = approvazioni e sandbox attive.")}
 
       <div class="card" id="s-executor-wrap" style="margin-top:14px">
         <label class="inline"><input type="checkbox" id="s-executor-enabled">
@@ -1393,7 +1390,10 @@ async function viewNewSession() {
       <div id="s-err"></div>
 
       <details class="more" id="s-opts">
-        <summary>Opzioni</summary>
+        <summary>Opzioni avanzate</summary>
+        <label>Modalità permessi</label>
+        <select id="s-perm"></select>
+        ${help("full = l'agente non chiede conferme (bypass approvazioni). standard = approvazioni e sandbox attive.")}
         <label>Directory di lavoro
           <span class="help-badge" title="Puoi lasciarla vuota: verrà usata la directory predefinita">?</span></label>
         <div class="row">
@@ -1405,10 +1405,12 @@ async function viewNewSession() {
                "Per PROJECT la directory resta sotto /srv/agent-workspace/projects; se lasci il campo vuoto " +
                `viene usata la radice del progetto (o ${serverHome()} per SERVER).`)}
         <div class="row">
-          <div style="flex:1"><label>Colonne</label><input id="s-cols" value="100" inputmode="numeric"></div>
-          <div style="flex:1"><label>Righe</label><input id="s-rows" value="30" inputmode="numeric"></div>
+          <div style="flex:1"><label>Larghezza terminale (colonne)</label><input id="s-cols" value="100" inputmode="numeric"></div>
+          <div style="flex:1"><label>Altezza terminale (righe)</label><input id="s-rows" value="30" inputmode="numeric"></div>
         </div>
-        ${help("Dimensione del terminale della sessione: conta solo per come la TUI dispone il testo.")}
+        ${help("Dimensione iniziale del terminale della sessione: le colonne indicano quanti caratteri " +
+               "stanno su una riga, le righe quante linee sono visibili. Influenza soltanto " +
+               "l'impaginazione della TUI, non le capacità o il contenuto del modello.")}
       </details>
     </div>`;
 

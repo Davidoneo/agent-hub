@@ -77,6 +77,20 @@ class StaticUiContracts(unittest.TestCase):
         self.assertLess(self.app.index(kill), self.app.index(delete))
         self.assertIn('$("#a-pause").onclick = () => act("pause")', self.app)
 
+    def test_new_session_keeps_technical_controls_in_advanced_options(self):
+        form_start = self.app.index("async function viewNewSession()")
+        form_end = self.app.index("  const envSel =", form_start)
+        form = self.app[form_start:form_end]
+        advanced = form.index('<details class="more" id="s-opts">')
+        permission = form.index('<select id="s-perm"></select>')
+        self.assertEqual(form.count('<select id="s-perm"></select>'), 1)
+        self.assertGreater(permission, advanced)
+        self.assertIn("<summary>Opzioni avanzate</summary>", form)
+        self.assertIn("Larghezza terminale (colonne)", form)
+        self.assertIn("Altezza terminale (righe)", form)
+        self.assertIn("quanti caratteri", form)
+        self.assertIn("quante linee sono visibili", form)
+
 
 if __name__ == "__main__":
     unittest.main()
