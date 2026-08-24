@@ -2060,10 +2060,10 @@ async function viewSession(sid) {
           <button class="key" id="a-up" title="Freccia su: voce precedente" aria-label="Freccia su">▲</button>
           <button class="key" id="a-down" title="Freccia giu: voce successiva" aria-label="Freccia giu">▼</button>
           <button class="key" id="a-enter" title="Invio: conferma la voce evidenziata">Enter</button>
-          <button class="key" id="a-pause" title="Esc: ferma la generazione, la sessione resta viva">Esc</button>
+          <button class="key" id="a-pause" title="Invia Esc: ferma la generazione, la sessione resta viva">Pausa</button>
         </div>
-        <button class="small danger" id="a-kill">Kill</button>
         <button class="small" id="a-restart">Restart</button>
+        <button class="small danger" id="a-kill">Kill</button>
         <button class="small danger" id="a-delete">Elimina</button>
       </div>
       ${help("Invia salva il testo in SQLite prima di consegnarlo: se tmux o la TUI falliscono il testo " +
@@ -2739,6 +2739,43 @@ function applyUsagePanel(on) {
 // OK resta verde: qui «va bene» non significa «in esecuzione».
 const HEALTH_CLS = { OK: "sent", WARNING: "idle", CRITICAL: "failed" };
 
+// La prima vista resta stabile e leggibile anche se agent-hub-health aggiunge
+// controlli: quelli non ancora classificati finiscono sempre in Generale.
+const HEALTH_GROUPS = [
+  { label: "Hardware", names: ["disk", "memory", "load", "temperature"] },
+  { label: "Rete / VPN", names: ["tailscaled", "tailscale_serve"] },
+  { label: "Agent Hub backend", names: [
+    "agent-hub", "agent-hub.socket", "backend_resources", "socket_boundary", "backend_http",
+  ] },
+  { label: "Agent Hub frontend", names: ["agent_hub_end_to_end"] },
+  { label: "Generale", names: [
+    "docker_rootless", "docker_rootful", "tmux_sessions", "tmux_db_coherence",
+    "orphan_agents", "failed_units", "oom_crashes",
+  ] },
+];
+
+function healthSummary(checks) {
+  const buckets = HEALTH_GROUPS.map(g => ({ ...g, checks: [] }));
+  const known = new Map();
+  buckets.forEach((g, index) => g.names.forEach(name => known.set(name, index)));
+  (checks || []).forEach(check => buckets[known.has(check.name) ? known.get(check.name) : buckets.length - 1].checks.push(check));
+
+  const rank = { OK: 0, WARNING: 1, CRITICAL: 2 };
+  return buckets.map(group => {
+    const status = group.checks.reduce((worst, check) =>
+      (rank[check.status] || 0) > (rank[worst] || 0) ? check.status : worst, "OK");
+    const problems = group.checks.filter(check => check.status !== "OK");
+    const detail = problems.length
+      ? problems.map(check => `${check.label}: ${check.detail}`).join(" · ")
+      : `${group.checks.length}/${group.checks.length} controlli OK`;
+    return `<div class="health-group">
+      <div class="row spread"><b>${esc(group.label)}</b>
+        <span class="tag ${HEALTH_CLS[status] || "ended"}">${esc(status)}</span></div>
+      <div class="muted">${esc(detail)}</div>
+    </div>`;
+  }).join("");
+}
+
 function healthCard(h) {
   const last = (h && h.last) || {};
   if (!last.checks) {
@@ -2760,7 +2797,9 @@ function healthCard(h) {
     <div class="muted">Ultimo controllo ${esc(ts(last.generated_at))} · ${last.duration_ms || 0} ms ·
       OK ${last.counts.OK} · WARNING ${last.counts.WARNING} · CRITICAL ${last.counts.CRITICAL}</div>
     <div class="muted mono">timer: ${esc(h.timer_active || "?")}</div>
-    <div class="kv" style="margin-top:10px">${rows}</div>
+    <div class="health-summary">${healthSummary(last.checks)}</div>
+    <details class="more health-details"><summary>Dettagli tecnici (${last.checks.length} controlli)</summary>
+      <div class="kv">${rows}</div></details>
     <div class="row" style="margin-top:10px">
       <button class="small primary" id="hl-run">Esegui controllo ora</button>
       <button class="small" id="hl-copy">Copia sintesi</button>
@@ -2818,34 +2857,35 @@ function renderStatus({ s, dk, health, meta }) {
   view().innerHTML = `<h2>Status</h2>
     ${freshness(meta)}
     <div id="health">${healthCard(health)}</div>
-    <div class="card"><b>Agent Hub service</b>
+    <details class="card more status-details"><summary>Diagnostica tecnica di servizi e sistema</summary>
+    <div class="status-details-body"><b>Agent Hub service</b>
       <div class="mono">${esc(s.service)}</div><pre>${esc(s.service_detail)}</pre></div>
-    <div class="card"><b>Server tmux delle sessioni</b>
+    <div class="status-details-body"><b>Server tmux delle sessioni</b>
       ${help("Le sessioni girano dentro queste unit systemd utente, non dentro agent-hub.service: " +
              "per questo un riavvio del backend non le termina.")}
       <div class="kv">
         <div>${projectUser()}</div><div class="mono">${unit(projectUser())}</div>
         <div>${serverUser()}</div><div class="mono">${unit(serverUser())}</div>
       </div></div>
-    <div class="grid2">
-      <div class="card project"><b>Project Docker — rootless</b>
+    <div class="status-details-body grid2">
+      <div><b>Project Docker — rootless</b>
         <div class="muted mono">utente: devagent</div>
         <pre>${esc(dk.project_docker_rootless.info || "—")}</pre>
         <details><summary>Container</summary><pre>${esc(dk.project_docker_rootless.containers || "(nessuno)")}</pre></details></div>
-      <div class="card server"><b>Server Docker — privileged</b>
+      <div><b>Server Docker — privileged</b>
         <div class="muted mono">utente: hostagent</div>
         <pre>${esc(dk.server_docker_privileged.info || "—")}</pre></div>
     </div>
-    <div class="card"><b>Tailscale</b><pre>${esc(s.tailscale)}</pre>
+    <div class="status-details-body"><b>Tailscale</b><pre>${esc(s.tailscale)}</pre>
       <b>Tailscale Serve</b><pre>${esc(s.tailscale_serve)}</pre></div>
-    <div class="card"><b>Sessioni tmux per utente</b>
+    <div class="status-details-body"><b>Sessioni tmux per utente</b>
       <pre>devagent (${s.tmux_sessions.devagent.length}):\n${esc(s.tmux_sessions.devagent.join("\n") || "—")}\n\nhostagent (${s.tmux_sessions.hostagent.length}):\n${esc(s.tmux_sessions.hostagent.join("\n") || "—")}</pre></div>
-    <div class="card"><b>Versioni harness e strumenti</b>
+    <div class="status-details-body"><b>Versioni harness e strumenti</b>
       <div class="kv">${Object.entries(s.versions).map(([k, v]) =>
         `<div>${esc(k)}</div><div class="mono">${esc(v)}</div>`).join("")}</div></div>
-    <div class="card"><b>Spazio disco</b><pre>${esc(s.disk)}</pre></div>
-    <div class="card"><b>Directory principali</b>
-      <pre>${esc(Object.values(s.dirs).join("\n"))}</pre></div>`;
+    <div class="status-details-body"><b>Spazio disco</b><pre>${esc(s.disk)}</pre></div>
+    <div class="status-details-body"><b>Directory principali</b>
+      <pre>${esc(Object.values(s.dirs).join("\n"))}</pre></div></details>`;
 
   wireHealth($("#health"), health);
 }

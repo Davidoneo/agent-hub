@@ -1,5 +1,42 @@
 # Handoff
 
+## 2026-08-25 — Health status and session actions simplified
+
+Status: implemented, deployed, and verified on the local Agent Hub instance.
+
+### Behavior
+
+- The Status page now presents five stable summaries: Hardware, Network/VPN,
+  Agent Hub backend, Agent Hub frontend, and General. The underlying health
+  collector is unchanged; all 19 deterministic checks remain available under
+  an expandable technical-details section, and unknown future checks fall
+  back to General.
+- The additional service, container, tmux, VPN, version, disk, and directory
+  diagnostics remain available in one collapsed technical section instead of
+  occupying the initial view.
+- The existing Escape-based generation interrupt is now labelled `Pausa` in
+  the session UI. Destructive actions are ordered by impact as Restart, Kill,
+  then Elimina.
+
+### Verification
+
+- Source checks pass: 12 Python files compile, JavaScript parses, 20 unit tests
+  pass, `git diff --check` passes, and the Ansible safety playbook passes.
+- Authenticated Chromium rendered the deployed Status and session-detail
+  pages at 1440x1200. DOM assertions confirmed five summaries, all 19 detailed
+  checks, visible Pause, and Restart before Kill before Elimina.
+- A fresh end-to-end health run reports 19/19 OK. Agent Hub, its private
+  socket, Tailscale, and SSH remain active; no systemd unit is failed.
+- Only `app/static/{app.js,style.css}` was installed. `agent-hub.service` was
+  not restarted and retained its PID and activation timestamp. The previous
+  assets are recoverable under
+  `/opt/agent-hub/backups/host/20260825-status-summary-actions/`.
+
+### Residual work
+
+- No GitHub push was requested or performed; publish the local infrastructure
+  commits separately when desired.
+
 ## 2026-08-24 — Cross-account prompt handoff repaired
 
 Status: implemented, deployed, and verified on the local Agent Hub instance.

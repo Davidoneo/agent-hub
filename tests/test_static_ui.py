@@ -58,6 +58,25 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn('location.hash = "#/session/" + encodeURIComponent(e.sessionId)', self.app)
         self.assertIn("LAUNCH_FAILED:", self.app)
 
+    def test_health_ui_summarizes_without_hiding_checks(self):
+        for label in ("Hardware", "Rete / VPN", "Agent Hub backend", "Agent Hub frontend", "Generale"):
+            self.assertIn(f'label: "{label}"', self.app)
+        self.assertIn('class="health-summary"', self.app)
+        self.assertIn('class="more health-details"', self.app)
+        self.assertIn("Dettagli tecnici (${last.checks.length} controlli)", self.app)
+        self.assertIn('class="card more status-details"', self.app)
+
+    def test_session_actions_expose_pause_and_order_by_impact(self):
+        pause = '<button class="key" id="a-pause"'
+        restart = '<button class="small" id="a-restart">Restart</button>'
+        kill = '<button class="small danger" id="a-kill">Kill</button>'
+        delete = '<button class="small danger" id="a-delete">Elimina</button>'
+        self.assertIn(pause, self.app)
+        self.assertIn(">Pausa</button>", self.app)
+        self.assertLess(self.app.index(restart), self.app.index(kill))
+        self.assertLess(self.app.index(kill), self.app.index(delete))
+        self.assertIn('$("#a-pause").onclick = () => act("pause")', self.app)
+
 
 if __name__ == "__main__":
     unittest.main()

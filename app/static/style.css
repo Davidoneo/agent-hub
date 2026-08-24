@@ -241,6 +241,19 @@ details.more[open] > summary::before { content: "▾"; }
 details.more > summary:hover { color: var(--fg); }
 details.more .kv { margin-top: 6px; }
 
+.health-summary {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px; margin-top: 10px;
+}
+.health-group {
+  min-width: 0; padding: 9px 10px; border: 1px solid var(--line);
+  border-radius: 9px; background: var(--panel2);
+}
+.health-group .muted { margin-top: 4px; }
+.health-details { margin-top: 8px; }
+.status-details > summary { font-size: 14px; font-weight: 600; }
+.status-details-body { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+
 #toast {
   position: fixed; left: 50%; transform: translateX(-50%); bottom: 20px;
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
