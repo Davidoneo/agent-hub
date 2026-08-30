@@ -50,14 +50,14 @@ CHANNEL = "telegram"
 
 # Stati dedotti dal controller che meritano un avviso. Gli stati dichiarati
 # dall'agente si notificano tutti, perche' e' l'agente ad averlo chiesto.
-ALERT_LIFECYCLES = ("CRASHED", "ENDED_UNREPORTED", "AUTH_REQUIRED",
-                    "USAGE_LIMIT", "POSSIBLY_STALLED")
+ALERT_LIFECYCLES = ("NEEDS_INPUT", "CRASHED", "ENDED_UNREPORTED", "AUTH_REQUIRED",
+                    "USAGE_LIMIT", "DELIVERY_FAILED", "POSSIBLY_STALLED")
 
 ICON = {
     "COMPLETED": "✅", "NEEDS_INPUT": "❓", "WAITING_SESSION": "⏸",
     "NEEDS_HOST_ACTION": "🛠",
     "FAILED": "❌", "CANCELLED": "⚪", "CRASHED": "💥",
-    "ENDED_UNREPORTED": "⚠️", "POSSIBLY_STALLED": "🐢",
+    "ENDED_UNREPORTED": "⚠️", "DELIVERY_FAILED": "📨", "POSSIBLY_STALLED": "🐢",
     "AUTH_REQUIRED": "🔑", "USAGE_LIMIT": "⏳", "RUNNING": "▶️", "STARTING": "🚀",
     "OK": "✅", "WARNING": "⚠️", "CRITICAL": "🚨",
 }
@@ -66,7 +66,8 @@ LABEL = {
     "WAITING_SESSION": "In attesa di un'altra sessione",
     "NEEDS_HOST_ACTION": "Richiede azione host", "FAILED": "Fallito",
     "CANCELLED": "Annullato", "CRASHED": "Crash",
-    "ENDED_UNREPORTED": "Concluso senza report", "POSSIBLY_STALLED": "Forse bloccato",
+    "ENDED_UNREPORTED": "Concluso senza report", "DELIVERY_FAILED": "Messaggio non consegnato",
+    "POSSIBLY_STALLED": "Forse bloccato",
     "AUTH_REQUIRED": "Login richiesto", "USAGE_LIMIT": "Limite d'uso",
     "RUNNING": "Al lavoro", "STARTING": "Avvio",
 }
@@ -402,6 +403,13 @@ def session_line(row):
     return " · ".join(b for b in bits if b)
 
 
+def lifecycle_event_key(row):
+    """Identita' stabile dell'occorrenza; le domande possono ripetersi."""
+    base = f"{row['id']}:{row['lifecycle']}"
+    recurrent = {"NEEDS_INPUT", "DELIVERY_FAILED"}
+    return f"{base}:{row['lifecycle_at']}" if row["lifecycle"] in recurrent else base
+
+
 # --------------------------------------------------------------- notifiche
 
 def pending_reports(conn):
@@ -449,7 +457,10 @@ def pending_lifecycles(conn):
         # se l'agente ha dichiarato uno stato, quello e' gia' stato notificato
         if r["report_status"] and r["lifecycle"] == r["report_status"]:
             continue
-        if not already_sent(conn, "lifecycle", f"{r['id']}:{r['lifecycle']}"):
+        # Domande e consegne fallite possono ricorrere piu' volte nella stessa
+        # sessione. La data distingue le occorrenze senza duplicare i poll.
+        key = lifecycle_event_key(r)
+        if not already_sent(conn, "lifecycle", key):
             out.append(r)
     return out
 
@@ -459,6 +470,8 @@ def lifecycle_message(cfg, r):
     label = LABEL.get(r["lifecycle"], r["lifecycle"])
     lines = [f"{icon} {label} · {r['name']}"]
     hint = {
+        "NEEDS_INPUT": "La TUI mostra una domanda interattiva e attende una risposta.",
+        "DELIVERY_FAILED": "Il testo è salvo in Agent Hub ma non è arrivato alla sessione.",
         "CRASHED": f"Processo uscito con codice {r['exit_code'] or '?'}, nessuno stato finale.",
         "ENDED_UNREPORTED": "Terminata senza agent-report: esito da verificare nella trascrizione.",
         "AUTH_REQUIRED": "Login scaduto: rifallo dalla pagina Accounts.",
@@ -514,7 +527,7 @@ def deliver_pending(cfg, chat, first_run=False, state=None):
                       r["status"], session_url(cfg, r["session_id"]))
                      for r in pending_reports(conn)]
         if "lifecycle" in wanted:
-            jobs += [("lifecycle", f"{r['id']}:{r['lifecycle']}", lifecycle_message(cfg, r),
+            jobs += [("lifecycle", lifecycle_event_key(r), lifecycle_message(cfg, r),
                       r["lifecycle"], session_url(cfg, r["id"]))
                      for r in pending_lifecycles(conn)]
         if "health" in wanted:
@@ -522,9 +535,11 @@ def deliver_pending(cfg, chat, first_run=False, state=None):
                       e.get("overall", ""), "")
                      for e in pending_health(conn)]
         active = ui_is_active(cfg)
-        # Questi eventi interrompono anche durante il lavoro attivo. Tutto il
-        # resto e' gia' visibile nella UI e viene archiviato senza Telegram.
+        # Questi eventi critici interrompono anche durante il lavoro attivo.
+        # NEEDS_INPUT resta invece nella UI: se l'utente e' gia' in Agent Hub
+        # un secondo avviso su Telegram sarebbe rumore.
         urgent = {"NEEDS_HOST_ACTION", "FAILED", "CRASHED", "ENDED_UNREPORTED",
+                  "DELIVERY_FAILED",
                   "AUTH_REQUIRED", "USAGE_LIMIT", "CRITICAL"}
         for kind, key, text, detail, button_url in jobs:
             if first_run:

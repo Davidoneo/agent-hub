@@ -18,9 +18,11 @@
 <link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
 </head>
 <body>
+<div id="app-chrome">
 <header>
   <div class="brand">Agent&nbsp;Hub</div>
   <div class="header-right">
+    <button class="ghost small" id="push-toggle" style="display:none" title="Attiva le notifiche push di Agent Hub">notifiche</button>
     <button class="ghost small" id="usage-toggle" title="Mostra o nasconde il pannello del consumo">consumo</button>
     <button class="ghost small" id="help-toggle" title="Mostra o nasconde le spiegazioni">? aiuti</button>
     <button class="ghost small" id="theme-toggle" title="Tema chiaro / scuro / automatico">tema</button>
@@ -37,6 +39,8 @@
   <a href="#/status">Status</a>
 </nav>
 
+<div id="attention" aria-live="polite"></div>
+</div>
 <div id="banner"></div>
 <div id="layout">
   <main id="view"><p class="muted">Caricamento…</p></main>

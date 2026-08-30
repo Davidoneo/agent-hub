@@ -34,7 +34,8 @@ function toast(msg, kind = "ok") {
   t.className = kind;
   t.style.display = "block";
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { t.style.display = "none"; }, kind === "err" ? 9000 : 3500);
+  toast._t = setTimeout(() => { t.style.display = "none"; },
+    kind === "err" ? 9000 : (kind === "attention" ? 6000 : 3500));
 }
 
 // --------------------------------------------------------------- errori
@@ -148,6 +149,112 @@ function recordActivity(force = false) {
   if (!force && t - lastActivityPing < 30_000) return;
   lastActivityPing = t;
   post("/api/activity", {}, "presenza UI").catch(() => {});
+}
+
+// --------------------------------------------------------- Web Push PWA
+
+let pushRegistration = null;
+let pushSubscription = null;
+let pushPresenceTimer = null;
+
+function pushKeyBytes(value) {
+  const padded = value + "=".repeat((4 - value.length % 4) % 4);
+  const raw = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+
+function paintPushButton() {
+  const btn = $("#push-toggle");
+  if (!btn) return;
+  btn.style.display = "inline-flex";
+  if (typeof Notification !== "undefined" && Notification.permission === "denied") {
+    btn.dataset.pushState = "blocked";
+    btn.textContent = "notifiche: bloccate";
+    btn.title = "Riabilita le notifiche dalle impostazioni del telefono";
+    return;
+  }
+  btn.dataset.pushState = pushSubscription ? "on" : "off";
+  btn.textContent = pushSubscription ? "notifiche: on" : "notifiche: off";
+  btn.title = pushSubscription
+    ? "Disattiva le notifiche push su questo dispositivo"
+    : "Attiva le notifiche push su questo dispositivo";
+}
+
+async function registerPushSubscription(sub, visible = !document.hidden) {
+  await post("/api/push/subscriptions", {
+    subscription: sub.toJSON(), visible,
+  }, "registrazione notifiche push");
+}
+
+async function reportPushPresence(visible = !document.hidden) {
+  if (!pushSubscription) return;
+  try {
+    await post("/api/push/presence", {
+      endpoint: pushSubscription.endpoint, visible,
+    }, "presenza notifiche push");
+  } catch (e) { /* il prossimo heartbeat riprova */ }
+}
+
+function reportPushHidden() {
+  if (!pushSubscription || !BOOT) return;
+  fetch("/api/push/presence", {
+    method: "POST", keepalive: true,
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": BOOT.csrf },
+    body: JSON.stringify({ endpoint: pushSubscription.endpoint, visible: false }),
+  }).catch(() => {});
+}
+
+async function setupPush() {
+  const btn = $("#push-toggle");
+  if (!btn || !("serviceWorker" in navigator) || !("PushManager" in window) ||
+      typeof Notification === "undefined") return;
+  let cfg;
+  try {
+    cfg = await api("/api/push", {}, "configurazione notifiche push");
+  } catch (e) { return; }
+  if (!cfg.enabled || !cfg.public_key) return;
+  try {
+    pushRegistration = await navigator.serviceWorker.register("/service-worker.js");
+    await navigator.serviceWorker.ready;
+    pushSubscription = await pushRegistration.pushManager.getSubscription();
+    if (pushSubscription) await registerPushSubscription(pushSubscription);
+  } catch (e) {
+    toast("Notifiche push non inizializzabili: " + (e.message || e), "err");
+  }
+  paintPushButton();
+  clearInterval(pushPresenceTimer);
+  pushPresenceTimer = setInterval(() => reportPushPresence(), 30_000);
+
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      if (pushSubscription) {
+        if (!confirm("Disattivare le notifiche push su questo dispositivo?")) return;
+        const endpoint = pushSubscription.endpoint;
+        await pushSubscription.unsubscribe();
+        await post("/api/push/unsubscribe", { endpoint }, "disattivazione notifiche push");
+        pushSubscription = null;
+        toast("Notifiche push disattivate");
+      } else {
+        const permission = await Notification.requestPermission();
+        if (permission !== "granted") {
+          toast("Permesso notifiche non concesso", "attention");
+          return;
+        }
+        pushSubscription = await pushRegistration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: pushKeyBytes(cfg.public_key),
+        });
+        await registerPushSubscription(pushSubscription, true);
+        toast("Notifiche push attivate su questo dispositivo");
+      }
+    } catch (e) {
+      showError(e instanceof ApiError ? e : new ApiError(0, e.message || String(e), "notifiche push"));
+    } finally {
+      btn.disabled = false;
+      paintPushButton();
+    }
+  };
 }
 
 // Stati delle riunioni in italiano, mappati sui tag CSS esistenti.
@@ -422,6 +529,7 @@ const LIFECYCLE = {
   CANCELLED: ["Annullato", "ended"],
   CRASHED: ["Crash", "failed"],
   ENDED_UNREPORTED: ["Concluso senza report", "unreported"],
+  DELIVERY_FAILED: ["Messaggio non consegnato", "delivery_failed"],
   POSSIBLY_STALLED: ["Forse bloccato", "stalled"],
   AUTH_REQUIRED: ["Login richiesto", "failed"],
   USAGE_LIMIT: ["Limite d'uso", "launching"],
@@ -461,6 +569,75 @@ function stateTags(s) {
   if (s.undelivered) out.push(`<span class="tag delivery_failed">${s.undelivered} testo/i non consegnati</span>`);
   if (s.kind === "login") out.push('<span class="tag login">LOGIN</span>');
   return out.join(" ");
+}
+
+// Notifiche interne: restano visibili sotto la navigazione finche' la causa
+// esiste. Telegram puo' quindi restare silenzioso mentre l'utente sta usando
+// Agent Hub, senza perdere le richieste che arrivano da un'altra sessione.
+const ATTENTION_LIFECYCLES = new Set([
+  "NEEDS_INPUT", "NEEDS_HOST_ACTION", "FAILED", "CRASHED",
+  "ENDED_UNREPORTED", "DELIVERY_FAILED", "POSSIBLY_STALLED", "AUTH_REQUIRED",
+  "USAGE_LIMIT", "LAUNCH_FAILED",
+]);
+let attentionReady = false;
+let attentionSeen = new Set();
+
+function attentionSignature(s) {
+  return `${s.id}:${s.lifecycle}:${s.lifecycle_at || ""}`;
+}
+
+function renderAttention(sessions) {
+  const box = $("#attention");
+  if (!box) return;
+  // La barra segnala lavoro attuale, non riesuma errori storici delle sessioni
+  // gia' chiuse (quelli restano consultabili in dashboard).
+  const active = (sessions || []).filter(s =>
+    ATTENTION_LIFECYCLES.has(s.lifecycle) && sessionIsOpen(s));
+  const signatures = new Set(active.map(attentionSignature));
+  if ("setAppBadge" in navigator && active.length) {
+    navigator.setAppBadge(active.length).catch(() => {});
+  } else if ("clearAppBadge" in navigator && !active.length) {
+    navigator.clearAppBadge().catch(() => {});
+  }
+  const fresh = attentionReady
+    ? active.filter(s => !attentionSeen.has(attentionSignature(s))) : [];
+
+  if (fresh.length) {
+    const first = fresh[0];
+    const label = (LIFECYCLE[first.lifecycle] || [first.lifecycle])[0];
+    toast(fresh.length === 1
+      ? `${first.name}: ${label}`
+      : `${fresh.length} sessioni richiedono attenzione`, "attention");
+  }
+  attentionSeen = signatures;
+  attentionReady = true;
+
+  if (!active.length) {
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = `<div class="attention-panel">
+    <div class="attention-title"><span aria-hidden="true">●</span>
+      <b>Richiede attenzione</b><span class="attention-count">${active.length}</span></div>
+    <div class="attention-items">${active.map(s => {
+      const [label, cls] = LIFECYCLE[s.lifecycle] || [s.lifecycle, "ended"];
+      return `<a href="#/session/${encodeURIComponent(s.id)}" class="attention-item">
+        <span class="attention-name">${esc(s.name)}</span>
+        <span class="tag ${cls}">${esc(label)}</span>
+        <span class="attention-open">Apri →</span></a>`;
+    }).join("")}</div>
+  </div>`;
+}
+
+async function loadAttention() {
+  if (document.hidden) return;
+  try {
+    const d = await api("/api/sessions", {}, "notifiche interne");
+    renderAttention(d.sessions);
+  } catch (e) {
+    // Un polling accessorio non deve coprire la pagina con un errore. Il
+    // riquadro corrente resta visibile e il prossimo giro riprova.
+  }
 }
 
 function compactResult(text, max = 180) {
@@ -2026,10 +2203,10 @@ async function viewSession(sid) {
   const envCls = s.environment === "SERVER" ? "server" : "project";
   const profiles = BOOT.profiles;
   const allDocs = await api("/api/documents", {}, "elenco documenti");
+  const isCodexSession = String(s.profile_id || "").toLowerCase().includes("codex");
 
   view().innerHTML = `
-    <div class="row spread"><h2>${esc(s.name)}</h2>
-      <a class="plain" href="#/"><button class="small">← Dashboard</button></a></div>
+    <h2>${esc(s.name)}</h2>
     <div class="card ${envCls}">
       <div class="row">
         <span class="tag ${envCls}">${envLabel(s)}</span>
@@ -2050,27 +2227,59 @@ async function viewSession(sid) {
     </div>
     ${diagCard(d.diagnostics)}
     <div id="sess-err"></div>
+    <div class="terminal-toolbar" aria-label="Scorrimento terminale">
+      <span>Schermo live</span>
+      <button class="small" id="term-page-up" title="Scorri indietro di una pagina nella cronologia tmux">Pagina su</button>
+      <button class="small" id="term-page-down" title="Scorri avanti di una pagina nella cronologia tmux">Pagina giù</button>
+      <button class="small" id="term-live" title="Torna subito all'output più recente">In fondo / live</button>
+    </div>
     <div id="term"></div>
     <div class="muted" id="ws-state" style="margin-top:6px">connessione…</div>
     <div id="status-strip">${statusStrip(s)}</div>
     <div class="sticky-actions">
       <textarea id="msg" placeholder="Messaggio o prompt multilinea…"></textarea>
-      <div class="row" style="margin-top:8px">
+      <div class="row compose-actions">
         <button class="primary" id="send">Invia</button>
         <button class="small" id="msg-toggle">Messaggi</button>
-        <div class="keypad" role="group" aria-label="Tasti inviati alla TUI">
-          <button class="key" id="a-up" title="Freccia su: voce precedente" aria-label="Freccia su">▲</button>
-          <button class="key" id="a-down" title="Freccia giu: voce successiva" aria-label="Freccia giu">▼</button>
-          <button class="key" id="a-enter" title="Invio: conferma la voce evidenziata">Enter</button>
-          <button class="key" id="a-pause" title="Invia Esc: ferma la generazione, la sessione resta viva">Pausa</button>
+      </div>
+      <div class="terminal-keyboard">
+        <div class="terminal-keyboard-head">
+          <span aria-hidden="true">⌨</span><b>Tastiera terminale</b>
         </div>
+        <div class="terminal-keyboard-rows">
+          <div class="dpad" role="group" aria-label="Frecce inviate alla TUI">
+            <button class="key arrow-key dpad-up" id="a-up" title="Freccia su: voce precedente" aria-label="Freccia su">↑</button>
+            <button class="key arrow-key dpad-left" id="a-left" title="Freccia sinistra: voce o domanda precedente" aria-label="Freccia sinistra">←</button>
+            <button class="key arrow-key dpad-down" id="a-down" title="Freccia giu: voce successiva" aria-label="Freccia giu">↓</button>
+            <button class="key arrow-key dpad-right" id="a-right" title="Freccia destra: voce o domanda successiva" aria-label="Freccia destra">→</button>
+          </div>
+          <div class="key-deck" role="group" aria-label="Tasti inviati alla TUI">
+            <div class="key-row key-row-main">
+              <button class="key" id="a-tab" title="Tab: in Codex apre le note per una risposta libera">Tab</button>
+              <button class="key key-wide" id="a-space" title="Spazio: seleziona o deseleziona la voce">Space</button>
+              <button class="key key-enter" id="a-enter" title="Invio: conferma la voce evidenziata">Enter ↵</button>
+            </div>
+            <div class="key-row key-row-secondary">
+              ${isCodexSession ? `<button class="key" id="a-context" title="Ctrl+T: mostra o nasconde il contesto precedente in Codex">Ctrl+T</button>` : ""}
+              <button class="key" id="a-pause" title="Invia Esc: ferma la generazione, la sessione resta viva">Esc / Pausa</button>
+            </div>
+          </div>
+        </div>
+        <div class="keypad-hint help">
+          ${isCodexSession
+            ? "Codex: usa le frecce per navigare, Space per selezionare, Tab per aggiungere note o una risposta libera e Ctrl+T per leggere il contesto precedente. Enter conferma."
+            : "Usa le frecce per navigare, Space per selezionare, Tab per spostarti nei campi ed Enter per confermare."}
+        </div>
+      </div>
+      <div class="row session-actions">
+        <span class="control-group-label">Azioni sessione</span>
         <button class="small" id="a-restart">Restart</button>
         <button class="small danger" id="a-kill">Kill</button>
         <button class="small danger" id="a-delete">Elimina</button>
       </div>
       ${help("Invia salva il testo in SQLite prima di consegnarlo: se tmux o la TUI falliscono il testo " +
              "resta recuperabile dal pulsante «Messaggi». Il tastierino manda un tasto vero alla TUI: " +
-             "Su/Giu scelgono la voce di un dialogo, Enter conferma, Esc ferma la generazione lasciando " +
+             "le frecce navigano, Space seleziona, Tab cambia campo, Enter conferma ed Esc ferma la generazione lasciando " +
              "viva la sessione. Per Ctrl-C usa il terminale qui sopra.")}
     </div>
 
@@ -2182,8 +2391,10 @@ async function viewSession(sid) {
 
   // terminale
   const dark = getComputedStyle(document.documentElement).getPropertyValue("--term-bg").trim() || "#000";
+  const mobileTerminal = window.matchMedia("(max-width: 520px)").matches;
   const term = new Terminal({
-    cursorBlink: true, fontSize: 13, scrollback: 20000,
+    cursorBlink: true, fontSize: mobileTerminal ? 14 : 13,
+    lineHeight: mobileTerminal ? 1.1 : 1, scrollback: 20000,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     theme: { background: dark, foreground: "#e6e8ee" },
   });
@@ -2215,8 +2426,25 @@ async function viewSession(sid) {
   let rt, trTimer = null, stateTimer = null, runtimeTimer = null;
   const onResize = () => { clearTimeout(rt); rt = setTimeout(sendResize, 250); };
   window.addEventListener("resize", onResize);
+  // Il layout puo' cambiare senza un resize della finestra (sidebar, scrollbar,
+  // PWA). FitAddon deve seguire la larghezza reale del contenitore.
+  const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(onResize);
+  if (resizeObserver) resizeObserver.observe($("#term"));
+  // Una PWA o tab nascosta non deve continuare a imporre al pane tmux le sue
+  // dimensioni, in concorrenza con il PC. Al ritorno la vista viene ricreata,
+  // si riconnette e diventa il client attivo con le dimensioni correnti.
+  const onVisibility = () => {
+    if (document.hidden) {
+      try { ws.close(); } catch (e) { /* noop */ }
+    } else if (ws.readyState !== WebSocket.OPEN) {
+      setTimeout(route, 0);
+    }
+  };
+  document.addEventListener("visibilitychange", onVisibility);
   cleanup = () => {
     window.removeEventListener("resize", onResize);
+    document.removeEventListener("visibilitychange", onVisibility);
+    if (resizeObserver) resizeObserver.disconnect();
     clearInterval(trTimer);
     clearInterval(stateTimer);
     clearInterval(runtimeTimer);
@@ -2268,7 +2496,7 @@ async function viewSession(sid) {
         try {
           await post(`/api/sessions/${encodeURIComponent(sid)}/messages/${encodeURIComponent(b.dataset.msend)}/resend`,
                      {}, "reinvio messaggio");
-          toast("Testo consegnato alla sessione");
+          toast("Reinvio accodato — la consegna avverrà in ordine");
           await refreshState();
           await reloadMessages();
         } catch (e) { showError(e, $("#sess-err")); b.disabled = false; }
@@ -2441,10 +2669,30 @@ async function viewSession(sid) {
       else if (action === "restart") setTimeout(route, 1200);
     } catch (e) { showError(e, $("#sess-err")); }
   }
+  async function scrollTerminal(action) {
+    try {
+      await post(`/api/sessions/${encodeURIComponent(sid)}/action`, { action }, "scorrimento terminale");
+    } catch (e) { showError(e, $("#sess-err")); }
+  }
+  function sendTuiKey(data) {
+    if (ws.readyState !== 1) {
+      toast("Terminale non connesso: il tasto non è stato inviato", "err");
+      return;
+    }
+    ws.send(data);
+  }
+  $("#a-left").onclick = () => sendTuiKey("\x1b[D");
   $("#a-up").onclick = () => act("up");
   $("#a-down").onclick = () => act("down");
+  $("#a-right").onclick = () => sendTuiKey("\x1b[C");
+  $("#a-space").onclick = () => sendTuiKey(" ");
   $("#a-enter").onclick = () => act("enter");
+  $("#a-tab").onclick = () => sendTuiKey("\t");
+  if ($("#a-context")) $("#a-context").onclick = () => sendTuiKey("\x14");
   $("#a-pause").onclick = () => act("pause");
+  $("#term-page-up").onclick = () => scrollTerminal("scroll-up");
+  $("#term-page-down").onclick = () => scrollTerminal("scroll-down");
+  $("#term-live").onclick = () => scrollTerminal("scroll-bottom");
   $("#a-kill").onclick = () => act("kill", "Terminare la sessione tmux?");
   $("#a-restart").onclick = () => act("restart", "Riavviare la sessione con lo stesso profilo e prompt iniziale?");
   $("#a-delete").onclick = () => act("delete", "Eliminare sessione, messaggi e log?");
@@ -2687,7 +2935,7 @@ function usagePanel(items, meta) {
     </div>`;
   }).join("");
   return `<div class="card"><div class="row spread"><b>Consumo dei piani</b>
-      <button class="ghost small" id="us-refresh" title="Interroga subito i provider">⟳</button></div>
+      <button class="ghost small" id="us-refresh" title="Rileggi ora i provider (non rinnova le credenziali OAuth)">⟳</button></div>
     ${help("Percentuali lette dalla stessa sorgente che ogni CLI usa per il proprio indicatore: " +
            "nessuna stima locale e nessun conteggio di token. Un giro in background le rilegge " +
            "ogni pochi minuti; questo pannello rilegge il database ogni minuto e non attende " +
@@ -2716,8 +2964,13 @@ async function loadUsagePanel() {
       btn.disabled = true;
       btn.textContent = "…";
       try {
-        await post("/api/usage/refresh", {}, "lettura consumo");
-        toast("Consumo riletto");
+        const refreshed = await post("/api/usage/refresh", {}, "lettura consumo");
+        const staleClaude = (refreshed.usage || []).find(u =>
+          u.provider === "claude" && u.status === "unverified" &&
+          /token locale scaduto/i.test(u.error || ""));
+        toast(staleClaude
+          ? "Provider riletti. Il rinnovo automatico Claude non è riuscito: avvia Claude Code; Agent Hub non va riavviato."
+          : "Consumo riletto", staleClaude ? "attention" : "ok");
       } catch (e) { showError(e); }
       loadUsagePanel();
     };
@@ -3408,6 +3661,9 @@ function applyTheme(mode) {
   // quindi ripeterla ogni minuto non costa nulla.
   applyUsagePanel(localStorage.getItem("agenthub-usage") !== "0");
   setInterval(loadUsagePanel, 60_000);
+  loadAttention();
+  setInterval(loadAttention, 10_000);
+  setupPush();
 
   ["pointerdown", "keydown", "touchstart", "wheel"].forEach(type =>
     document.addEventListener(type, () => recordActivity(), { passive: true, capture: true }));
@@ -3419,10 +3675,16 @@ function applyTheme(mode) {
   // l'impronta servita dal backend la ricarica dopo il prossimo deploy.
   setInterval(() => refreshBoot().catch(() => {}), 60_000);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) { refreshBoot().catch(() => {}); loadUsagePanel(); recordActivity(true); }
+    if (!document.hidden) {
+      refreshBoot().catch(() => {});
+      loadUsagePanel();
+      loadAttention();
+      recordActivity(true);
+      reportPushPresence(true);
+    } else {
+      reportPushHidden();
+    }
   });
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/service-worker.js").catch(() => {});
-  }
+  window.addEventListener("pagehide", reportPushHidden);
   route();
 })();

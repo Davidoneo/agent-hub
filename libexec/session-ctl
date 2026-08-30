@@ -18,9 +18,12 @@ Il socket dedicato e' `agenthub` (`tmux -L agenthub`).
 import fcntl
 import json
 import os
+import pty
 import pwd
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -48,6 +51,8 @@ def _cfg(key, default):
 
 PROJECT_UNIX_USER = _cfg("AGENT_HUB_PROJECT_USER", "projectagent")
 SERVER_UNIX_USER = _cfg("AGENT_HUB_SERVER_USER", "serveragent")
+CLAUDE_AUTO_REFRESH = _cfg("AGENT_HUB_CLAUDE_AUTO_REFRESH", "1") == "1"
+CLAUDE_REFRESH_INTERVAL = 20 * 3600
 
 TMUX_SOCKET = "agenthub"
 TMUX_UNIT = "agent-hub-tmux.service"
@@ -60,6 +65,11 @@ UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
 INPUT_DIRS = ("/run/agent-hub-inputs/", "/tmp/agent-hub-")
 RATE_LIMIT_TITLE = "Approaching rate limits"
 RATE_LIMIT_QUESTION = "for lower credit usage?"
+CODEX_PASTE_MIN_DELAY = 12.0
+CODEX_PASTE_MAX_DELAY = 20.0
+SUBMIT_OBSERVE = 5.0
+SUBMIT_RETRY_DELAY = 1.5
+CODEX_SUBMIT_RETRY_DELAY = 3.0
 
 
 def die(msg, code=2):
@@ -384,7 +394,90 @@ def _read_input(path):
     return path
 
 
-def _paste(name, path, env, submit=True):
+def _pane_submit_state(name, env):
+    """Restituisce (morto, titolo) senza interpretare il contenuto del prompt."""
+    r = tmux("display-message", "-p", "-t", name, "-F",
+             "#{pane_dead}\t#{pane_title}", env=env)
+    if r.returncode != 0:
+        return True, ""
+    parts = (r.stdout or "").rstrip("\n").split("\t", 1)
+    return (not parts or parts[0] == "1"), (parts[1] if len(parts) > 1 else "")
+
+
+def _codex_paste_delay(path):
+    """Tempo prudente per uscire dal paste state difettoso di Codex sotto tmux."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    # Il problema cresce con il payload; il contratto Agent Hub porta anche i
+    # follow-up brevi oltre 2 KiB. Il minimo di 12 s supera il caso reale in
+    # cui 8,6 s non sono bastati, senza lasciare attese illimitate.
+    return min(CODEX_PASTE_MAX_DELAY,
+               max(CODEX_PASTE_MIN_DELAY, 10.0 + size / 2048.0))
+
+
+def _observe_submission(name, env, idle_title, composer_signature,
+                        timeout=SUBMIT_OBSERVE):
+    """Osserva che la TUI abbia consumato davvero il submit.
+
+    Tutti gli harness possono cambiare titolo, mostrare il marcatore di
+    interruzione o ridisegnare il composer quando accettano il turno. Un exit
+    code 0 di `tmux send-keys` da solo non e' mai una prova di consegna.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        dead, title = _pane_submit_state(name, env)
+        if dead:
+            return False
+        if title and title != idle_title:
+            return True
+        screen = _screen_text(name, env)
+        if "esc to interrupt" in screen.lower():
+            return True
+        if _screen_signature(screen) != composer_signature:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _screen_signature(text):
+    """Firma conservativa che ignora solo wrapping e righe vuote della TUI."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _submit_after_paste(name, path, env, prof=None):
+    """Invia il submit e ne verifica l'effetto reale per ogni harness."""
+    profile_id = (prof or {}).get("id", "")
+    if profile_id == "codex-openai":
+        # Codex puo' restare nel paste state per diversi secondi sotto tmux.
+        time.sleep(_codex_paste_delay(path))
+    else:
+        _settle(name, env)
+    dead, idle_title = _pane_submit_state(name, env)
+    if dead:
+        return False, "il processo dell'harness e' terminato prima del submit"
+    composer_signature = _screen_signature(_screen_text(name, env))
+    for attempt in range(2):
+        r = tmux("send-keys", "-t", name, "Enter", env=env)
+        if r.returncode != 0:
+            return False, (r.stderr or "send-keys fallito").strip()
+        if _observe_submission(name, env, idle_title, composer_signature):
+            return True, ""
+        if attempt == 0:
+            # Mai un secondo Enter alla cieca: se la schermata e' cambiata il
+            # primo submit ha avuto un effetto e il retry potrebbe confermare
+            # una domanda interattiva appena comparsa.
+            if _screen_signature(_screen_text(name, env)) != composer_signature:
+                return False, ("La TUI ha cambiato schermata senza una prova univoca di submit; "
+                               "retry automatico omesso per non rispondere a eventuali dialoghi")
+            delay = CODEX_SUBMIT_RETRY_DELAY if profile_id == "codex-openai" else SUBMIT_RETRY_DELAY
+            time.sleep(delay)
+    return False, ("La TUI non ha mostrato l'avvio del turno dopo due submit: "
+                   "il testo resta recuperabile nel composer; usa Invia ora")
+
+
+def _paste(name, path, env, submit=True, prof=None):
     """Invia testo (anche multilinea) via buffer tmux: nessun quoting shell.
 
     `paste-buffer -p` racchiude il testo nelle sequenze di *bracketed paste*
@@ -412,16 +505,9 @@ def _paste(name, path, env, submit=True):
     if r.returncode != 0:
         return False, (r.stderr or "paste-buffer fallito").strip()
     if submit:
-        # La TUI deve aver finito di consumare il blocco di paste prima
-        # dell'Invio. Un'attesa fissa e' una scommessa sulla velocita' di
-        # disegno: se il testo e' lungo o la macchina e' carica, l'Invio arriva
-        # dentro il blocco e diventa un a capo invece di inviare — il messaggio
-        # resta nel campo di composizione e la consegna risulta comunque
-        # riuscita. Si aspetta invece che lo schermo smetta di cambiare.
-        _settle(name, env)
-        r = tmux("send-keys", "-t", name, "Enter", env=env)
-        if r.returncode != 0:
-            return False, (r.stderr or "send-keys fallito").strip()
+        ok, err = _submit_after_paste(name, path, env, prof)
+        if not ok:
+            return False, err
     return True, ""
 
 
@@ -591,7 +677,7 @@ def cmd_deliver(argv):
     if not ok:
         print(json.dumps({"ok": False, "method": "paste", "error": err, "trust_confirmed": trusted}))
         sys.exit(4)
-    ok, err = _paste(name, path, env)
+    ok, err = _paste(name, path, env, prof=prof)
     print(json.dumps({"ok": ok, "method": "paste", "error": err, "trust_confirmed": trusted}))
     sys.exit(0 if ok else 5)
 
@@ -624,7 +710,7 @@ def cmd_await_ready(argv):
 
 
 def cmd_send(argv):
-    """send <session> <file> [nosubmit] — incolla il contenuto e preme Invio."""
+    """send <session> <file> [submit|nosubmit] [profile-id] — incolla e invia."""
     if len(argv) < 2:
         die("uso: send <session> <file> [nosubmit]")
     name = check_session(argv[0])
@@ -639,7 +725,11 @@ def cmd_send(argv):
         ok, err = menu
         print(json.dumps({"ok": ok, "method": "menu-choice", "error": err}))
         sys.exit(0 if ok else 4)
-    ok, err = _paste(name, path, env, submit=(len(argv) < 3 or argv[2] != "nosubmit"))
+    prof = None
+    if len(argv) > 3 and argv[3]:
+        prof = load_profiles().get(argv[3]) or die("profilo sconosciuto")
+    ok, err = _paste(name, path, env,
+                     submit=(len(argv) < 3 or argv[2] != "nosubmit"), prof=prof)
     print(json.dumps({"ok": ok, "method": "paste", "error": err}))
     sys.exit(0 if ok else 5)
 
@@ -655,6 +745,39 @@ def cmd_keys(argv):
                "up": "Up", "down": "Down"}
     key = mapping.get(argv[1]) or die("tasto non consentito")
     tmux("send-keys", "-t", name, key)
+    print("ok")
+
+
+def cmd_scroll(argv):
+    """scroll <session> <up|down|bottom> — naviga la history tmux.
+
+    Il client web vive nello schermo alternativo di tmux: lo scrollback locale
+    di xterm.js non e' quindi affidabile. La cronologia vera e' nel pane tmux e
+    va navigata tramite copy-mode. `bottom` esce esplicitamente dal copy-mode e
+    torna all'output live, senza inviare tasti alla TUI sottostante.
+    """
+    if len(argv) != 2:
+        die("uso: scroll <session> <up|down|bottom>")
+    name = check_session(argv[0])
+    direction = argv[1]
+    if direction not in ("up", "down", "bottom"):
+        die("direzione scroll non consentita")
+    env = base_env()
+    state = tmux("display-message", "-p", "-t", name, "-F", "#{pane_in_mode}", env=env)
+    if state.returncode != 0:
+        die((state.stderr or "sessione tmux non leggibile").strip(), 3)
+    in_mode = (state.stdout or "").strip() == "1"
+    if direction == "up":
+        r = (tmux("send-keys", "-X", "-t", name, "page-up", env=env) if in_mode
+             else tmux("copy-mode", "-e", "-u", "-t", name, env=env))
+    elif direction == "down":
+        r = (tmux("send-keys", "-X", "-t", name, "page-down", env=env) if in_mode
+             else subprocess.CompletedProcess([], 0, "", ""))
+    else:
+        r = (tmux("send-keys", "-X", "-t", name, "cancel", env=env) if in_mode
+             else subprocess.CompletedProcess([], 0, "", ""))
+    if r.returncode != 0:
+        die((r.stderr or "scorrimento tmux fallito").strip(), 3)
     print("ok")
 
 
@@ -1418,6 +1541,103 @@ def _models_codex():
     return {"models": out, "configured": True}
 
 
+def _claude_oauth_data(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _refresh_claude_oauth(path, previous_expiry):
+    """Avvia solo il bootstrap auth di Claude e lo termina appena rinnova.
+
+    Claude Code non espone un comando di solo refresh. Un normale startup in
+    safe mode rinnova pero' la credenziale prima di mostrare il prompt e non
+    consuma un turno modello. Il lock e il timestamp impediscono processi
+    concorrenti e limitano il workaround a un tentativo ogni 20 ore.
+    """
+    user = me()
+    state = os.path.join(user.pw_dir, ".cache", "agent-hub")
+    try:
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        lock_path = os.path.join(state, "claude-oauth-refresh.lock")
+        lock = open(lock_path, "a+", encoding="utf-8")
+    except OSError:
+        return False
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            lock.seek(0)
+            last = float((lock.read() or "0").strip())
+        except (OSError, ValueError):
+            last = 0
+        if time.time() - last < CLAUDE_REFRESH_INTERVAL:
+            return False
+        current = _claude_oauth_data(path)
+        current_expiry = float(current.get("expiresAt") or 0)
+        if current_expiry > previous_expiry and current_expiry / 1000.0 > time.time():
+            return True
+        try:
+            lock.seek(0)
+            lock.truncate()
+            lock.write(str(time.time()))
+            lock.flush()
+            os.fchmod(lock.fileno(), 0o600)
+        except OSError:
+            return False
+
+        binary = os.path.join(user.pw_dir, ".local", "bin", "claude")
+        if not os.path.isfile(binary):
+            binary = shutil.which("claude", path=base_env()["PATH"]) or ""
+        if not binary:
+            return False
+        master = slave = None
+        proc = None
+        renewed = False
+        try:
+            master, slave = pty.openpty()
+            os.set_blocking(master, False)
+            proc = subprocess.Popen(
+                [binary, "--safe-mode"], stdin=slave, stdout=slave, stderr=slave,
+                cwd=user.pw_dir, env=base_env(), start_new_session=True, close_fds=True)
+            os.close(slave)
+            slave = None
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                try:
+                    os.read(master, 16384)  # impedisce che il buffer PTY blocchi lo startup
+                except (BlockingIOError, OSError):
+                    pass
+                fresh = _claude_oauth_data(path)
+                expiry = float(fresh.get("expiresAt") or 0)
+                if expiry > previous_expiry and expiry / 1000.0 > time.time():
+                    renewed = True
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.25)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            if proc and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=3)
+                except (OSError, subprocess.SubprocessError):
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+            for fd in (master, slave):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        return renewed
+
+
 def _claude_oauth():
     """Credenziale OAuth locale di Claude Code: (token, rinnovabile, errore).
 
@@ -1430,18 +1650,20 @@ def _claude_oauth():
     invece di far sparire modelli che funzionano.
     """
     path = os.path.join(me().pw_dir, ".claude", ".credentials.json")
-    try:
-        with open(path) as fh:
-            oauth = json.load(fh).get("claudeAiOauth") or {}
-    except (OSError, ValueError):
-        oauth = {}
+    oauth = _claude_oauth_data(path)
     token = str(oauth.get("accessToken") or "")
     renewable = bool(oauth.get("refreshToken"))
     if not token:
         return "", renewable, "nessuna credenziale locale"
-    if float(oauth.get("expiresAt") or 0) / 1000.0 <= time.time():
-        return "", renewable, ("token locale scaduto: Claude Code lo rinnova "
-                               "al prossimo avvio, catalogo non verificabile ora")
+    expiry = float(oauth.get("expiresAt") or 0)
+    if expiry / 1000.0 <= time.time():
+        if renewable and CLAUDE_AUTO_REFRESH and _refresh_claude_oauth(path, expiry):
+            oauth = _claude_oauth_data(path)
+            token = str(oauth.get("accessToken") or "")
+            if token and float(oauth.get("expiresAt") or 0) / 1000.0 > time.time():
+                return token, True, ""
+        return "", renewable, ("token locale scaduto: rinnovo automatico non "
+                               "riuscito o gia' tentato oggi")
     return token, renewable, ""
 
 
@@ -1740,7 +1962,7 @@ def cmd_server(argv):
 
 COMMANDS = {
     "start": cmd_start, "send": cmd_send, "deliver": cmd_deliver,
-    "await-ready": cmd_await_ready, "keys": cmd_keys,
+    "await-ready": cmd_await_ready, "keys": cmd_keys, "scroll": cmd_scroll,
     "kill": cmd_kill, "has": cmd_has, "list": cmd_list, "capture": cmd_capture,
     "attach": cmd_attach, "resize": cmd_resize, "login": cmd_login, "info": cmd_info,
     "models": cmd_models, "usage": cmd_usage, "runtime": cmd_runtime,

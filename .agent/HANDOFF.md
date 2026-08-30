@@ -1,5 +1,46 @@
 # Handoff
 
+## 2026-08-30 — Reliable session messaging and attention handling
+
+Status: prepared and verified for the public repository.
+
+### Behavior
+
+- Session messages are persisted before delivery and consumed in order by one
+  worker per session. Interrupted paste deliveries resume after backend
+  restarts; failed deliveries remain recoverable and block later messages
+  instead of being silently overtaken.
+- Submit handling now observes a real TUI transition for Codex, Claude Code and
+  OpenCode. A successful tmux command alone is not recorded as delivery.
+- Interactive TUI questions and delivery failures are explicit attention
+  states. They appear in the web UI and Telegram; optional Web Push supports
+  installed PWAs while suppressing duplicate foreground notifications.
+- The mobile session view now respects device safe areas, preserves useful
+  terminal height, provides structured-answer controls, and navigates tmux
+  history explicitly. Hidden browser tabs no longer keep resizing a shared
+  pane.
+- Optional Claude usage refresh performs a rate-limited safe-mode CLI startup
+  only for an expired renewable local credential and stops before a model
+  prompt is sent.
+
+### Public-repository boundary
+
+- VAPID private keys, Push subscription endpoints, OAuth credentials, Telegram
+  credentials, inventories and instance state remain host-local.
+- New public material contains no live session identifiers, account identities,
+  hostnames, private project names or deployment-specific backup paths.
+  Examples use role variables and synthetic test values.
+
+### Verification
+
+- Python and JavaScript syntax checks and all 52 unit tests pass.
+- Ansible lint, playbook syntax, SSH/firewall regressions and Agent Hub's
+  least-privilege default checks pass.
+- Tests cover queue recovery and ordering, honest multi-harness submission,
+  interactive-question recognition, recurrent attention events, Web Push UI
+  contracts, mobile terminal behavior and safe-area layout.
+- The repository working tree passes the configured Gitleaks scan.
+
 ## 2026-08-25 — Public screenshots and Ansible tooling patched
 
 Status: prepared and verified for the public repository.

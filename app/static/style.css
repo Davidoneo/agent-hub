@@ -71,19 +71,26 @@ body {
   -webkit-text-size-adjust: 100%;
 }
 
+#app-chrome {
+  position: sticky; top: 0; z-index: 10; background: var(--panel);
+  padding-top: env(safe-area-inset-top);
+}
 header {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 10px 12px; background: var(--panel); border-bottom: 1px solid var(--line);
-  position: sticky; top: 0; z-index: 10;
+  padding: 10px calc(12px + env(safe-area-inset-right)) 10px
+    calc(12px + env(safe-area-inset-left));
+  background: var(--panel); border-bottom: 1px solid var(--line);
 }
 .brand { font-weight: 700; letter-spacing: .5px; }
 .header-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .who { color: var(--muted); font-size: 12px; max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 #nav {
-  display: flex; gap: 4px; overflow-x: auto; padding: 8px 10px;
+  display: flex; gap: 4px; overflow-x: auto;
+  padding: 8px calc(10px + env(safe-area-inset-right)) 8px
+    calc(10px + env(safe-area-inset-left));
   background: var(--panel); border-bottom: 1px solid var(--line);
-  position: sticky; top: 51px; z-index: 9; -webkit-overflow-scrolling: touch;
+  -webkit-overflow-scrolling: touch;
 }
 #nav a {
   color: var(--muted); text-decoration: none; padding: 7px 12px;
@@ -101,7 +108,7 @@ main { padding: 14px; max-width: 1100px; margin: 0 auto; }
   max-width: 1420px; margin: 0 auto; align-items: start;
 }
 #layout main { margin: 0; }
-#side { padding: 14px 14px 14px 0; position: sticky; top: 56px; }
+#side { padding: 14px 14px 14px 0; position: sticky; top: 108px; }
 body.usage-off #layout { grid-template-columns: minmax(0, 1fr); max-width: 1100px; }
 body.usage-off #side { display: none; }
 @media (max-width: 1000px) {
@@ -147,22 +154,61 @@ button.ghost { background: transparent; }
 button.small { padding: 6px 10px; font-size: 13px; min-height: 32px; }
 button:disabled { opacity: .5; cursor: default; }
 
-/* Tastierino: i tasti mandati davvero alla TUI, raggruppati per distinguerli
-   dalle azioni sulla sessione (Kill, Restart, Elimina) che le stanno accanto. */
-.keypad {
-  display: inline-flex; align-items: stretch; gap: 0;
-  border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
-  background: var(--panel2);
+/* Tastierino: un oggetto visivo separato dai comandi dell'interfaccia. */
+.compose-actions { margin-top: 8px; }
+.terminal-keyboard {
+  margin-top: 8px; padding: 8px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--pre-bg);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--fg) 4%, transparent);
 }
-.keypad button.key {
-  border: 0; border-radius: 0; background: transparent;
-  padding: 6px 11px; font-size: 13px; min-height: 32px;
+.terminal-keyboard-head {
+  display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px;
+  color: var(--muted); font-size: 12px;
+}
+.terminal-keyboard-head b { color: var(--fg); font-size: 12.5px; }
+.terminal-keyboard-rows {
+  display: grid; grid-template-columns: auto minmax(240px, 1fr);
+  align-items: end; gap: 10px;
+}
+.terminal-keyboard button.key {
+  border: 1px solid var(--line); border-bottom-width: 3px; border-radius: 7px;
+  background: linear-gradient(var(--panel), var(--panel2));
+  padding: 6px 9px; font-size: 12.5px; min-height: 38px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  border-left: 1px solid var(--line);
+  box-shadow: 0 1px 1px color-mix(in srgb, var(--fg) 8%, transparent);
 }
-.keypad button.key:first-child { border-left: 0; }
-.keypad button.key:hover { background: var(--accent); color: var(--accent-fg); }
-.keypad button.key:disabled:hover { background: transparent; color: inherit; }
+.terminal-keyboard button.key:hover { border-color: var(--accent); }
+.terminal-keyboard button.key:active {
+  transform: translateY(1px); border-bottom-width: 2px;
+}
+.terminal-keyboard button.key:disabled:hover { border-color: var(--line); }
+.dpad {
+  display: grid; grid-template-columns: repeat(3, 38px);
+  grid-template-rows: repeat(2, 38px); grid-template-areas:
+    ". up ."
+    "left down right";
+  gap: 4px;
+}
+.dpad .arrow-key {
+  width: 38px; min-height: 38px; padding: 0;
+  font-size: 18px; line-height: 1;
+}
+.dpad-up { grid-area: up; }
+.dpad-left { grid-area: left; }
+.dpad-down { grid-area: down; }
+.dpad-right { grid-area: right; }
+.key-deck { display: grid; gap: 6px; }
+.key-row { display: grid; gap: 6px; }
+.key-row-main { grid-template-columns: .75fr 1.35fr 1fr; }
+.key-row-secondary { grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); }
+.key-row .key { width: 100%; }
+.keypad-hint {
+  margin-top: 6px; color: var(--muted); font-size: 12.5px; line-height: 1.4;
+}
+.session-actions {
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line);
+}
+.control-group-label { color: var(--muted); font-size: 12px; margin-right: 2px; }
 a.plain { text-decoration: none; color: inherit; }
 
 .tag {
@@ -217,9 +263,17 @@ pre.transcript { max-height: 460px; white-space: pre; word-break: normal; overfl
   height: 58vh; min-height: 240px; background: var(--term-bg);
   border: 1px solid var(--line); border-radius: 10px; padding: 6px; overflow: hidden;
 }
+.terminal-toolbar {
+  display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+  margin: 0 0 6px; color: var(--muted); font-size: 12.5px;
+}
+.terminal-toolbar span { margin-right: auto; }
+.terminal-toolbar button { min-height: 30px; }
 .sticky-actions {
   position: sticky; bottom: 0; background: var(--panel);
-  border-top: 1px solid var(--line); padding: 10px; margin: 12px -14px 0;
+  border-top: 1px solid var(--line);
+  padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
+  margin: 12px -14px 0;
   z-index: 5;
 }
 
@@ -255,14 +309,42 @@ details.more .kv { margin-top: 6px; }
 .status-details-body { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
 
 #toast {
-  position: fixed; left: 50%; transform: translateX(-50%); bottom: 20px;
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(20px + env(safe-area-inset-bottom));
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
   padding: 10px 16px; max-width: 92vw; display: none; z-index: 50; font-size: 14px;
   box-shadow: 0 6px 24px rgba(0,0,0,.25); white-space: pre-wrap;
 }
 #toast.err { border-color: var(--danger); color: var(--danger); }
 #toast.ok { border-color: var(--ok); }
+#toast.attention { border-color: var(--warn); color: var(--fg); }
 
+#attention {
+  max-width: 1100px; margin: 0 auto;
+  padding: 0 calc(14px + env(safe-area-inset-right)) 0
+    calc(14px + env(safe-area-inset-left));
+}
+.attention-panel {
+  margin-top: 8px; padding: 8px 10px; border: 1px solid var(--warn);
+  border-left: 4px solid var(--warn); border-radius: 10px;
+  background: color-mix(in srgb, var(--warn) 8%, var(--panel));
+  box-shadow: var(--shadow);
+}
+.attention-title { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.attention-title > span:first-child { color: var(--warn); font-size: 10px; }
+.attention-count {
+  min-width: 20px; padding: 0 6px; border-radius: 999px; text-align: center;
+  background: var(--warn); color: var(--panel); font-size: 11px; font-weight: 700;
+}
+.attention-items { max-height: 132px; overflow: auto; }
+.attention-item {
+  display: flex; align-items: center; gap: 7px; padding: 6px 0;
+  border-top: 1px solid color-mix(in srgb, var(--warn) 24%, transparent);
+  color: inherit; text-decoration: none; font-size: 13px;
+}
+.attention-item:first-child { margin-top: 5px; }
+.attention-name { flex: 1; min-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attention-open { color: var(--accent); white-space: nowrap; }
 #banner { max-width: 1100px; margin: 0 auto; padding: 0 14px; }
 .errbox {
   border: 1px solid var(--danger); border-left: 4px solid var(--danger);
@@ -360,11 +442,57 @@ body.help-on .help { display: block; }
 .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .2s; }
 
 @media (max-width: 520px) {
+  /* Sul telefono tutti i comandi globali devono essere visibili senza una
+     terza riga di intestazione, e le sezioni non devono sembrare troncate. */
+  header {
+    padding-top: 6px; padding-bottom: 6px;
+  }
+  .header-right { flex-wrap: nowrap; gap: 4px; }
+  .header-right button.small {
+    min-height: 34px; padding: 5px 7px; font-size: 12px; white-space: nowrap;
+  }
+  .who { display: none; }
+  #push-toggle {
+    width: 52px; justify-content: center; font-size: 0;
+  }
+  #push-toggle::after { content: "N: off"; font-size: 12px; }
+  #push-toggle[data-push-state="on"]::after { content: "N: on"; }
+  #push-toggle[data-push-state="blocked"]::after { content: "N: !"; }
+  #nav {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    overflow: visible; gap: 3px; padding-top: 6px; padding-bottom: 6px;
+  }
+  #nav a {
+    min-width: 0; padding: 7px 3px; text-align: center; font-size: 13px;
+    overflow: hidden; text-overflow: ellipsis;
+  }
   main { padding: 10px; }
-  .sticky-actions { margin: 12px -10px 0; }
+  .muted { font-size: 14px; }
+  .mono { font-size: 13px; }
+  /* Il blocco arriva a oltre 400 px quando il tastierino va a capo: sticky
+     lo sovrapponeva al terminale fino a nasconderlo quasi interamente. */
+  .sticky-actions {
+    position: static; margin: 12px -10px 0; padding-left: 10px;
+    padding-right: 10px;
+  }
   .kv { grid-template-columns: 1fr; gap: 0 0; }
   .kv div:nth-child(odd) { margin-top: 6px; }
-  #term { height: 46vh; }
+  #term { height: 52vh; min-height: 300px; padding: 4px; }
+  .terminal-toolbar span { display: none; }
+  .terminal-toolbar button {
+    flex: 1; min-width: 0; padding-left: 4px; padding-right: 4px;
+    white-space: nowrap;
+  }
+  .terminal-keyboard-rows {
+    grid-template-columns: auto minmax(0, 1fr); align-items: end; gap: 8px;
+  }
+  .terminal-keyboard button.key { min-height: 40px; padding: 6px 5px; }
+  .dpad {
+    grid-template-columns: repeat(3, 38px); grid-template-rows: repeat(2, 40px);
+  }
+  .dpad .arrow-key { min-height: 40px; padding: 0; }
+  .key-row { gap: 4px; }
+  .attention-item .tag { max-width: 42vw; overflow: hidden; text-overflow: ellipsis; }
 }
 
 /* ---------------------------------------------- dialoghi applicativi

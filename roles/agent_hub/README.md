@@ -6,6 +6,11 @@ OpenCode) driven from a private web UI, reachable only over Tailscale.
 Sessions run inside per-user `tmux` servers, so closing the browser or
 restarting the backend does not stop the work in progress.
 
+Session input is a durable SQLite queue, serialized per session. Backend
+restarts resume interrupted paste deliveries, and delivery failures are raised
+as attention states instead of remaining silent. The wrapper records `sent`
+only after observing that the target TUI consumed the submit.
+
 Opt-in, like every role here. It stays inert until you set:
 
 ```yaml
@@ -75,6 +80,23 @@ Telegram is off by default. Keep the token in a vault:
 agent_hub_telegram_enabled: true
 agent_hub_telegram_token: "{{ vault_agent_hub_telegram_token }}"
 ```
+
+Standards-based Web Push is also opt-in. The role generates the VAPID private
+key directly on the host; do not put that key in inventory:
+
+```yaml
+agent_hub_webpush_enabled: true
+```
+
+After deployment, each device subscribes independently through the
+`notifiche: off` button. On iOS/iPadOS the site must first be added to the Home
+Screen. While that PWA is visible Agent Hub uses its in-app attention panel;
+when it is in the background the service worker shows the system notification.
+
+The Claude usage reader enables `agent_hub_claude_auto_refresh` by default. If
+a renewable local OAuth access token is expired, it performs at most one
+safe-mode CLI startup every 20 hours, stops it as soon as the credential
+changes, and never sends a model prompt.
 
 See `defaults/main.yml` for the full list.
 

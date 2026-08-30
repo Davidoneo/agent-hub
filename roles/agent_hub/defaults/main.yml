@@ -58,3 +58,15 @@ agent_hub_github_log_dir: /var/log/agent-hub
 agent_hub_telegram_enabled: false
 agent_hub_telegram_token: ""
 agent_hub_telegram_chat_ids: []
+
+# Claude Code does not expose a refresh-only command. When its renewable OAuth
+# access token expires, the usage reader may perform one safe-mode startup per
+# Unix account every 20 hours and stop it before any model turn is sent.
+agent_hub_claude_auto_refresh: true
+
+# Standards-based Web Push for installed Agent Hub PWAs. The private VAPID key
+# is generated locally on first install and never belongs in inventory/Git.
+agent_hub_webpush_enabled: false
+agent_hub_webpush_private_key: /etc/agent-hub/webpush-private.pem
+# Empty uses agent_hub_origin at runtime; override with a public mailto: or URL.
+agent_hub_webpush_subject: ""

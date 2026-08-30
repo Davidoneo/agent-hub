@@ -35,7 +35,7 @@
 
 - name: Agent Hub | packages
   ansible.builtin.apt:
-    name: [python3, python3-venv, tmux, sudo, git, curl]
+    name: [python3, python3-venv, tmux, sudo, git, curl, openssl]
     state: present
     update_cache: true
     cache_valid_time: 3600
@@ -193,10 +193,34 @@
 
 - name: Agent Hub | virtualenv
   ansible.builtin.pip:
-    name: [fastapi, "uvicorn[standard]", jinja2, python-multipart]
+    name: [fastapi, "uvicorn[standard]", jinja2, python-multipart, "pywebpush==2.4.0"]
     virtualenv: "{{ agent_hub_root }}/.venv"
     virtualenv_command: python3 -m venv
   notify: Restart agent-hub
+
+- name: Agent Hub | generate the host-local Web Push VAPID key
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - ecparam
+      - -name
+      - prime256v1
+      - -genkey
+      - -noout
+      - -out
+      - "{{ agent_hub_webpush_private_key }}"
+    creates: "{{ agent_hub_webpush_private_key }}"
+  when: agent_hub_webpush_enabled | bool
+  notify: Restart agent-hub
+
+- name: Agent Hub | protect the Web Push VAPID key
+  ansible.builtin.file:
+    path: "{{ agent_hub_webpush_private_key }}"
+    state: file
+    owner: "{{ agent_hub_service_user }}"
+    group: "{{ agent_hub_service_user }}"
+    mode: "0600"
+  when: agent_hub_webpush_enabled | bool
 
 - name: Agent Hub | service configuration
   ansible.builtin.template:

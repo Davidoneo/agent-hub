@@ -22,6 +22,7 @@ causa di un errore di tmux o della TUI.
 from __future__ import annotations
 
 import asyncio
+import base64
 import fcntl
 import fnmatch
 import hashlib
@@ -47,7 +48,19 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+try:
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat, load_pem_private_key,
+    )
+    from pywebpush import WebPushException, webpush as send_webpush
+except ImportError:  # il ruolo installa il supporto; utile per test/source check
+    Encoding = PublicFormat = load_pem_private_key = None
+    WebPushException = Exception
+    send_webpush = None
+
 import transcript as tr
+import delivery_queue as delivery
+import tui_state
 
 # ----------------------------------------------------------------- config
 
@@ -70,6 +83,10 @@ CONFIG = {
     "reports": os.environ.get("AGENT_HUB_REPORTS", "/srv/agent-workspace/reports"),
     "health_dir": os.environ.get("AGENT_HUB_HEALTH_DIR", "/var/lib/agent-hub/health"),
     "presence": os.environ.get("AGENT_HUB_PRESENCE", "/var/lib/agent-hub/ui-activity.json"),
+    "webpush_enabled": os.environ.get("AGENT_HUB_WEBPUSH_ENABLED", "0") == "1",
+    "webpush_private_key": os.environ.get(
+        "AGENT_HUB_WEBPUSH_PRIVATE_KEY", "/etc/agent-hub/webpush-private.pem"),
+    "webpush_subject": os.environ.get("AGENT_HUB_WEBPUSH_SUBJECT", "").strip(),
 }
 
 SESSION_CTL = "/usr/local/libexec/agent-hub/session-ctl"
@@ -184,8 +201,8 @@ REPORT_STATUSES = ("COMPLETED", "NEEDS_INPUT", "WAITING_SESSION",
                    "NEEDS_HOST_ACTION", "FAILED", "CANCELLED")
 # Stati che il controller ricava da fatti osservabili, mai dal contenuto della TUI.
 CONTROLLER_STATUSES = ("RUNNING", "STARTING", "LAUNCH_FAILED", "CRASHED",
-                       "ENDED_UNREPORTED", "POSSIBLY_STALLED", "AUTH_REQUIRED",
-                       "USAGE_LIMIT")
+                       "ENDED_UNREPORTED", "DELIVERY_FAILED", "POSSIBLY_STALLED",
+                       "AUTH_REQUIRED", "USAGE_LIMIT")
 
 ALLOWED_DOC_EXT = {
     ".pdf": "application/pdf",
@@ -452,6 +469,19 @@ def init_db() -> None:
                 sent_at TEXT NOT NULL,
                 detail TEXT DEFAULT '',
                 PRIMARY KEY (channel, kind, key)
+            );
+            -- Sottoscrizioni Web Push per singola installazione/browser. Gli
+            -- endpoint sono credenziali di consegna e restano nel DB privato.
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                id TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL UNIQUE,
+                identity TEXT NOT NULL,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                visibility TEXT NOT NULL DEFAULT 'hidden',
+                visibility_at TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS meetings (
                 id TEXT PRIMARY KEY,
@@ -954,13 +984,16 @@ def usage_loop() -> None:
 
 
 def recover_pending() -> None:
-    """Consegne interrotte da un riavvio del backend: stato onesto, non 'sent'."""
+    """Recupera la coda dopo un riavvio senza perdere i testi registrati.
+
+    Le consegne via paste sono idempotenti quanto permette una TUI: tornano in
+    coda e vengono riverificate dal wrapper. Un prompt gia' passato in argv,
+    invece, e' certamente arrivato alla exec e non deve essere incollato una
+    seconda volta soltanto perche' il backend non ne ha finito la conferma.
+    """
     try:
         with db() as conn:
-            conn.execute(
-                "UPDATE messages SET status=?, last_error=? WHERE status IN (?,?)",
-                (FAILED, "backend riavviato durante la consegna: usa «Invia ora»",
-                 LAUNCHING, PENDING))
+            delivery.recover_pending(conn)
     except sqlite3.Error:
         pass
 
@@ -1201,6 +1234,222 @@ async def record_ui_activity(request: Request):
     return {"active": True, "at": now()}
 
 
+# ------------------------------------------------------------ Web Push PWA
+
+PUSH_LIFECYCLES = {
+    "NEEDS_INPUT", "NEEDS_HOST_ACTION", "FAILED", "CRASHED",
+    "ENDED_UNREPORTED", "DELIVERY_FAILED", "POSSIBLY_STALLED", "AUTH_REQUIRED",
+    "USAGE_LIMIT", "LAUNCH_FAILED",
+}
+PUSH_POLL_SECONDS = 15
+PUSH_VISIBLE_SECONDS = 45
+_PUSH_PUBLIC_KEY = ""
+
+
+def webpush_ready() -> bool:
+    return bool(CONFIG["webpush_enabled"] and send_webpush and
+                load_pem_private_key and Path(CONFIG["webpush_private_key"]).is_file())
+
+
+def webpush_public_key() -> str:
+    """Chiave VAPID pubblica P-256 nel formato richiesto da PushManager."""
+    global _PUSH_PUBLIC_KEY
+    if _PUSH_PUBLIC_KEY:
+        return _PUSH_PUBLIC_KEY
+    if not webpush_ready():
+        return ""
+    try:
+        raw = Path(CONFIG["webpush_private_key"]).read_bytes()
+        private = load_pem_private_key(raw, password=None)
+        point = private.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        _PUSH_PUBLIC_KEY = base64.urlsafe_b64encode(point).rstrip(b"=").decode("ascii")
+    except (OSError, ValueError, TypeError):
+        return ""
+    return _PUSH_PUBLIC_KEY
+
+
+def push_subscription_payload(data: dict) -> tuple[str, str, str]:
+    sub = data.get("subscription") if isinstance(data.get("subscription"), dict) else data
+    endpoint = str(sub.get("endpoint") or "").strip()
+    keys = sub.get("keys") if isinstance(sub.get("keys"), dict) else {}
+    p256dh = str(keys.get("p256dh") or "").strip()
+    auth = str(keys.get("auth") or "").strip()
+    if not endpoint.startswith("https://") or len(endpoint) > 4096:
+        raise HTTPException(400, "endpoint Web Push non valido")
+    if not (20 <= len(p256dh) <= 512 and 8 <= len(auth) <= 256):
+        raise HTTPException(400, "chiavi Web Push non valide")
+    return endpoint, p256dh, auth
+
+
+@app.get("/api/push")
+async def push_config(request: Request):
+    enabled = webpush_ready() and bool(webpush_public_key())
+    with db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM push_subscriptions WHERE identity=?",
+            (identity(request),)).fetchone()[0]
+    return {"enabled": enabled, "public_key": webpush_public_key() if enabled else "",
+            "subscriptions": count}
+
+
+@app.post("/api/push/subscriptions")
+async def register_push(request: Request):
+    if not webpush_ready() or not webpush_public_key():
+        raise HTTPException(503, "Web Push non configurato")
+    data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(400, "sottoscrizione Web Push non valida")
+    endpoint, p256dh, auth = push_subscription_payload(data)
+    login = identity(request)
+    visible = "visible" if data.get("visible") is True else "hidden"
+    stamp = now()
+    with db() as conn:
+        old = conn.execute(
+            "SELECT id FROM push_subscriptions WHERE endpoint=?", (endpoint,)).fetchone()
+        sub_id = old["id"] if old else str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO push_subscriptions "
+            "(id,endpoint,identity,p256dh,auth,visibility,visibility_at,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET "
+            "identity=excluded.identity,p256dh=excluded.p256dh,auth=excluded.auth,"
+            "visibility=excluded.visibility,visibility_at=excluded.visibility_at,"
+            "updated_at=excluded.updated_at",
+            (sub_id, endpoint, login, p256dh, auth, visible, stamp, stamp, stamp))
+    return {"registered": True, "id": sub_id}
+
+
+@app.post("/api/push/unsubscribe")
+async def unregister_push(request: Request):
+    data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(400, "richiesta Web Push non valida")
+    endpoint = str(data.get("endpoint") or "").strip()
+    if not endpoint:
+        raise HTTPException(400, "endpoint Web Push mancante")
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM push_subscriptions WHERE endpoint=? AND identity=?",
+            (endpoint, identity(request))).fetchone()
+        if row:
+            conn.execute("DELETE FROM push_subscriptions WHERE id=?", (row["id"],))
+    return {"registered": False}
+
+
+@app.post("/api/push/presence")
+async def push_presence(request: Request):
+    data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(400, "presenza Web Push non valida")
+    endpoint = str(data.get("endpoint") or "").strip()
+    visible = "visible" if data.get("visible") is True else "hidden"
+    with db() as conn:
+        conn.execute(
+            "UPDATE push_subscriptions SET visibility=?,visibility_at=?,updated_at=? "
+            "WHERE endpoint=? AND identity=?",
+            (visible, now(), now(), endpoint, identity(request)))
+    return {"visibility": visible}
+
+
+def push_event_key(row: dict) -> str:
+    return f"{row['id']}:{row['lifecycle']}:{row.get('lifecycle_at') or ''}"
+
+
+def push_is_visible(subscription: dict) -> bool:
+    if subscription.get("visibility") != "visible":
+        return False
+    try:
+        age = time.time() - datetime.fromisoformat(subscription["visibility_at"]).timestamp()
+    except (TypeError, ValueError):
+        return False
+    return age <= PUSH_VISIBLE_SECONDS
+
+
+def mark_push(sub_id: str, event_key: str, detail: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO notifications(channel,kind,key,sent_at,detail) "
+            "VALUES (?,?,?,?,?)", (f"webpush:{sub_id}", "lifecycle", event_key, now(), detail))
+
+
+def push_was_marked(sub_id: str, event_key: str) -> bool:
+    with db() as conn:
+        return bool(conn.execute(
+            "SELECT 1 FROM notifications WHERE channel=? AND kind='lifecycle' AND key=?",
+            (f"webpush:{sub_id}", event_key)).fetchone())
+
+
+def push_payload(row: dict, attention_count: int) -> dict:
+    label = LIFECYCLE_LABEL.get(row["lifecycle"], row["lifecycle"])
+    summary = re.sub(r"\s+", " ", row.get("report_summary") or "").strip()
+    if len(summary) > 140:
+        summary = summary[:139].rstrip() + "…"
+    body = summary or {
+        "NEEDS_INPUT": "La sessione attende una tua risposta.",
+        "NEEDS_HOST_ACTION": "Serve un intervento amministrativo sull'host.",
+        "DELIVERY_FAILED": "Un testo è salvo ma non è arrivato alla sessione.",
+        "AUTH_REQUIRED": "È necessario rifare il login della harness.",
+        "USAGE_LIMIT": "La harness ha raggiunto il limite d'uso.",
+    }.get(row["lifecycle"], "Apri Agent Hub per controllare la sessione.")
+    return {
+        "title": f"{label} · {row['name']}", "body": body,
+        "url": f"/#/session/{row['id']}",
+        "tag": f"agenthub-{row['id']}-{row['lifecycle']}",
+        "badge": attention_count,
+    }
+
+
+def deliver_webpush_once() -> int:
+    """Consegna le transizioni correnti, una volta per installazione PWA."""
+    if not webpush_ready():
+        return 0
+    with db() as conn:
+        sessions = [dict(r) for r in conn.execute(
+            "SELECT id,name,lifecycle,lifecycle_at,report_summary FROM sessions "
+            "WHERE status='running' AND lifecycle IN (%s)" %
+            ",".join("?" * len(PUSH_LIFECYCLES)), tuple(PUSH_LIFECYCLES))]
+        subscriptions = [dict(r) for r in conn.execute("SELECT * FROM push_subscriptions")]
+    sent = 0
+    for sub in subscriptions:
+        for row in sessions:
+            key = push_event_key(row)
+            if push_was_marked(sub["id"], key):
+                continue
+            if push_is_visible(sub):
+                # Non segnare come consegnato: se l'app passa in background
+                # mentre la richiesta resta aperta, il prossimo giro invia la
+                # push. Finche' e' visibile basta la barra interna.
+                continue
+            try:
+                send_webpush(
+                    subscription_info={"endpoint": sub["endpoint"],
+                                       "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]}},
+                    data=json.dumps(push_payload(row, len(sessions)), ensure_ascii=False),
+                    vapid_private_key=CONFIG["webpush_private_key"],
+                    vapid_claims={"sub": CONFIG["webpush_subject"] or CONFIG["origin"]},
+                    timeout=15,
+                )
+                mark_push(sub["id"], key, row["lifecycle"])
+                sent += 1
+            except WebPushException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", 0)
+                if status in (404, 410):
+                    with db() as conn:
+                        conn.execute("DELETE FROM push_subscriptions WHERE id=?", (sub["id"],))
+                    break
+            except (OSError, ValueError):
+                pass
+    return sent
+
+
+def webpush_loop() -> None:
+    while True:
+        time.sleep(PUSH_POLL_SECONDS)
+        try:
+            deliver_webpush_once()
+        except Exception:  # noqa: BLE001
+            pass  # rete/push service non deve mai fermare Agent Hub
+
+
 @app.get("/api/sessions")
 async def list_sessions():
     live = sync_status()
@@ -1315,6 +1564,7 @@ LIFECYCLE_LABEL = {
     "CANCELLED": "Annullato",
     "CRASHED": "Crash",
     "ENDED_UNREPORTED": "Concluso senza report",
+    "DELIVERY_FAILED": "Messaggio non consegnato",
     "POSSIBLY_STALLED": "Forse bloccato",
     "AUTH_REQUIRED": "Login richiesto",
     "USAGE_LIMIT": "Limite d'uso",
@@ -1352,6 +1602,33 @@ def match_known_error(row: dict) -> str:
             if rx.search(text):
                 return state
     return ""
+
+
+_PANE_SCREEN_CACHE: dict[str, tuple[int, str]] = {}
+
+
+def pane_screen_text(row: dict) -> str:
+    """Schermo visibile del pane, con cache legata all'ultimo output PTY.
+
+    `capture ... 0` parte dalla prima riga visibile e non include la history:
+    una domanda gia' risposta smette quindi subito di valere. La lettura non
+    si allega al pane, non manda input e non ne cambia le dimensioni.
+    """
+    try:
+        stamp = log_path(row).stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    hit = _PANE_SCREEN_CACHE.get(row["tmux_name"])
+    if hit and hit[0] == stamp:
+        return hit[1]
+    try:
+        result = wrapper(row["unix_user"], SESSION_CTL, "capture",
+                         row["tmux_name"], "0", timeout=10)
+        text = result.stdout if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    _PANE_SCREEN_CACHE[row["tmux_name"]] = (stamp, text)
+    return text
 
 
 def report_is_current(row: dict, last: dict) -> bool:
@@ -1402,9 +1679,11 @@ def apply_lifecycle(row: dict, last: dict) -> str:
     elif not row["alive"]:
         if row["status"] == "starting":
             life = "STARTING"
-        elif row["report_status"]:
+        elif current_report:
             # 1. processo concluso con report → si usa il report
             life = row["report_status"]
+        elif last and last.get("status") == FAILED:
+            life = "DELIVERY_FAILED"
         elif row["exit_code"] not in ("", "0", "?"):
             # 3. exit code diverso da zero → crash
             life = "CRASHED"
@@ -1419,8 +1698,15 @@ def apply_lifecycle(row: dict, last: dict) -> str:
         known = match_known_error(row)
         stall = controller_config()["stall_seconds"]
         age = inactivity_age(row, last)
-        if known:
+        if last and last.get("status") == FAILED:
+            life = "DELIVERY_FAILED"
+        elif known:
             life = known
+        elif tui_state.needs_input(row.get("profile_id", ""), pane_screen_text(row)):
+            # Stato osservato dalla cornice interattiva della harness. Non e'
+            # un report dell'agente e sparisce appena il pane viene ridisegnato
+            # dopo la risposta dell'utente.
+            life = "NEEDS_INPUT"
         elif age is not None and age > stall:
             # 4. viva, nessun output o input recente: segnalata, mai terminata
             life = "POSSIBLY_STALLED"
@@ -1494,7 +1780,8 @@ def maybe_nudge(row: dict, last: dict) -> bool:
         return False
     if not row["alive"] or row["status"] != "running":
         return False
-    if row["lifecycle"] in ("WAITING_SESSION", "AUTH_REQUIRED", "USAGE_LIMIT", "STARTING"):
+    if row["lifecycle"] in ("NEEDS_INPUT", "WAITING_SESSION", "AUTH_REQUIRED",
+                             "USAGE_LIMIT", "STARTING"):
         return False               # l'agente e' fermo per un motivo noto
     age = inactivity_age(row, last)
     if age is None or age < cfg["nudge_seconds"] or age > cfg["stall_seconds"]:
@@ -2381,7 +2668,7 @@ def deliver_text(row: dict, mid: str, text: str, *, wait_ready: bool,
                         "1" if row.get("auto_trust", 1) else "0", timeout=300)
         else:
             r = wrapper(row["unix_user"], SESSION_CTL, "send", row["tmux_name"],
-                        path, timeout=90)
+                        path, "submit", row["profile_id"], timeout=120)
     except subprocess.TimeoutExpired:
         set_message(mid, status=FAILED, last_error="timeout del wrapper di consegna")
         return False, "timeout del wrapper di consegna"
@@ -2406,21 +2693,94 @@ def deliver_text(row: dict, mid: str, text: str, *, wait_ready: bool,
     return ok, err
 
 
+_DELIVERY_GUARD = threading.Lock()
+_DELIVERY_ACTIVE: set[str] = set()
+_DELIVERY_WAKE = threading.Event()
+
+
+def delivery_payload(row: dict, message: dict) -> str:
+    """Ricostruisce il testo effettivo dalla copia canonica salvata in SQLite."""
+    text = message.get("text") or ""
+    if message.get("kind") == NUDGE_KIND:
+        return text                 # il sollecito contiene gia' il contratto
+    return with_contract(row, text, initial=message.get("kind") == "initial")
+
+
+def claim_next_delivery(sid: str) -> tuple[dict, dict] | tuple[None, None]:
+    """Prende atomicamente il primo testo della sessione, rispettando l'ordine.
+
+    Un errore o una preparazione iniziale ancora in corso blocca i testi
+    successivi: nessun follow-up puo' scavalcare il proprio predecessore.
+    """
+    with db() as conn:
+        return delivery.claim_next(conn, sid)
+
+
+def pending_delivery_sessions() -> list[str]:
+    with db() as conn:
+        return delivery.pending_sessions(conn)
+
+
+def delivery_worker(sid: str) -> None:
+    """Consuma in ordine la coda di una sola sessione."""
+    try:
+        while True:
+            row, message = claim_next_delivery(sid)
+            if not row or not message:
+                return
+            # attempts contiene il valore prima del claim: >0 significa retry.
+            final = RESENT if int(message.get("attempts") or 0) else SENT
+            try:
+                ok, _err = deliver_text(
+                    row, message["id"], delivery_payload(row, message),
+                    wait_ready=message.get("kind") == "initial",
+                    final_status=final, count_attempt=False)
+            except Exception as exc:  # noqa: BLE001
+                set_message(message["id"], status=FAILED,
+                            last_error=f"errore interno: {exc}"[:2000])
+                ok = False
+            if not ok:
+                return              # l'ordine resta fermo sul testo fallito
+    finally:
+        with _DELIVERY_GUARD:
+            _DELIVERY_ACTIVE.discard(sid)
+        _DELIVERY_WAKE.set()         # recupera un enqueue arrivato sul confine
+
+
+def queue_session_delivery(sid: str) -> None:
+    """Avvia al massimo un consumer per sessione; SQLite resta la coda."""
+    with _DELIVERY_GUARD:
+        if sid in _DELIVERY_ACTIVE:
+            return
+        _DELIVERY_ACTIVE.add(sid)
+    threading.Thread(target=delivery_worker, args=(sid,), daemon=True).start()
+
+
+def delivery_loop() -> None:
+    """Rilegge la coda persistente anche dopo restart o wakeup mancati."""
+    while True:
+        try:
+            for sid in pending_delivery_sessions():
+                queue_session_delivery(sid)
+        except sqlite3.Error:
+            pass
+        _DELIVERY_WAKE.wait(2.0)
+        _DELIVERY_WAKE.clear()
+
+
 def deliver_async(row: dict, mid: str, text: str, *, wait_ready: bool = True,
                   count_attempt: bool = False) -> None:
-    """Consegna in background.
+    """Accoda una consegna persistente e ritorna subito.
 
     La richiesta HTTP termina appena il testo e' al sicuro in SQLite: la pagina
     conferma subito la registrazione e segue lo stato di consegna dal
-    successivo aggiornamento di stato. Nessuna attesa della TUI nel ciclo
-    request/response, che era la causa della latenza percepita all'invio.
+    successivo aggiornamento di stato. `text`, `wait_ready` e `count_attempt`
+    restano nella firma per compatibilita' interna; payload e tentativi vengono
+    ricostruiti dalla riga persistita, cosi' un restart non perde il lavoro.
     """
-    def worker():
-        try:
-            deliver_text(row, mid, text, wait_ready=wait_ready, count_attempt=count_attempt)
-        except Exception as exc:  # noqa: BLE001
-            set_message(mid, status=FAILED, last_error=f"errore interno: {exc}"[:2000])
-    threading.Thread(target=worker, daemon=True).start()
+    del text, wait_ready, count_attempt
+    queue_session_delivery(row["id"])
+    _DELIVERY_WAKE.set()
 
 
 def confirm_argv_async(row: dict, mid: str) -> None:
@@ -2749,8 +3109,8 @@ def register_initial_prompt(row: dict, prompt: str, started: dict) -> str:
     if not prompt.strip():
         return ""
     mid = add_message(row["id"], prompt, kind="initial")
-    bump_attempt(mid)
     if started.get("argv_prompt"):
+        bump_attempt(mid)
         set_message(mid, status=LAUNCHING, method="cli-arg")
         confirm_argv_async(row, mid)
     else:
@@ -2913,6 +3273,8 @@ def _create_session(body: dict) -> dict:
         if prompt.strip():
             mid = add_message(sid, prompt, kind="initial")
             bump_attempt(mid)
+            set_message(mid, status=LAUNCHING,
+                        method="goal" if prompt_as_goal else "setup")
         launch_extras_async(row, mid, prompt, as_goal=prompt_as_goal)
         delivery = "goal" if prompt_as_goal else ("paste" if mid else "none")
     else:
@@ -2957,7 +3319,6 @@ async def post_message(sid: str, request: Request):
         text = text.rstrip() + "\n\n" + documents_block(docs)
     # il testo e' salvato prima del tentativo: un errore di tmux non lo perde
     mid = add_message(sid, text, kind="user")
-    bump_attempt(mid)
     deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
     return {"ok": True, "registered": True, "message": message_row(mid),
             "detail": "Messaggio registrato: la consegna è in corso."}
@@ -2973,14 +3334,13 @@ async def resend_message(sid: str, mid: str):
         raise HTTPException(404, "messaggio inesistente")
     if m["kind"] == "control":
         raise HTTPException(400, "una scelta TUI non puo' essere reinviata come messaggio")
-    # il reinvio risponde dentro la richiesta HTTP: qui l'attesa che la
-    # sessione si liberi resta corta, quanto basta a scavalcare un tool call
-    ok, err = deliver_text(row, mid,
-                           with_contract(row, m["text"], initial=(m["kind"] == "initial")),
-                           wait_ready=False, final_status=RESENT, busy_cap=20.0)
-    if not ok:
-        raise HTTPException(400, f"Reinvio fallito: {err}")
-    return {"ok": True, "message": message_row(mid)}
+    if m["status"] not in (FAILED, PENDING, SENT, RESENT):
+        raise HTTPException(400, "il testo non richiede un reinvio")
+    set_message(mid, status=PENDING, method="", last_error="",
+                note="reinvio accodato")
+    queue_session_delivery(sid)
+    _DELIVERY_WAKE.set()
+    return {"ok": True, "queued": True, "message": message_row(mid)}
 
 
 @app.post("/api/sessions/{sid}/input")
@@ -3002,6 +3362,11 @@ async def session_action(sid: str, request: Request):
         r = wrapper(u, SESSION_CTL, "keys", t, key, timeout=30)
         if r.returncode != 0:
             raise HTTPException(400, (r.stderr or r.stdout).strip() or "invio tasto fallito")
+    elif action in ("scroll-up", "scroll-down", "scroll-bottom"):
+        direction = action.removeprefix("scroll-")
+        r = wrapper(u, SESSION_CTL, "scroll", t, direction, timeout=30)
+        if r.returncode != 0:
+            raise HTTPException(400, (r.stderr or r.stdout).strip() or "scorrimento fallito")
     elif action == "kill":
         wrapper(u, SESSION_CTL, "kill", t, timeout=30)
         with db() as conn:
@@ -3513,7 +3878,6 @@ async def attach_documents(sid: str, request: Request):
     note = (body.get("note") or "").strip()
     text = (note + "\n\n" if note else "") + documents_block(docs)
     mid = add_message(sid, text, kind="user")
-    bump_attempt(mid)
     deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
     return {"ok": True, "registered": True, "documents": docs, "message": message_row(mid),
             "detail": "Percorsi registrati: la consegna è in corso."}
@@ -5540,8 +5904,11 @@ init_db()
 migrate_db()
 recover_pending()
 sweep_runtime()
+threading.Thread(target=delivery_loop, daemon=True).start()
 threading.Thread(target=sweep_loop, daemon=True).start()
 threading.Thread(target=usage_loop, daemon=True).start()
+if webpush_ready():
+    threading.Thread(target=webpush_loop, daemon=True).start()
 if MEETING_WORKERS_ENABLED:
     threading.Thread(target=_meeting_worker, daemon=True).start()
     threading.Thread(target=_action_worker, daemon=True).start()

@@ -5,3 +5,36 @@
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
 self.addEventListener("fetch", () => {});
+
+self.addEventListener("push", event => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (e) { data = {}; }
+  const title = data.title || "Agent Hub richiede attenzione";
+  const options = {
+    body: data.body || "Apri Agent Hub per controllare la sessione.",
+    icon: "/static/icons/icon-192.png",
+    badge: "/static/icons/icon-192.png",
+    tag: data.tag || "agenthub-attention",
+    renotify: true,
+    data: { url: data.url || "/#/" },
+  };
+  const work = [self.registration.showNotification(title, options)];
+  if (Number(data.badge) > 0 && "setAppBadge" in self.navigator) {
+    work.push(self.navigator.setAppBadge(Number(data.badge)));
+  }
+  event.waitUntil(Promise.all(work));
+});
+
+self.addEventListener("notificationclick", event => {
+  event.notification.close();
+  const target = new URL(event.notification.data?.url || "/#/", self.location.origin).href;
+  event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true })
+    .then(async windows => {
+      const current = windows[0];
+      if (current) {
+        if ("navigate" in current) await current.navigate(target);
+        return current.focus();
+      }
+      return self.clients.openWindow ? self.clients.openWindow(target) : undefined;
+    }));
+});
