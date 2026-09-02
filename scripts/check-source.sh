@@ -27,6 +27,7 @@ node --check app/static/app.js
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
   tests/test_report_ctl.py tests/test_meeting_report_ctl.py tests/test_static_ui.py \
   tests/test_health_ctl.py tests/test_tui_state.py tests/test_telegram_ctl.py \
+  tests/test_telegram_outbox_ctl.py \
   tests/test_claude_refresh.py tests/test_session_ctl_delivery.py \
   tests/test_delivery_queue.py
 git diff --check

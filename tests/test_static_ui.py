@@ -69,13 +69,22 @@ class StaticUiContracts(unittest.TestCase):
     def test_session_actions_expose_pause_and_order_by_impact(self):
         pause = '<button class="key" id="a-pause"'
         restart = '<button class="small" id="a-restart">Restart</button>'
-        kill = '<button class="small danger" id="a-kill">Kill</button>'
+        kill = '<button class="small danger" id="a-kill">${escalationHost ? "Chiudi solo host" : "Kill"}</button>'
         delete = '<button class="small danger" id="a-delete">Elimina</button>'
         self.assertIn(pause, self.app)
         self.assertIn(">Esc / Pausa</button>", self.app)
         self.assertLess(self.app.index(restart), self.app.index(kill))
         self.assertLess(self.app.index(kill), self.app.index(delete))
         self.assertIn('$("#a-pause").onclick = () => act("pause")', self.app)
+
+    def test_escalation_sessions_are_linked_and_can_close_as_a_pair(self):
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        self.assertIn("relation_type TEXT DEFAULT ''", backend)
+        self.assertIn('"relations": session_relations(sid)', backend)
+        self.assertIn('action == "kill_pair"', backend)
+        self.assertIn('id="a-kill-pair"', self.app)
+        self.assertIn("Chiudi entrambe", self.app)
+        self.assertIn("Sessioni collegate", self.app)
 
     def test_mobile_tui_controls_cover_structured_answers_and_context(self):
         for control in ("a-left", "a-right", "a-space", "a-tab", "a-context"):
@@ -126,13 +135,15 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("setInterval(loadAttention, 10_000)", self.app)
         self.assertIn(".attention-panel {", self.css)
 
-    def test_delivery_failure_is_visible_attention(self):
+    def test_delivery_failure_is_visible_in_web_attention_only(self):
         backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
         notifier = (ROOT / "libexec/telegram-ctl").read_text(encoding="utf-8")
         self.assertIn('"DELIVERY_FAILED": "Messaggio non consegnato"', backend)
         self.assertIn('"DELIVERY_FAILED"', self.app)
         self.assertIn('"DELIVERY_FAILED"', notifier)
-        self.assertIn('"DELIVERY_FAILED",', notifier.split("urgent =", 1)[1])
+        self.assertNotIn("urgent =", notifier)
+        self.assertIn("deliver_escalations", notifier)
+        self.assertIn("deliver_shares", notifier)
 
     def test_pwa_push_is_opt_in_and_opens_the_session(self):
         worker = (ROOT / "app/static/service-worker.js").read_text(encoding="utf-8")
@@ -143,6 +154,9 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("pushManager.subscribe", self.app)
         self.assertIn('self.addEventListener("push"', worker)
         self.assertIn('self.addEventListener("notificationclick"', worker)
+        self.assertIn('data.type === "dismiss"', worker)
+        self.assertIn('self.addEventListener("message"', worker)
+        self.assertIn('type: "sync-attention"', self.app)
         self.assertIn("clients.openWindow(target)", worker)
         self.assertIn('CREATE TABLE IF NOT EXISTS push_subscriptions', backend)
         self.assertIn('@app.post("/api/push/subscriptions")', backend)

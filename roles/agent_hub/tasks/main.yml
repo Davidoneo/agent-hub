@@ -108,6 +108,16 @@
     directory_mode: "0755"
   notify: Restart agent-hub
 
+- name: Agent Hub | Telegram long-running worker code
+  ansible.builtin.copy:
+    src: "{{ agent_hub_source_root }}/libexec/telegram-ctl"
+    dest: "{{ agent_hub_libexec }}/telegram-ctl"
+    owner: root
+    group: root
+    mode: "0755"
+  when: agent_hub_telegram_enabled | bool
+  notify: Restart agent-hub-telegram
+
 - name: Agent Hub | privileged wrappers
   ansible.builtin.copy:
     src: "{{ agent_hub_source_root }}/libexec/"
@@ -125,6 +135,7 @@
     mode: "0755"
   loop:
     - agent-report
+    - agent-telegram
     - agent-meeting-report
     - agent-document
 

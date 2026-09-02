@@ -594,6 +594,13 @@ function renderAttention(sessions) {
   const active = (sessions || []).filter(s =>
     ATTENTION_LIFECYCLES.has(s.lifecycle) && sessionIsOpen(s));
   const signatures = new Set(active.map(attentionSignature));
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.ready.then(reg => {
+      if (reg.active) reg.active.postMessage({
+        type: "sync-attention", session_ids: active.map(s => s.id),
+      });
+    }).catch(() => {});
+  }
   if ("setAppBadge" in navigator && active.length) {
     navigator.setAppBadge(active.length).catch(() => {});
   } else if ("clearAppBadge" in navigator && !active.length) {
@@ -2204,6 +2211,9 @@ async function viewSession(sid) {
   const profiles = BOOT.profiles;
   const allDocs = await api("/api/documents", {}, "elenco documenti");
   const isCodexSession = String(s.profile_id || "").toLowerCase().includes("codex");
+  const relations = d.relations || { parent: null, children: [] };
+  const escalationHost = s.environment === "SERVER" && s.relation_type === "escalation" &&
+    !!s.parent_session;
 
   view().innerHTML = `
     <h2>${esc(s.name)}</h2>
@@ -2225,6 +2235,20 @@ async function viewSession(sid) {
       ${help("Il processo tmux vive fuori dal cgroup di agent-hub.service: riavviare il backend o chiudere " +
              "il browser non termina la sessione. Lo stato mostrato viene sempre riletto da tmux.")}
     </div>
+    ${(relations.parent || (relations.children || []).length) ? `<div class="card relation-card">
+      <div class="row spread"><b>Sessioni collegate</b>
+        <span class="tag ${escalationHost ? "server" : "idle"}">${
+          escalationHost ? "escalation host" : "continuità"}</span></div>
+      ${relations.parent ? `<div class="relation-row"><span>Chiamante</span>
+        <a href="#/session/${encodeURIComponent(relations.parent.id)}">${esc(relations.parent.name)}</a>
+        <span class="tag ${relations.parent.environment === "SERVER" ? "server" : "project"}">${
+          esc(relations.parent.environment)}</span></div>` : ""}
+      ${(relations.children || []).map(child => `<div class="relation-row"><span>${
+        child.relation_type === "escalation" ? "Escalation" : "Continuazione"}</span>
+        <a href="#/session/${encodeURIComponent(child.id)}">${esc(child.name)}</a>
+        <span class="tag ${child.environment === "SERVER" ? "server" : "project"}">${
+          esc(child.environment)}</span></div>`).join("")}
+    </div>` : ""}
     ${diagCard(d.diagnostics)}
     <div id="sess-err"></div>
     <div class="terminal-toolbar" aria-label="Scorrimento terminale">
@@ -2274,7 +2298,8 @@ async function viewSession(sid) {
       <div class="row session-actions">
         <span class="control-group-label">Azioni sessione</span>
         <button class="small" id="a-restart">Restart</button>
-        <button class="small danger" id="a-kill">Kill</button>
+        <button class="small danger" id="a-kill">${escalationHost ? "Chiudi solo host" : "Kill"}</button>
+        ${escalationHost ? '<button class="small danger" id="a-kill-pair">Chiudi entrambe</button>' : ""}
         <button class="small danger" id="a-delete">Elimina</button>
       </div>
       ${help("Invia salva il testo in SQLite prima di consegnarlo: se tmux o la TUI falliscono il testo " +
@@ -2693,7 +2718,11 @@ async function viewSession(sid) {
   $("#term-page-up").onclick = () => scrollTerminal("scroll-up");
   $("#term-page-down").onclick = () => scrollTerminal("scroll-down");
   $("#term-live").onclick = () => scrollTerminal("scroll-bottom");
-  $("#a-kill").onclick = () => act("kill", "Terminare la sessione tmux?");
+  $("#a-kill").onclick = () => act("kill", escalationHost
+    ? "Chiudere soltanto la sessione host? La sessione chiamante resterà aperta."
+    : "Terminare la sessione tmux?");
+  if ($("#a-kill-pair")) $("#a-kill-pair").onclick = () => act(
+    "kill_pair", "Chiudere sia la sessione host sia la sessione che ha richiesto l'escalation?");
   $("#a-restart").onclick = () => act("restart", "Riavviare la sessione con lo stesso profilo e prompt iniziale?");
   $("#a-delete").onclick = () => act("delete", "Eliminare sessione, messaggi e log?");
 

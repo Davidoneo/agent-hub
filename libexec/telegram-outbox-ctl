@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Accoda condivisioni Telegram senza esporre il token alle sessioni.
+
+`agent-telegram` passa una riga JSON e, per i file, i byte subito dopo. Il
+wrapper gira come account Agent Hub, ricava il chiamante da SUDO_USER e accetta
+soltanto sessioni appartenenti a quel chiamante. Nessuna rete in questo
+processo: la consegna spetta ad agent-hub-telegram.service.
+"""
+import json
+import os
+import pwd
+import re
+import sqlite3
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
+
+
+DB = os.environ.get("AGENT_HUB_DB", "/var/lib/agent-hub/agent-hub.sqlite3")
+OUTBOX_DIR = os.environ.get(
+    "AGENT_HUB_TELEGRAM_OUTBOX", "/var/lib/agent-hub/telegram-outbox")
+SESSION_RE = re.compile(r"^[0-9a-fA-F-]{6,40}$")
+MAX_HEADER = 16 * 1024
+MAX_TEXT = 12_000
+MAX_FILE = 20 * 1024 * 1024
+
+
+def die(message, code=2):
+    print(json.dumps({"ok": False, "error": message}), file=sys.stderr)
+    raise SystemExit(code)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def ensure_schema(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS telegram_outbox (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT DEFAULT '',
+            file_path TEXT DEFAULT '',
+            file_name TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            requested_by TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            sent_at TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_telegram_outbox_status
+            ON telegram_outbox(status, created_at);
+    """)
+
+
+def safe_filename(value):
+    name = os.path.basename(str(value or "")).strip()
+    if not name or name in (".", "..") or len(name.encode("utf-8")) > 240:
+        die("nome file non valido")
+    return name
+
+
+def read_request():
+    header = sys.stdin.buffer.readline(MAX_HEADER + 1)
+    if not header or len(header) > MAX_HEADER or not header.endswith(b"\n"):
+        die("header richiesta mancante o troppo lungo")
+    try:
+        data = json.loads(header.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        die("header JSON non valido")
+    if not isinstance(data, dict):
+        die("header JSON non valido")
+    return data
+
+
+def stage_file(filename):
+    os.makedirs(OUTBOX_DIR, mode=0o700, exist_ok=True)
+    os.chmod(OUTBOX_DIR, 0o700)
+    fd, path = tempfile.mkstemp(prefix="share-", suffix="-" + filename, dir=OUTBOX_DIR)
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            while True:
+                chunk = sys.stdin.buffer.read(min(1024 * 1024, MAX_FILE + 1 - size))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_FILE:
+                    raise ValueError("file troppo grande (massimo 20 MiB)")
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o600)
+        if size == 0:
+            raise ValueError("file vuoto")
+        return path
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def cmd_queue(argv):
+    if len(argv) != 1:
+        die("uso: telegram-outbox-ctl queue <session-id>")
+    caller = os.environ.get("SUDO_USER", "").strip()
+    effective = pwd.getpwuid(os.geteuid()).pw_name
+    if not caller or caller in ("root", effective):
+        die("chiamante sudo non determinabile", 3)
+    sid = argv[0].removeprefix("agenthub-").strip()
+    if not SESSION_RE.fullmatch(sid):
+        die("identificatore sessione non valido")
+    request = read_request()
+    kind = str(request.get("kind") or "").strip()
+    if kind not in ("message", "link", "file"):
+        die("tipo di condivisione non valido")
+    text = str(request.get("text") or "").strip()
+    file_name = file_path = ""
+    if kind == "message":
+        if not text or len(text) > MAX_TEXT:
+            die("messaggio mancante o troppo lungo (massimo 12000 caratteri)")
+    elif kind == "link":
+        url = str(request.get("url") or "").strip()
+        if len(url) > 2048 or not re.fullmatch(r"https?://\S+", url):
+            die("link non valido: usare http:// o https://")
+        text = (text + "\n" if text else "") + url
+    else:
+        file_name = safe_filename(request.get("filename"))
+        if len(text) > 1024:
+            die("didascalia troppo lunga (massimo 1024 caratteri)")
+
+    conn = sqlite3.connect(DB, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    ensure_schema(conn)
+    row = conn.execute("SELECT unix_user FROM sessions WHERE id=?", (sid,)).fetchone()
+    if not row:
+        die("sessione inesistente", 3)
+    if row["unix_user"] != caller:
+        die(f"sessione non appartenente al chiamante {caller}", 3)
+    try:
+        if kind == "file":
+            file_path = stage_file(file_name)
+        item_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO telegram_outbox "
+            "(id,session_id,kind,text,file_path,file_name,status,attempts,last_error,"
+            "requested_by,created_at,sent_at) VALUES (?,?,?,?,?,?,'pending',0,'',?,?,'')",
+            (item_id, sid, kind, text, file_path, file_name, caller[:40], now()))
+        conn.commit()
+    except Exception as exc:
+        if file_path:
+            try:
+                os.unlink(file_path)
+            except OSError:
+                pass
+        die(str(exc), 4)
+    print(json.dumps({"ok": True, "id": item_id, "session_id": sid,
+                      "kind": kind, "status": "pending"}))
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] != "queue":
+        die("comandi: queue")
+    cmd_queue(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

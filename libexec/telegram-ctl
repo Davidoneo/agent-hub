@@ -4,22 +4,22 @@
 Gira come account di servizio sotto `agent-hub-telegram.service`. Due compiti in un solo
 ciclo, senza dipendenze esterne (solo `urllib` della standard library):
 
-  * **notifica** gli eventi gia' prodotti dal controller — stati finali
-    registrati con `agent-report`, stati dedotti che richiedono attenzione,
-    cambi di stato del controllo di salute;
-  * **risponde** ai comandi in arrivo via long polling (`getUpdates`).
+  * risponde ai comandi di stato via long polling (`getUpdates`);
+  * chiede sì/no per le escalation host e inoltra soltanto condivisioni
+    esplicitamente accodate dalle sessioni con `agent-telegram`.
 
 Il notificatore non calcola nulla: legge `session_reports`, `sessions.lifecycle`
 e lo storico di `agent-hub-health`. Se questo servizio e' fermo, l'Agent Hub
 funziona esattamente come prima — l'integrazione e' un consumatore, non un
 componente del percorso critico.
 
-Consegna una sola volta: ogni evento notificato lascia una riga in
-`notifications`, con chiave l'evento e non il messaggio.
+Report, lifecycle e salute non generano messaggi automatici: restano nella UI,
+nelle Web Push e nei comandi on-demand del bot.
 
 Comandi: /start /aiuto /stato /sessioni /sessione <id> /salute /riunioni
-Le sole scritture sono voti e richieste di revisione delle riunioni, limitate
-alle due chat esplicitamente autorizzate; il bot non comanda sessioni o host.
+Le sole scritture provenienti dalla chat sono voti/revisioni delle riunioni e
+decisioni sulle escalation, limitate agli approvatori o alla chat primaria; il
+bot non comanda direttamente sessioni o host.
 
 Uso:
     telegram-ctl run          ciclo continuo (usato dall'unit systemd)
@@ -28,6 +28,7 @@ Uso:
     telegram-ctl pair         mostra le chat che hanno scritto al bot
 """
 import json
+import mimetypes
 import os
 import re
 import sqlite3
@@ -36,6 +37,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 
 CONFIG_FILE = "/etc/agent-hub/telegram.env"
@@ -86,7 +88,7 @@ def log(msg):
 def load_config():
     """Legge il file in stile env. Le chiavi mancanti restano stringhe vuote."""
     cfg = {"token": "", "chat_id": "", "pairing_code": "", "meeting_approvers_csv": "",
-           "origin": "", "notify": "reports,lifecycle,health",
+           "origin": "", "notify": "",
            "poll_timeout": "25", "quiet": "0", "verbosity": "compact",
            "active_pause_seconds": "0"}
     keys = {
@@ -321,9 +323,9 @@ def call_upload(cfg, method, fields, filename, content, content_type, timeout=12
     return payload.get("result")
 
 
-# Telegram accetta file ben piu' grandi, ma una minuta e' testo: oltre questa
-# soglia c'e' un errore da guardare, non un allegato da mandare.
-MAX_ATTACHMENT = 2 * 1024 * 1024
+# Limite intenzionale della coda esplicita: evita di caricare in RAM file
+# arbitrariamente grandi pur restando comodo per PDF e artefatti ordinari.
+MAX_ATTACHMENT = 20 * 1024 * 1024
 
 
 def send_document(cfg, chat, path, caption="", silent=True):
@@ -343,8 +345,9 @@ def send_document(cfg, chat, path, caption="", silent=True):
     if caption:
         fields["caption"] = caption[:1024]
     try:
+        content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
         call_upload(cfg, "sendDocument", fields, os.path.basename(path),
-                    content, "text/markdown")
+                    content, content_type)
         return True
     except TelegramError as exc:
         log(f"invio allegato fallito: {exc}")
@@ -514,46 +517,86 @@ def health_message(cfg, entry):
     return "\n".join(lines)
 
 
+def pending_escalations(conn):
+    return conn.execute(
+        "SELECT e.id,e.session_id,e.scope,e.requested_at,s.name,s.environment,"
+        "s.profile_id,s.project_slug FROM escalation_requests e "
+        "LEFT JOIN sessions s ON s.id=e.session_id WHERE e.status='pending' "
+        "ORDER BY e.requested_at,e.rowid").fetchall()
+
+
+def deliver_escalations(cfg, chat, conn):
+    """Una richiesta PROJECT produce un solo messaggio con scelta sì/no."""
+    sent = 0
+    for row in pending_escalations(conn):
+        if already_sent(conn, "escalation_request", row["id"]):
+            continue
+        text = (f"🛠 Richiesta escalation host · {row['name'] or row['session_id']}\n"
+                f"{session_line(row)}\n\nScope richiesto:\n"
+                f"{clip(row['scope'], 1200) or '(scope non indicato)'}")
+        keyboard = {"inline_keyboard": [[
+            {"text": "✅ Sì, concedi", "callback_data": f"ey:{row['id']}"},
+            {"text": "❌ No, rifiuta", "callback_data": f"en:{row['id']}"},
+        ]]}
+        url = session_url(cfg, row["session_id"])
+        if url:
+            keyboard["inline_keyboard"].append([
+                {"text": "Apri sessione", "url": url},
+            ])
+        if send_long(cfg, chat, text, reply_markup=keyboard,
+                     silent=(cfg["quiet"] == "1")):
+            mark_sent(conn, "escalation_request", row["id"], row["session_id"])
+            sent += 1
+        else:
+            break
+    return sent
+
+
+def pending_shares(conn):
+    return conn.execute(
+        "SELECT o.*,s.name,s.environment FROM telegram_outbox o "
+        "LEFT JOIN sessions s ON s.id=o.session_id "
+        "WHERE o.status IN ('pending','sending') ORDER BY o.created_at,o.rowid").fetchall()
+
+
+def deliver_shares(cfg, chat, conn):
+    """Consegna la coda opt-in; il file di staging sparisce solo dopo il send."""
+    sent = 0
+    for row in pending_shares(conn):
+        conn.execute(
+            "UPDATE telegram_outbox SET status='sending',attempts=attempts+1,last_error='' "
+            "WHERE id=?", (row["id"],))
+        title = f"📨 Da {row['name'] or row['session_id']} ({row['environment'] or '?'})"
+        if row["kind"] == "file":
+            caption = title + ("\n" + row["text"] if row["text"] else "")
+            ok = send_document(cfg, chat, row["file_path"], caption=caption,
+                               silent=(cfg["quiet"] == "1"))
+        else:
+            ok = send_long(cfg, chat, title + "\n\n" + row["text"],
+                           silent=(cfg["quiet"] == "1"))
+        if not ok:
+            conn.execute(
+                "UPDATE telegram_outbox SET status='pending',last_error=? WHERE id=?",
+                ("consegna Telegram non riuscita; nuovo tentativo al prossimo ciclo", row["id"]))
+            break
+        conn.execute(
+            "UPDATE telegram_outbox SET status='sent',sent_at=?,last_error='',file_path='' "
+            "WHERE id=?", (now(), row["id"]))
+        if row["file_path"]:
+            try:
+                os.unlink(row["file_path"])
+            except OSError:
+                pass
+        sent += 1
+    return sent
+
+
 def deliver_pending(cfg, chat, first_run=False, state=None):
-    """Invia gli eventi non ancora notificati. Alla prima esecuzione li marca
-    soltanto: nessuno vuole ricevere in blocco lo storico di ieri.
-    Le riunioni vengono sempre elaborate (non dipendono da notify)."""
-    wanted = {w.strip() for w in cfg["notify"].split(",") if w.strip()}
+    """Consegna solo richieste esplicite, escalation e workflow riunioni."""
     sent = 0
     with db() as conn:
-        jobs = []
-        if "reports" in wanted:
-            jobs += [("report", f"{r['session_id']}:{r['rid']}", report_message(cfg, r),
-                      r["status"], session_url(cfg, r["session_id"]))
-                     for r in pending_reports(conn)]
-        if "lifecycle" in wanted:
-            jobs += [("lifecycle", lifecycle_event_key(r), lifecycle_message(cfg, r),
-                      r["lifecycle"], session_url(cfg, r["id"]))
-                     for r in pending_lifecycles(conn)]
-        if "health" in wanted:
-            jobs += [("health", e.get("at", ""), health_message(cfg, e),
-                      e.get("overall", ""), "")
-                     for e in pending_health(conn)]
-        active = ui_is_active(cfg)
-        # Questi eventi critici interrompono anche durante il lavoro attivo.
-        # NEEDS_INPUT resta invece nella UI: se l'utente e' gia' in Agent Hub
-        # un secondo avviso su Telegram sarebbe rumore.
-        urgent = {"NEEDS_HOST_ACTION", "FAILED", "CRASHED", "ENDED_UNREPORTED",
-                  "DELIVERY_FAILED",
-                  "AUTH_REQUIRED", "USAGE_LIMIT", "CRITICAL"}
-        for kind, key, text, detail, button_url in jobs:
-            if first_run:
-                mark_sent(conn, kind, key, "storico precedente, non notificato")
-                continue
-            if active and detail not in urgent:
-                mark_sent(conn, kind, key, f"{detail} (omesso: UI attiva)")
-                continue
-            if send(cfg, chat, text, silent=(cfg["quiet"] == "1"),
-                    button_url=button_url):
-                mark_sent(conn, kind, key, detail)
-                sent += 1
-            else:
-                break        # Telegram non risponde: si riprova al giro dopo
+        sent += deliver_escalations(cfg, chat, conn)
+        sent += deliver_shares(cfg, chat, conn)
         # Riunioni: sempre attive, non controllate da notify
         if not first_run and chat:
             try:
@@ -818,9 +861,59 @@ def handle_revision_text(cfg, state, chat_id, text, primary_chat):
             raise
 
 
+def handle_escalation_decision(cfg, state, chat_id, request_id, approved):
+    """Registra la scelta; solo il backend può materializzare la sessione host."""
+    if chat_id != chat_id_of(cfg, state):
+        send(cfg, chat_id, "Solo la chat primaria può decidere un'escalation host.")
+        return
+    stamp = now()
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        req = conn.execute(
+            "SELECT e.*,s.name,s.status AS session_status FROM escalation_requests e "
+            "LEFT JOIN sessions s ON s.id=e.session_id WHERE e.id=?", (request_id,)).fetchone()
+        if not req or req["status"] != "pending":
+            conn.rollback()
+            send(cfg, chat_id, "Questa richiesta non è più in attesa di decisione.")
+            return
+        if approved:
+            conn.execute(
+                "UPDATE escalation_requests SET status='approved_queued',decided_at=?,"
+                "decision_chat_id=?,error='' WHERE id=?",
+                (stamp, chat_id, request_id))
+        else:
+            conn.execute(
+                "UPDATE escalation_requests SET status='denied',decided_at=?,"
+                "decision_chat_id=?,error='' WHERE id=?",
+                (stamp, chat_id, request_id))
+            if req["session_status"]:
+                text = ("La richiesta di escalation host è stata rifiutata via Telegram. "
+                        f"Scope richiesto: {req['scope']}\n\n"
+                        "Prosegui senza privilegi host oppure chiedi una decisione diversa all'utente.")
+                conn.execute(
+                    "INSERT INTO messages (id,session_id,kind,text,status,method,attempts,created_at) "
+                    "VALUES (?,?,?,?, 'pending','',0,?)",
+                    (str(uuid.uuid4()), req["session_id"], "escalation", text, stamp))
+                conn.execute(
+                    "UPDATE sessions SET lifecycle='RUNNING',lifecycle_at=? "
+                    "WHERE id=? AND status='running'", (stamp, req["session_id"]))
+        conn.commit()
+    if approved:
+        send(cfg, chat_id,
+             f"✅ Escalation concessa per «{req['name'] or req['session_id']}». "
+             "Agent Hub sta creando la sessione host collegata.")
+    else:
+        send(cfg, chat_id,
+             f"❌ Escalation rifiutata per «{req['name'] or req['session_id']}». "
+             "La risposta è stata rimandata alla sessione chiamante.")
+
+
 def handle_callback(cfg, state, cb_chat_id, cb_data):
     """Instrada i callback delle riunioni."""
-    if cb_data.startswith("ma:"):
+    if cb_data.startswith(("ey:", "en:")):
+        handle_escalation_decision(cfg, state, cb_chat_id, cb_data[3:],
+                                   cb_data.startswith("ey:"))
+    elif cb_data.startswith("ma:"):
         parts = cb_data.split(":")
         if len(parts) >= 3:
             handle_meeting_approve(cfg, state, cb_chat_id,
@@ -849,10 +942,11 @@ MENU = [
     ("aiuto", "Elenco dei comandi e cosa fa ciascuno"),
 ]
 BOT_NAME = "Agent Hub"
-BOT_SHORT = "Notifiche, stato sessioni e approvazione riunioni."
-BOT_ABOUT = ("Notifica gli stati finali registrati dagli agenti, i crash, gli stalli, "
-             "i login scaduti, i limiti d'uso e i cambi di stato del server. "
-             "Consente l'approvazione delle riunioni (scrittura solo per approvatori autorizzati).")
+BOT_SHORT = "Stato on-demand, escalation host e condivisioni esplicite."
+BOT_ABOUT = ("Risponde ai comandi di stato, consente sì/no sulle richieste di "
+             "escalation host e riceve testi, link o file soltanto quando una "
+             "sessione li condivide su richiesta esplicita. Gestisce anche le "
+             "approvazioni delle riunioni autorizzate.")
 SECONDARY_MENU = [
     ("riunioni", "Riunioni in attesa di approvazione o in corso"),
 ]
@@ -875,6 +969,8 @@ def cmd_help():
         "/chatid — identificativo di questa chat (diagnostica)",
         "",
         "L'approvazione delle riunioni richiede due approvatori autorizzati.",
+        "Gli aggiornamenti ordinari non vengono inviati automaticamente: usa i comandi.",
+        "Le sessioni condividono testo, link o file solo su richiesta esplicita.",
         "Le sessioni si comandano dalla pagina web.",
     ]
     return "\n".join(lines)
@@ -1371,7 +1467,7 @@ def check():
     out = {"config_file": CONFIG_FILE,
            "token_presente": bool(cfg["token"]),
            "chat_id": chat_id_of(cfg, state) or "(non associata)",
-           "notify": cfg["notify"], "verbosita": cfg["verbosity"],
+           "notifiche_automatiche": False, "verbosita": cfg["verbosity"],
            "pausa_ui_secondi": cfg["active_pause_seconds"],
            "ui_attiva": ui_is_active(cfg),
            "origin": cfg["origin"] or "(non impostato)",

@@ -25,6 +25,7 @@ class ReportCtlBoundaryTests(unittest.TestCase):
             conn.executescript("""
                 CREATE TABLE sessions (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, unix_user TEXT NOT NULL,
+                    environment TEXT NOT NULL,
                     report_status TEXT DEFAULT '', report_summary TEXT DEFAULT '',
                     reported_at TEXT DEFAULT '', waiting_for_session TEXT DEFAULT ''
                 );
@@ -33,9 +34,9 @@ class ReportCtlBoundaryTests(unittest.TestCase):
                     summary TEXT NOT NULL, waiting_for_session TEXT NOT NULL,
                     reported_at TEXT NOT NULL, source TEXT NOT NULL, unix_user TEXT NOT NULL
                 );
-                INSERT INTO sessions (id,name,unix_user) VALUES
-                    ('aaaaaa','project','devagent'),
-                    ('bbbbbb','server','hostagent');
+                INSERT INTO sessions (id,name,unix_user,environment) VALUES
+                    ('aaaaaa','project','devagent','PROJECT'),
+                    ('bbbbbb','server','serveragent','SERVER');
             """)
 
     def tearDown(self):
@@ -86,6 +87,28 @@ class ReportCtlBoundaryTests(unittest.TestCase):
                 "SELECT report_status FROM sessions WHERE id='bbbbbb'"
             ).fetchone()[0]
         self.assertEqual(status, "")
+
+    def test_project_host_action_creates_telegram_approval_request(self):
+        result = self.run_ctl(
+            "devagent", "report", "aaaaaa", "NEEDS_HOST_ACTION",
+            "Installare il pacchetto host X, senza modificare la rete", "",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["escalation_request_id"])
+        with sqlite3.connect(self.db) as conn:
+            request = conn.execute(
+                "SELECT session_id,scope,status FROM escalation_requests"
+            ).fetchone()
+        self.assertEqual(request, (
+            "aaaaaa", "Installare il pacchetto host X, senza modificare la rete", "pending"))
+
+    def test_server_host_action_does_not_request_another_escalation(self):
+        result = self.run_ctl(
+            "serveragent", "report", "bbbbbb", "NEEDS_HOST_ACTION", "serve presenza fisica", "",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["escalation_request_id"], "")
 
     def test_waiting_session_records_structured_dependency(self):
         result = self.run_ctl(

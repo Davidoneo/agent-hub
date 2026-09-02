@@ -364,6 +364,12 @@ details.more .kv { margin-top: 6px; }
   background: color-mix(in srgb, var(--ok) 8%, var(--panel));
   border-radius: 10px; padding: 8px 10px; margin: 8px 0; font-size: 13px;
 }
+.relation-card { display: grid; gap: 7px; }
+.relation-row {
+  display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr) auto;
+  align-items: center; gap: 9px; padding-top: 7px; border-top: 1px solid var(--line);
+}
+.relation-row > span:first-child { color: var(--muted); font-size: 12px; }
 
 /* Modello ed effort in esercizio: riga sempre visibile nell'intestazione
    della sessione, dettaglio e controlli dietro un clic. */

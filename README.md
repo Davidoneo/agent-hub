@@ -10,7 +10,8 @@ servers, survive browser and backend restarts, and are separated into:
 Messages are stored in SQLite before delivery and consumed in order by one
 worker per session. Interrupted paste deliveries return to the durable queue
 after a backend restart; a failed delivery remains recoverable and becomes an
-explicit UI, Telegram and Web Push attention state. A successful tmux key
+explicit UI and Web Push attention state. Telegram stays on-demand except for
+host-escalation approval, meeting approval and explicitly requested shares. A successful tmux key
 injection is not treated as proof by itself: the wrapper observes the TUI
 transition for Codex, Claude Code and OpenCode before recording `sent`.
 

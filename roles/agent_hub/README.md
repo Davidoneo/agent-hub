@@ -23,10 +23,10 @@ agent_hub_install: true
 |---|---|
 | `agent-hub.socket` | systemd-owned Unix listener, mode `0600` |
 | `agent-hub.service` | FastAPI/uvicorn receives that listener by file descriptor and serves the UI/API |
-| `agent-hub-telegram.service` | Optional notifier, the only component reaching the internet |
+| `agent-hub-telegram.service` | Optional status/approval/share bot, the only component reaching the internet |
 | `agent-hub-health.timer` | Deterministic host health snapshot every 30 minutes |
 | `/usr/local/libexec/agent-hub/*-ctl` | Root-owned wrappers, the privilege boundary |
-| `/usr/local/bin/agent-*` | Stable report, meeting and document commands for sessions |
+| `/usr/local/bin/agent-*` | Stable report, Telegram share, meeting and document commands for sessions |
 | Three Unix accounts | Service account plus two agent accounts, deliberately separated |
 
 ## The privilege split
@@ -80,6 +80,10 @@ Telegram is off by default. Keep the token in a vault:
 agent_hub_telegram_enabled: true
 agent_hub_telegram_token: "{{ vault_agent_hub_telegram_token }}"
 ```
+
+The bot keeps status commands on demand, handles host-escalation yes/no and
+meeting approvals, and delivers `agent-telegram` text/link/file shares. It does
+not push routine report, lifecycle, or health messages.
 
 Standards-based Web Push is also opt-in. The role generates the VAPID private
 key directly on the host; do not put that key in inventory:

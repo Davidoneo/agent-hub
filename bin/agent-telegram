@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Condividi su Telegram soltanto dopo una richiesta esplicita dell'utente.
+
+Uso:
+  agent-telegram message "testo"
+  agent-telegram link https://example.org [--text "descrizione"]
+  agent-telegram file /percorso/al/file [--caption "didascalia"]
+"""
+import argparse
+import json
+import os
+import pwd
+import subprocess
+import sys
+
+
+CTL = "/usr/local/libexec/agent-hub/telegram-outbox-ctl"
+
+
+def config_value(key, default):
+    try:
+        with open("/etc/agent-hub/config.env", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip().startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or default
+    except OSError:
+        pass
+    return default
+
+
+def session_id(explicit):
+    for value in (explicit, os.environ.get("AGENT_HUB_SESSION_ID", ""),
+                  os.environ.get("AGENT_HUB_SESSION", "")):
+        token = str(value or "").strip()
+        if token:
+            return token.removeprefix("agenthub-")
+    return ""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--session", default="")
+    sub = parser.add_subparsers(dest="command", required=True)
+    msg = sub.add_parser("message")
+    msg.add_argument("text")
+    link = sub.add_parser("link")
+    link.add_argument("url")
+    link.add_argument("--text", default="")
+    file_cmd = sub.add_parser("file")
+    file_cmd.add_argument("path")
+    file_cmd.add_argument("--caption", default="")
+    args = parser.parse_args()
+
+    sid = session_id(args.session)
+    if not sid:
+        raise SystemExit("SESSION_ID non determinabile: usa --session <id>")
+    if args.command == "message":
+        header, body = {"kind": "message", "text": args.text}, b""
+    elif args.command == "link":
+        header, body = {"kind": "link", "url": args.url, "text": args.text}, b""
+    else:
+        path = os.path.realpath(args.path)
+        if not os.path.isfile(path):
+            raise SystemExit("file inesistente o non regolare")
+        if os.path.getsize(path) > 20 * 1024 * 1024:
+            raise SystemExit("file troppo grande (massimo 20 MiB)")
+        header = {"kind": "file", "filename": os.path.basename(path),
+                  "text": args.caption}
+        with open(path, "rb") as handle:
+            body = handle.read()
+    payload = (json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8") + body
+    owner = config_value("AGENT_HUB_SERVICE_USER", "agenthub")
+    command = [CTL, "queue", sid]
+    if pwd.getpwuid(os.getuid()).pw_name != owner:
+        command = ["sudo", "-n", "-u", owner, *command]
+    result = subprocess.run(command, input=payload, capture_output=True)
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip() or "accodamento fallito"
+        try:
+            detail = json.loads(detail).get("error", detail)
+        except (ValueError, AttributeError):
+            pass
+        raise SystemExit(detail)
+    print(json.dumps(json.loads(result.stdout), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

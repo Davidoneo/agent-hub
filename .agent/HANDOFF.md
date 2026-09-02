@@ -1,5 +1,36 @@
 # Handoff
 
+## 2026-09-02 — Linked host escalations and opt-in Telegram delivery
+
+Status: implemented, deployed, and verified on the local Agent Hub instance.
+
+### Behavior
+
+- Project-to-host escalations now have a durable request record and a linked
+  host session. Granting a request resolves the source attention state and
+  dismisses its Web Push notification automatically.
+- Linked session details are visible in the UI. An escalation host session can
+  be closed by itself or together with the project session that requested it.
+- Routine Telegram report, lifecycle, and health notifications are disabled.
+  Status commands remain available; Telegram now sends only explicit
+  session-requested messages, links, or files and escalation approval prompts
+  with a short scope and Yes/No actions.
+- Telegram approval is queued and consumed by the unprivileged backend, which
+  creates the host session idempotently. The explicit-sharing helper can only
+  enqueue content for a session owned by its invoking Unix user.
+
+### Verification
+
+- The complete source check passes with 59 tests, Python and JavaScript syntax
+  checks, and a clean diff check. Ansible lint, playbook syntax, host-safety,
+  and least-privilege tests pass.
+- Live API and static-asset checks confirm linked escalation metadata, Push
+  dismissal, paired-close controls, active-notification synchronization, and
+  source/live parity. Both services restarted cleanly; all 19 health checks,
+  SSH, and Tailscale are healthy, and all existing tmux panes were preserved.
+- No Telegram test message was sent. No commit or GitHub push was requested or
+  performed.
+
 ## 2026-08-30 — Reliable session messaging and attention handling
 
 Status: prepared and verified for the public repository.

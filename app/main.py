@@ -363,6 +363,8 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 initial_prompt TEXT DEFAULT '',
                 parent_session TEXT DEFAULT '',
+                relation_type TEXT DEFAULT '',       -- continuation | escalation
+                relation_request_id TEXT DEFAULT '', -- richiesta escalation che ha creato la child
                 cols INTEGER DEFAULT 100,
                 rows INTEGER DEFAULT 30,
                 created_at TEXT NOT NULL,
@@ -470,6 +472,42 @@ def init_db() -> None:
                 detail TEXT DEFAULT '',
                 PRIMARY KEY (channel, kind, key)
             );
+            -- Una richiesta nasce da NEEDS_HOST_ACTION in una sessione PROJECT.
+            -- Telegram registra soltanto la decisione; il backend crea la
+            -- sessione SERVER, cosi' il bot non acquisisce privilegi host.
+            CREATE TABLE IF NOT EXISTS escalation_requests (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                report_id TEXT DEFAULT '',
+                scope TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                host_session_id TEXT DEFAULT '',
+                requested_at TEXT NOT NULL,
+                decided_at TEXT DEFAULT '',
+                decision_chat_id TEXT DEFAULT '',
+                error TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_escalation_requests_status
+                ON escalation_requests(status, requested_at);
+            -- Condivisioni Telegram richieste esplicitamente dall'utente.
+            -- I file vengono copiati in staging dal processo chiamante: il
+            -- notificatore non ottiene accesso aggiuntivo al filesystem.
+            CREATE TABLE IF NOT EXISTS telegram_outbox (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,             -- message | link | file
+                text TEXT DEFAULT '',
+                file_path TEXT DEFAULT '',
+                file_name TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT DEFAULT '',
+                requested_by TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                sent_at TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_telegram_outbox_status
+                ON telegram_outbox(status, created_at);
             -- Sottoscrizioni Web Push per singola installazione/browser. Gli
             -- endpoint sono credenziali di consegna e restano nel DB privato.
             CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -550,6 +588,20 @@ def migrate_db() -> None:
         if "launch_info" not in have:
             # comando e cgroup reali dell'ultimo avvio, per la diagnostica
             conn.execute("ALTER TABLE sessions ADD COLUMN launch_info TEXT DEFAULT ''")
+        if "relation_type" not in have:
+            conn.execute("ALTER TABLE sessions ADD COLUMN relation_type TEXT DEFAULT ''")
+        if "relation_request_id" not in have:
+            conn.execute("ALTER TABLE sessions ADD COLUMN relation_request_id TEXT DEFAULT ''")
+        conn.execute(
+            "UPDATE sessions SET relation_type=CASE WHEN environment='SERVER' AND EXISTS ("
+            "SELECT 1 FROM sessions p WHERE p.id=sessions.parent_session "
+            "AND p.environment='PROJECT') THEN 'escalation' ELSE 'continuation' END "
+            "WHERE parent_session<>'' AND COALESCE(relation_type,'')=''"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_relation_request "
+            "ON sessions(relation_request_id) WHERE relation_request_id<>''"
+        )
         # contratto di stato finale e stato deterministico del controller.
         # `effort`: livello richiesto all'avvio. `harness_session_id`:
         # identificativo passato alla CLI con --session-id, che rende
@@ -1391,11 +1443,43 @@ def push_payload(row: dict, attention_count: int) -> dict:
         "USAGE_LIMIT": "La harness ha raggiunto il limite d'uso.",
     }.get(row["lifecycle"], "Apri Agent Hub per controllare la sessione.")
     return {
+        "type": "attention", "session_id": row["id"],
         "title": f"{label} · {row['name']}", "body": body,
         "url": f"/#/session/{row['id']}",
         "tag": f"agenthub-{row['id']}-{row['lifecycle']}",
         "badge": attention_count,
     }
+
+
+def dismiss_webpush_session(sid: str) -> None:
+    """Chiede a ogni PWA di chiudere gli avvisi ormai risolti della sessione."""
+    if not webpush_ready():
+        return
+    with db() as conn:
+        subscriptions = [dict(r) for r in conn.execute("SELECT * FROM push_subscriptions")]
+    payload = json.dumps({"type": "dismiss", "session_id": sid})
+    for sub in subscriptions:
+        try:
+            send_webpush(
+                subscription_info={"endpoint": sub["endpoint"],
+                                   "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]}},
+                data=payload,
+                vapid_private_key=CONFIG["webpush_private_key"],
+                vapid_claims={"sub": CONFIG["webpush_subject"] or CONFIG["origin"]},
+                timeout=15,
+            )
+        except WebPushException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", 0)
+            if status in (404, 410):
+                with db() as conn:
+                    conn.execute("DELETE FROM push_subscriptions WHERE id=?", (sub["id"],))
+        except (OSError, ValueError):
+            pass
+
+
+def dismiss_webpush_session_async(sid: str) -> None:
+    if webpush_ready():
+        threading.Thread(target=dismiss_webpush_session, args=(sid,), daemon=True).start()
 
 
 def deliver_webpush_once() -> int:
@@ -1723,6 +1807,8 @@ def apply_lifecycle(row: dict, last: dict) -> str:
                              (life, now(), row["id"]))
         except sqlite3.Error:
             pass
+        if stored in PUSH_LIFECYCLES and life not in PUSH_LIFECYCLES:
+            dismiss_webpush_session_async(row["id"])
     return life
 
 
@@ -1974,6 +2060,23 @@ def session_documents(sid: str) -> list[dict]:
     return existing_document_rows(rows)
 
 
+def session_relations(sid: str) -> dict:
+    """Parent e child persistenti, distinti per continuazione/escalation."""
+    with db() as conn:
+        current = conn.execute(
+            "SELECT parent_session FROM sessions WHERE id=?", (sid,)).fetchone()
+        parent = None
+        if current and current["parent_session"]:
+            parent = conn.execute(
+                "SELECT id,name,environment,status,lifecycle,relation_type "
+                "FROM sessions WHERE id=?", (current["parent_session"],)).fetchone()
+        children = conn.execute(
+            "SELECT id,name,environment,status,lifecycle,relation_type FROM sessions "
+            "WHERE parent_session=? ORDER BY created_at", (sid,)).fetchall()
+    return {"parent": dict(parent) if parent else None,
+            "children": [dict(r) for r in children]}
+
+
 def message_counters(sid: str) -> dict:
     with db() as conn:
         tot = conn.execute("SELECT COUNT(*) FROM messages "
@@ -1993,6 +2096,7 @@ async def session_detail(sid: str):
     return {"session": row, "messages": session_messages(sid),
             "documents": session_documents(sid),
             "reports": session_reports(sid),
+            "relations": session_relations(sid),
             "diagnostics": launch_diagnostics(row)}
 
 
@@ -2501,6 +2605,14 @@ def contract_block(row: dict) -> str:
         "WAITING_SESSION indica una dipendenza fra agenti e riprende automaticamente "
         "questa sessione quando quella indicata termina; NEEDS_INPUT e' riservato a una "
         "risposta dell'utente.",
+        "Per una sessione PROJECT, NEEDS_HOST_ACTION apre una richiesta di escalation "
+        "approvabile o rifiutabile via Telegram: nel --summary descrivi brevemente lo "
+        "scope amministrativo richiesto e perche' serve.",
+        "Telegram non riceve aggiornamenti automatici ordinari. Usalo soltanto quando "
+        "l'utente chiede esplicitamente di condividere qualcosa: `agent-telegram message "
+        "\"...\"`, `agent-telegram link https://... --text \"...\"` oppure "
+        "`agent-telegram file /percorso --caption \"...\"`. Non inviare nulla di tua "
+        "iniziativa.",
         "Non concludere un turno senza registrare uno di questi stati: il riepilogo "
         "che scrivi e' il risultato che arriva a chi ha chiesto il lavoro, e senza "
         "di esso la sessione viene segnalata come bloccata.",
@@ -2528,7 +2640,8 @@ def contract_reminder(row: dict) -> str:
             'agent-report COMPLETED --summary "cosa hai fatto"\n'
             "(oppure NEEDS_INPUT se attendi una risposta; WAITING_SESSION "
             "--waiting-for <session-id> se attendi un'altra sessione; "
-            "NEEDS_HOST_ACTION se serve un intervento sull'host, FAILED, CANCELLED).\n"
+            "NEEDS_HOST_ACTION con uno scope breve se serve un'escalation host, "
+            "FAILED, CANCELLED).\n"
             "Vale a ogni turno, anche per richieste brevi: senza questo comando il "
             "risultato del lavoro non arriva a chi lo ha chiesto.")
 
@@ -3211,7 +3324,10 @@ def _create_session(body: dict) -> dict:
         "executor_max_agents": executor_max_agents,
         "permission_mode": perm, "unix_user": unix_user, "kind": "agent",
         "status": "starting", "initial_prompt": prompt,
-        "parent_session": body.get("parent_session") or "", "cols": cols, "rows": rows,
+        "parent_session": body.get("parent_session") or "",
+        "relation_type": body.get("relation_type") or "",
+        "relation_request_id": body.get("relation_request_id") or "",
+        "cols": cols, "rows": rows,
         "created_at": now(), "ended_at": "",
         # La conferma della directory non e' piu' una scelta: la directory di
         # lavoro viene scelta qui dentro, quindi il dialogo dell'harness
@@ -3291,12 +3407,14 @@ def insert_session(row: dict) -> None:
             "profile_id,model,effort,session_mode,goal,harness_session_id,"
             "executor_enabled,executor_model,"
             "executor_max_agents,permission_mode,unix_user,kind,"
-            "status,initial_prompt,parent_session,cols,rows,created_at,ended_at,auto_trust) VALUES "
+            "status,initial_prompt,parent_session,relation_type,relation_request_id,"
+            "cols,rows,created_at,ended_at,auto_trust) VALUES "
             "(:id,:name,:tmux_name,:project_slug,:workdir,:environment,:profile_id,:model,"
             ":effort,:session_mode,:goal,:harness_session_id,"
             ":executor_enabled,:executor_model,:executor_max_agents,"
             ":permission_mode,:unix_user,:kind,:status,"
-            ":initial_prompt,:parent_session,:cols,:rows,:created_at,:ended_at,:auto_trust)", row)
+            ":initial_prompt,:parent_session,:relation_type,:relation_request_id,"
+            ":cols,:rows,:created_at,:ended_at,:auto_trust)", row)
 
 
 @app.get("/api/sessions/{sid}/messages")
@@ -3368,9 +3486,14 @@ async def session_action(sid: str, request: Request):
         if r.returncode != 0:
             raise HTTPException(400, (r.stderr or r.stdout).strip() or "scorrimento fallito")
     elif action == "kill":
-        wrapper(u, SESSION_CTL, "kill", t, timeout=30)
-        with db() as conn:
-            conn.execute("UPDATE sessions SET status='ended', ended_at=? WHERE id=?", (now(), sid))
+        close_session(row)
+    elif action == "kill_pair":
+        if row.get("environment") != "SERVER" or row.get("relation_type") != "escalation" \
+                or not row.get("parent_session"):
+            raise HTTPException(400, "la chiusura doppia è disponibile solo nella sessione host di un'escalation")
+        parent = get_session(row["parent_session"])
+        close_session(row)
+        close_session(parent)
     elif action == "restart":
         wrapper(u, SESSION_CTL, "kill", t, timeout=30)
         time.sleep(1)
@@ -3390,6 +3513,14 @@ async def session_action(sid: str, request: Request):
     else:
         raise HTTPException(400, f"azione non valida: {action}")
     return {"ok": True, "action": action}
+
+
+def close_session(row: dict) -> None:
+    """Chiude il pane conservando sessione, messaggi, report e trascrizione."""
+    wrapper(row["unix_user"], SESSION_CTL, "kill", row["tmux_name"], timeout=30)
+    with db() as conn:
+        conn.execute("UPDATE sessions SET status='ended', ended_at=? WHERE id=?",
+                     (now(), row["id"]))
 
 
 def delete_session(row: dict) -> None:
@@ -3954,9 +4085,164 @@ async def continue_with(sid: str, request: Request):
         "executor_max_agents": row.get("executor_max_agents") or 0,
         "prompt": prompt,
         "parent_session": sid,
+        "relation_type": "continuation",
         "cols": row["cols"], "rows": row["rows"],
         "auto_trust": bool(row.get("auto_trust", 1)),
     })
+
+
+def host_profile_for(row: dict) -> str:
+    """Riusa la harness della PROJECT se esiste anche per l'account SERVER."""
+    try:
+        prof = profile_by_id(row["profile_id"])
+        if SERVER_UNIX_USER in prof.get("allowed_users", []):
+            return prof["id"]
+    except HTTPException:
+        pass
+    for prof in load_profiles():
+        if SERVER_UNIX_USER in prof.get("allowed_users", []):
+            return prof["id"]
+    raise HTTPException(400, "nessun profilo disponibile per la sessione host")
+
+
+def system_report(sid: str, status: str, summary: str,
+                  waiting_for: str = "", source: str = "controller") -> None:
+    """Registra una transizione strutturata prodotta dall'orchestrazione."""
+    stamp = now()
+    with db() as conn:
+        row = conn.execute("SELECT unix_user FROM sessions WHERE id=?", (sid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "sessione chiamante non più disponibile")
+        conn.execute(
+            "INSERT INTO session_reports (id,session_id,status,summary,waiting_for_session,"
+            "reported_at,source,unix_user) VALUES (?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), sid, status, summary, waiting_for, stamp, source,
+             row["unix_user"]))
+        conn.execute(
+            "UPDATE sessions SET report_status=?,report_summary=?,reported_at=?,"
+            "waiting_for_session=?,lifecycle=?,lifecycle_at=? WHERE id=?",
+            (status, summary, stamp, waiting_for, status, stamp, sid))
+
+
+def escalation_request_for_grant(row: dict, scope: str) -> str:
+    """Riusa la richiesta pendente o ne crea una per il grant dato dalla UI."""
+    with db() as conn:
+        req = conn.execute(
+            "SELECT id FROM escalation_requests WHERE session_id=? "
+            "AND status IN ('pending','approved_queued','granting') "
+            "ORDER BY requested_at DESC,rowid DESC LIMIT 1", (row["id"],)).fetchone()
+        request_id = req["id"] if req else str(uuid.uuid4())
+        if not req:
+            conn.execute(
+                "INSERT INTO escalation_requests "
+                "(id,session_id,report_id,scope,status,requested_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (request_id, row["id"], "", scope, "granting", now()))
+        else:
+            conn.execute(
+                "UPDATE escalation_requests SET status='granting',scope=?,error='' WHERE id=?",
+                (scope, request_id))
+    return request_id
+
+
+def finalize_escalation_grant(source_row: dict, host_row: dict,
+                              request_id: str, scope: str) -> None:
+    summary = (f"Escalation host approvata; attendo «{host_row['name']}» "
+               f"({host_row['id']}).")
+    system_report(source_row["id"], "WAITING_SESSION", summary,
+                  host_row["id"], source="escalation")
+    with db() as conn:
+        conn.execute(
+            "UPDATE escalation_requests SET status='granted',host_session_id=?,"
+            "decided_at=COALESCE(NULLIF(decided_at,''),?),error='' WHERE id=?",
+            (host_row["id"], now(), request_id))
+        # Un grant diretto dalla pagina risolve anche eventuali richieste più
+        # vecchie ancora pendenti per la stessa sessione.
+        conn.execute(
+            "UPDATE escalation_requests SET status='superseded',decided_at=? "
+            "WHERE session_id=? AND id<>? AND status IN ('pending','approved_queued')",
+            (now(), source_row["id"], request_id))
+    dismiss_webpush_session_async(source_row["id"])
+
+
+def grant_escalation(source_row: dict, scope: str, request_id: str = "",
+                     profile_id: str = "") -> dict:
+    """Crea una sola child SERVER per richiesta e collega entrambi i lifecycle."""
+    request_id = request_id or escalation_request_for_grant(source_row, scope)
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM sessions WHERE relation_request_id=?", (request_id,)).fetchone()
+    if existing:
+        host_row = dict(existing)
+        finalize_escalation_grant(source_row, host_row, request_id, scope)
+        return {"session": host_row, "request_id": request_id, "recovered": True}
+
+    prompt = compose_handoff(source_row, to_host=True)
+    if scope:
+        prompt += "\n\n## Scope approvato\n" + scope
+    try:
+        result = _create_session({
+            "name": f"ESCALATION · {source_row['name']}",
+            "environment": "SERVER",
+            "workdir": source_row["workdir"],
+            "profile_id": profile_id or host_profile_for(source_row),
+            "prompt": prompt,
+            "parent_session": source_row["id"],
+            "relation_type": "escalation",
+            "relation_request_id": request_id,
+            "cols": source_row["cols"], "rows": source_row["rows"],
+        })
+    except HTTPException as exc:
+        failed_sid = (exc.headers or {}).get("X-Agent-Hub-Session-Id", "")
+        if not failed_sid:
+            raise
+        host_row = get_session(failed_sid)
+        finalize_escalation_grant(source_row, host_row, request_id, scope)
+        return {"session": host_row, "request_id": request_id,
+                "launch_error": str(exc.detail)}
+    finalize_escalation_grant(source_row, result["session"], request_id, scope)
+    result["request_id"] = request_id
+    return result
+
+
+def claim_approved_escalation() -> dict | None:
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        req = conn.execute(
+            "SELECT * FROM escalation_requests WHERE status='approved_queued' "
+            "ORDER BY requested_at,rowid LIMIT 1").fetchone()
+        if not req:
+            return None
+        changed = conn.execute(
+            "UPDATE escalation_requests SET status='granting',error='' "
+            "WHERE id=? AND status='approved_queued'", (req["id"],)).rowcount
+        return dict(req) if changed == 1 else None
+
+
+def process_approved_escalations() -> int:
+    processed = 0
+    while True:
+        req = claim_approved_escalation()
+        if not req:
+            return processed
+        try:
+            source = get_session(req["session_id"])
+            grant_escalation(source, req["scope"], req["id"])
+        except Exception as exc:  # noqa: BLE001
+            with db() as conn:
+                conn.execute(
+                    "UPDATE escalation_requests SET status='failed',error=?,decided_at=? WHERE id=?",
+                    (str(getattr(exc, "detail", exc))[:1000], now(), req["id"]))
+        processed += 1
+
+
+def escalation_loop() -> None:
+    while True:
+        try:
+            process_approved_escalations()
+        except sqlite3.Error:
+            pass
+        time.sleep(2)
 
 
 @app.post("/api/sessions/{sid}/escalate")
@@ -3965,21 +4251,10 @@ async def escalate(sid: str, request: Request):
     if row["environment"] != "PROJECT":
         raise HTTPException(400, "l'escalation e' disponibile solo per sessioni PROJECT")
     body = await request.json()
-    prompt = compose_handoff(row, to_host=True)
-    if body.get("note"):
-        prompt += "\n\n## Nota dell'operatore\n" + str(body["note"])
-    return _create_session({
-        "name": f"ESCALATION · {row['name']}",
-        "environment": "SERVER",
-        "workdir": row["workdir"],
-        "profile_id": body.get("profile_id") or row["profile_id"],
-        "model": body.get("model", ""),
-        "effort": body.get("effort", ""),
-        "prompt": prompt,
-        "parent_session": sid,
-        "cols": row["cols"], "rows": row["rows"],
-        "auto_trust": bool(row.get("auto_trust", 1)),
-    })
+    scope = re.sub(r"\s+", " ", str(body.get("note") or row.get("report_summary") or "")).strip()
+    if len(scope) > 4000:
+        raise HTTPException(400, "scope escalation troppo lungo (massimo 4000 caratteri)")
+    return grant_escalation(row, scope, profile_id=str(body.get("profile_id") or ""))
 
 
 @app.get("/api/sessions/{sid}/handoff-preview")
@@ -5903,9 +6178,16 @@ STARTED_AT = now()
 init_db()
 migrate_db()
 recover_pending()
+with db() as _conn:
+    # Se il backend si è fermato fra decisione Telegram e creazione/link della
+    # child, relation_request_id rende il retry idempotente.
+    _conn.execute(
+        "UPDATE escalation_requests SET status='approved_queued' "
+        "WHERE status='granting'")
 sweep_runtime()
 threading.Thread(target=delivery_loop, daemon=True).start()
 threading.Thread(target=sweep_loop, daemon=True).start()
+threading.Thread(target=escalation_loop, daemon=True).start()
 threading.Thread(target=usage_loop, daemon=True).start()
 if webpush_ready():
     threading.Thread(target=webpush_loop, daemon=True).start()

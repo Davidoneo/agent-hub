@@ -27,6 +27,8 @@
       loop:
         - "{{ playbook_dir }}/../app/main.py"
         - "{{ playbook_dir }}/../bin/agent-report"
+        - "{{ playbook_dir }}/../bin/agent-telegram"
+        - "{{ playbook_dir }}/../libexec/telegram-outbox-ctl"
         - "{{ playbook_dir }}/../libexec/git-ssh-ctl"
       register: canonical_sources
 

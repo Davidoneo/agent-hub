@@ -51,6 +51,26 @@ def db():
     return conn
 
 
+def ensure_escalation_schema(conn):
+    """Evita una finestra di deploy fra copia del wrapper e restart backend."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS escalation_requests (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            report_id TEXT DEFAULT '',
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            host_session_id TEXT DEFAULT '',
+            requested_at TEXT NOT NULL,
+            decided_at TEXT DEFAULT '',
+            decision_chat_id TEXT DEFAULT '',
+            error TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_escalation_requests_status
+            ON escalation_requests(status, requested_at);
+    """)
+
+
 def write_event(payload):
     """Evento JSON locale, scritto atomicamente (tmp + rename)."""
     try:
@@ -118,8 +138,9 @@ def cmd_report(argv):
 
     stamp = now()
     with db() as conn:
+        ensure_escalation_schema(conn)
         row = conn.execute(
-            "SELECT id, name, unix_user, report_status, report_summary, reported_at, "
+            "SELECT id, name, unix_user, environment, report_status, report_summary, reported_at, "
             "waiting_for_session "
             "FROM sessions WHERE id=?", (sid,)).fetchone()
         if not row:
@@ -132,17 +153,30 @@ def cmd_report(argv):
         duplicate = (row["report_status"] == status
                      and (row["report_summary"] or "") == summary
                      and (row["waiting_for_session"] or "") == waiting_for)
+        request_id = ""
         if duplicate:
             stamp = row["reported_at"] or stamp
         else:
+            report_id = str(uuid.uuid4())
             conn.execute(
                 "INSERT INTO session_reports (id,session_id,status,summary,waiting_for_session,"
                 "reported_at,source,unix_user) VALUES (?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), sid, status, summary, waiting_for, stamp, source, unix_user))
+                (report_id, sid, status, summary, waiting_for, stamp, source, unix_user))
             conn.execute(
                 "UPDATE sessions SET report_status=?, report_summary=?, reported_at=?, "
                 "waiting_for_session=? "
                 "WHERE id=?", (status, summary, stamp, waiting_for, sid))
+            # Qualunque nuovo esito sostituisce una richiesta ancora pendente.
+            conn.execute(
+                "UPDATE escalation_requests SET status='superseded',decided_at=? "
+                "WHERE session_id=? AND status='pending'", (stamp, sid))
+            if status == "NEEDS_HOST_ACTION" and row["environment"] == "PROJECT":
+                request_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO escalation_requests "
+                    "(id,session_id,report_id,scope,status,requested_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (request_id, sid, report_id, summary, "pending", stamp))
 
     payload = {
         "session_id": sid,
@@ -153,6 +187,7 @@ def cmd_report(argv):
         "source": source,
         "unix_user": unix_user,
         "session_name": row["name"],
+        "escalation_request_id": request_id,
     }
     # nel file resta lo *stato*, non la cronaca della chiamata: `duplicate`
     # descrive l'invocazione e vive solo nella risposta a chi l'ha fatta
