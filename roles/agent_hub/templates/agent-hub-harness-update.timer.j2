@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Agent Hub - nightly harness updates
+
+[Timer]
+OnCalendar={{ agent_hub_harness_update_calendar }}
+RandomizedDelaySec=20min
+Persistent=true
+Unit=agent-hub-harness-update.service
+
+[Install]
+WantedBy=timers.target

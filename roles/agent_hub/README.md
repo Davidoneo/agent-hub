@@ -25,6 +25,7 @@ agent_hub_install: true
 | `agent-hub.service` | FastAPI/uvicorn receives that listener by file descriptor and serves the UI/API |
 | `agent-hub-telegram.service` | Optional status/approval/share bot, the only component reaching the internet |
 | `agent-hub-health.timer` | Deterministic host health snapshot every 30 minutes |
+| `agent-hub-harness-update.timer` | Nightly harness updates followed by a Codex compatibility audit |
 | `/usr/local/libexec/agent-hub/*-ctl` | Root-owned wrappers, the privilege boundary |
 | `/usr/local/bin/agent-*` | Stable report, Telegram share, meeting and document commands for sessions |
 | Three Unix accounts | Service account plus two agent accounts, deliberately separated |
@@ -103,6 +104,19 @@ safe-mode CLI startup every 20 hours, stops it as soon as the credential
 changes, and never sends a model prompt.
 
 See `defaults/main.yml` for the full list.
+
+Harness updates are enabled with the Agent Hub role and run nightly at 03:20
+(with a randomized delay). Codex and OpenCode use their global installation;
+Claude Code is updated independently for the PROJECT and SERVER accounts. An
+Agent Hub session using `gpt-5.6-sol` with `high` effort is created after every
+cycle; identical reruns on the same day do not create duplicates. Override or
+disable this policy with:
+
+```yaml
+agent_hub_harness_updates_enabled: false
+agent_hub_harness_update_calendar: "*-*-* 03:20:00"
+agent_hub_harness_audit_project: agent-hub
+```
 
 ## Exposure
 

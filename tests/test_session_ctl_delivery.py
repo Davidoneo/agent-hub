@@ -1,6 +1,8 @@
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +17,73 @@ LOADER.exec_module(session_ctl)
 
 
 class SessionDeliveryTests(unittest.TestCase):
+    def test_claude_login_uses_direct_auth_command_without_waiting_for_composer(self):
+        calls = []
+        user = session_ctl.me().pw_name
+        profile = {
+            "id": "claude-anthropic",
+            "harness": "claude",
+            "command": "claude",
+            "allowed_users": [user],
+            "login": {"args": ["auth", "login"]},
+        }
+
+        def fake_tmux(*args, **_kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(session_ctl, "load_profiles",
+                               return_value={profile["id"]: profile}), \
+             mock.patch.object(session_ctl, "ensure_server"), \
+             mock.patch.object(session_ctl, "tmux", side_effect=fake_tmux), \
+             mock.patch.object(session_ctl, "_wait_ready") as wait_ready, \
+             mock.patch("builtins.print"):
+            session_ctl.cmd_login(["agenthub-abcdef", profile["id"]])
+
+        launch = next(call for call in calls if call[0] == "new-session")
+        self.assertEqual(launch[-1], "exec claude auth login")
+        self.assertIn(
+            ("set-option", "-t", "agenthub-abcdef", "remain-on-exit", "on"), calls)
+        wait_ready.assert_not_called()
+
+    def test_private_launch_spec_preserves_and_removes_a_long_prompt(self):
+        prompt = "handoff lungo\n" + ("x" * 20000)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(session_ctl, "_launch_spec_dir", return_value=directory):
+            path = session_ctl._write_launch_spec(["codex", "--model", "gpt-5.6-sol", prompt])
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            argv = session_ctl._consume_launch_spec(path)
+            self.assertEqual(argv[-1], prompt)
+            self.assertFalse(os.path.exists(path))
+
+    def test_claude_trust_selects_yes_before_enter(self):
+        sent = []
+
+        def fake_tmux(*args, **_kwargs):
+            if args[0] == "send-keys":
+                sent.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(session_ctl, "tmux", side_effect=fake_tmux), \
+             mock.patch.object(session_ctl, "_screen_text", return_value=(
+                 "  No, exit\n❯ Yes, I trust this folder\n")), \
+             mock.patch.object(session_ctl.time, "sleep"):
+            ok, err = session_ctl._confirm_trust_prompt(
+                "agenthub-abcdef", {"key": "Enter"}, {},
+                "❯ No, exit\n  Yes, I trust this folder\n")
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        self.assertEqual(sent, ["Down", "Enter"])
+
+    def test_claude_trust_never_confirms_an_unknown_selection(self):
+        with mock.patch.object(session_ctl, "tmux") as mocked:
+            ok, err = session_ctl._confirm_trust_prompt(
+                "agenthub-abcdef", {"key": "Enter"}, {},
+                "Do you trust the files in this folder?\n")
+        self.assertFalse(ok)
+        self.assertIn("non risulta selezionata", err)
+        mocked.assert_not_called()
+
     def test_backend_passes_profile_to_followup_transport(self):
         backend = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
         self.assertIn('path, "submit", row["profile_id"], timeout=120)', backend)

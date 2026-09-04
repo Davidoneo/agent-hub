@@ -107,6 +107,19 @@ AGENT_UNIX_USERS = (PROJECT_UNIX_USER, SERVER_UNIX_USER)
 SERVER_HOME = os.environ.get("AGENT_HUB_SERVER_HOME", f"/home/{SERVER_UNIX_USER}")
 CSRF_TOKEN = uuid.uuid4().hex
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,79}$")
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+# Default esplicito dell'Hub, distinto dal default mutevole della singola CLI.
+# Ogni account Unix puo' sovrascriverlo dalla pagina Accounts.
+DEFAULT_SESSION_PREFERENCES = {
+    "profile_id": "codex-openai",
+    "model": "gpt-5.6-sol",
+    "effort": "high",
+}
 
 # ------------------------------------------------------- meetings config
 
@@ -262,6 +275,49 @@ def profile_by_id(pid: str) -> dict:
     raise HTTPException(400, f"profilo sconosciuto: {pid}")
 
 
+def account_session_default(unix_user: str) -> dict:
+    """Default effettivo per le nuove sessioni di un account Unix."""
+    preferred = dict(DEFAULT_SESSION_PREFERENCES)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT profile_id,model,effort FROM account_session_defaults WHERE unix_user=?",
+            (unix_user,),
+        ).fetchone()
+    if row:
+        preferred.update(dict(row))
+    try:
+        prof = profile_by_id(preferred["profile_id"])
+        if unix_user not in prof.get("allowed_users", []):
+            raise HTTPException(400, "profilo non consentito")
+    except HTTPException:
+        prof = next((p for p in load_profiles()
+                     if unix_user in p.get("allowed_users", [])), None)
+        if not prof:
+            return {"profile_id": "", "model": "", "effort": ""}
+        preferred = {"profile_id": prof["id"], "model": "", "effort": ""}
+    if not prof.get("supports_model") or not MODEL_RE.fullmatch(preferred.get("model") or ""):
+        preferred["model"] = ""
+    if (not prof.get("supports_effort") or
+            preferred.get("effort") not in (prof.get("effort_levels") or [])):
+        preferred["effort"] = ""
+    return preferred
+
+
+def account_session_defaults() -> dict:
+    return {user: account_session_default(user) for user in AGENT_UNIX_USERS}
+
+
+def validate_model(prof: dict, value) -> str:
+    model = str(value or "").strip()
+    if not model:
+        return ""
+    if not prof.get("supports_model"):
+        raise HTTPException(400, f"il profilo {prof['id']} non permette di scegliere il modello")
+    if not MODEL_RE.fullmatch(model):
+        raise HTTPException(400, "id modello non valido")
+    return model
+
+
 # --------------------------------------------------- configurazione controller
 
 CONTROLLER_DEFAULTS = {
@@ -369,7 +425,8 @@ def init_db() -> None:
                 rows INTEGER DEFAULT 30,
                 created_at TEXT NOT NULL,
                 ended_at TEXT DEFAULT '',
-                auto_trust INTEGER NOT NULL DEFAULT 1
+                auto_trust INTEGER NOT NULL DEFAULT 1,
+                notification_suppressed_at TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS ports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -448,6 +505,13 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_model_catalog_user_provider
                 ON model_catalog(unix_user, provider);
+            CREATE TABLE IF NOT EXISTS account_session_defaults (
+                unix_user TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                model TEXT DEFAULT '',
+                effort TEXT DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
             -- Consumo dei piani, riletto periodicamente dal wrapper. E' uno
             -- stato remoto e costoso da leggere: sta qui perche' la pagina
             -- possa mostrare sempre l'ultimo valore noto con la sua data,
@@ -582,6 +646,34 @@ def init_db() -> None:
 def migrate_db() -> None:
     """Aggiunge le colonne mancanti ai database creati da versioni precedenti."""
     with db() as conn:
+        had_lifecycle_receipts = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifecycle_receipts'"
+        ).fetchone())
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS lifecycle_receipts ("
+            "identity TEXT NOT NULL,event_key TEXT NOT NULL,read_at TEXT NOT NULL,"
+            "PRIMARY KEY(identity,event_key))"
+        )
+        # Al primo deploy il pregresso e' gia' stato visto: inizializzare qui
+        # evita che un aggiornamento faccia comparire decine di badge storici.
+        # Da quel momento ogni nuova coppia lifecycle/lifecycle_at nasce invece
+        # non letta e resta sincronizzata fra tutte le PWA della stessa identita'.
+        if not had_lifecycle_receipts:
+            identities = [r["identity"] for r in conn.execute(
+                "SELECT DISTINCT identity FROM push_subscriptions")]
+            current = conn.execute(
+                "SELECT id,lifecycle,lifecycle_at FROM sessions WHERE lifecycle<>''"
+            ).fetchall()
+            stamp = now()
+            for login in identities:
+                conn.execute(
+                    "INSERT OR IGNORE INTO lifecycle_receipts(identity,event_key,read_at) "
+                    "VALUES (?,?,?)", (login, "__initialized__", stamp))
+                conn.executemany(
+                    "INSERT OR IGNORE INTO lifecycle_receipts(identity,event_key,read_at) "
+                    "VALUES (?,?,?)",
+                    [(login, f"{row['id']}:{row['lifecycle']}:{row['lifecycle_at'] or ''}",
+                      stamp) for row in current])
         have = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
         if "auto_trust" not in have:
             conn.execute("ALTER TABLE sessions ADD COLUMN auto_trust INTEGER NOT NULL DEFAULT 1")
@@ -616,7 +708,10 @@ def migrate_db() -> None:
                     # dipendenza strutturata usata da WAITING_SESSION
                     "waiting_for_session",
                     # ultimo mtime del log gia' contabilizzato come lavoro
-                    "work_probe_mtime", "work_probe_at"):
+                    "work_probe_mtime", "work_probe_at",
+                    # Una chiusura esplicita e' definitiva anche se una child
+                    # collegata aggiorna il lifecycle qualche secondo dopo.
+                    "notification_suppressed_at"):
             if col not in have:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT ''")
         # secondi in cui l'harness ha davvero scritto sul PTY: e' il tempo di
@@ -1248,6 +1343,7 @@ async def bootstrap(request: Request):
         "csrf": CSRF_TOKEN,
         "profiles": load_profiles(),
         "catalog": model_catalog_payload(),
+        "account_defaults": account_session_defaults(),
         # Il frontend non deve piu' cablare i nomi degli account Unix.
         "unix_users": {"project": PROJECT_UNIX_USER, "server": SERVER_UNIX_USER,
                         "service": MEETING_CTL_USER},
@@ -1289,12 +1385,12 @@ async def record_ui_activity(request: Request):
 # ------------------------------------------------------------ Web Push PWA
 
 PUSH_LIFECYCLES = {
-    "NEEDS_INPUT", "NEEDS_HOST_ACTION", "FAILED", "CRASHED",
+    "COMPLETED", "NEEDS_INPUT", "NEEDS_HOST_ACTION", "FAILED", "CRASHED",
     "ENDED_UNREPORTED", "DELIVERY_FAILED", "POSSIBLY_STALLED", "AUTH_REQUIRED",
     "USAGE_LIMIT", "LAUNCH_FAILED",
 }
 PUSH_POLL_SECONDS = 15
-PUSH_VISIBLE_SECONDS = 45
+PUSH_TTL_SECONDS = 300
 _PUSH_PUBLIC_KEY = ""
 
 
@@ -1353,6 +1449,7 @@ async def register_push(request: Request):
         raise HTTPException(400, "sottoscrizione Web Push non valida")
     endpoint, p256dh, auth = push_subscription_payload(data)
     login = identity(request)
+    ensure_notification_identity(login)
     visible = "visible" if data.get("visible") is True else "hidden"
     stamp = now()
     with db() as conn:
@@ -1367,6 +1464,19 @@ async def register_push(request: Request):
             "visibility=excluded.visibility,visibility_at=excluded.visibility_at,"
             "updated_at=excluded.updated_at",
             (sub_id, endpoint, login, p256dh, auth, visible, stamp, stamp, stamp))
+        if not old:
+            # Una nuova installazione deve ricevere soltanto transizioni future,
+            # non tutti gli stati di attenzione/completamento gia' presenti.
+            historical = conn.execute(
+                "SELECT id,lifecycle,lifecycle_at FROM sessions "
+                "WHERE lifecycle IN (%s)" % ",".join("?" * len(PUSH_LIFECYCLES)),
+                tuple(PUSH_LIFECYCLES)).fetchall()
+            conn.executemany(
+                "INSERT OR IGNORE INTO notifications(channel,kind,key,sent_at,detail) "
+                "VALUES (?,?,?,?,?)",
+                [(f"webpush:{sub_id}", "lifecycle",
+                  f"{row['id']}:{row['lifecycle']}:{row['lifecycle_at'] or ''}",
+                  stamp, f"historical:{row['lifecycle']}") for row in historical])
     return {"registered": True, "id": sub_id}
 
 
@@ -1406,14 +1516,44 @@ def push_event_key(row: dict) -> str:
     return f"{row['id']}:{row['lifecycle']}:{row.get('lifecycle_at') or ''}"
 
 
-def push_is_visible(subscription: dict) -> bool:
-    if subscription.get("visibility") != "visible":
-        return False
-    try:
-        age = time.time() - datetime.fromisoformat(subscription["visibility_at"]).timestamp()
-    except (TypeError, ValueError):
-        return False
-    return age <= PUSH_VISIBLE_SECONDS
+def ensure_notification_identity(login: str, rows: list[dict] | None = None) -> None:
+    """Inizializza una nuova identita' senza trasformare lo storico in novita'."""
+    with db() as conn:
+        if conn.execute(
+                "SELECT 1 FROM lifecycle_receipts WHERE identity=? AND event_key=?",
+                (login, "__initialized__")).fetchone():
+            return
+        if rows is None:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id,lifecycle,lifecycle_at FROM sessions WHERE lifecycle<>''")]
+        stamp = now()
+        conn.execute(
+            "INSERT OR IGNORE INTO lifecycle_receipts(identity,event_key,read_at) "
+            "VALUES (?,?,?)", (login, "__initialized__", stamp))
+        conn.executemany(
+            "INSERT OR IGNORE INTO lifecycle_receipts(identity,event_key,read_at) "
+            "VALUES (?,?,?)",
+            [(login, push_event_key(row), stamp) for row in rows if row.get("lifecycle")])
+
+
+def lifecycle_receipt_keys(login: str) -> set[str]:
+    with db() as conn:
+        return {r["event_key"] for r in conn.execute(
+            "SELECT event_key FROM lifecycle_receipts WHERE identity=?", (login,))}
+
+
+def notification_unread_count(login: str, rows: list[dict] | None = None) -> int:
+    if rows is None:
+        with db() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id,lifecycle,lifecycle_at,notification_suppressed_at "
+                "FROM sessions WHERE lifecycle IN (%s)" %
+                ",".join("?" * len(PUSH_LIFECYCLES)), tuple(PUSH_LIFECYCLES))]
+    read = lifecycle_receipt_keys(login)
+    return sum(1 for row in rows
+               if row.get("lifecycle") in PUSH_LIFECYCLES
+               and not row.get("notification_suppressed_at")
+               and push_event_key(row) not in read)
 
 
 def mark_push(sub_id: str, event_key: str, detail: str) -> None:
@@ -1436,14 +1576,18 @@ def push_payload(row: dict, attention_count: int) -> dict:
     if len(summary) > 140:
         summary = summary[:139].rstrip() + "…"
     body = summary or {
+        "COMPLETED": "Il turno della sessione è terminato.",
         "NEEDS_INPUT": "La sessione attende una tua risposta.",
         "NEEDS_HOST_ACTION": "Serve un intervento amministrativo sull'host.",
+        "CRASHED": "Il processo della sessione è terminato in modo anomalo.",
         "DELIVERY_FAILED": "Un testo è salvo ma non è arrivato alla sessione.",
         "AUTH_REQUIRED": "È necessario rifare il login della harness.",
         "USAGE_LIMIT": "La harness ha raggiunto il limite d'uso.",
     }.get(row["lifecycle"], "Apri Agent Hub per controllare la sessione.")
     return {
         "type": "attention", "session_id": row["id"],
+        "lifecycle": row["lifecycle"],
+        "event_key": push_event_key(row),
         "title": f"{label} · {row['name']}", "body": body,
         "url": f"/#/session/{row['id']}",
         "tag": f"agenthub-{row['id']}-{row['lifecycle']}",
@@ -1451,14 +1595,21 @@ def push_payload(row: dict, attention_count: int) -> dict:
     }
 
 
-def dismiss_webpush_session(sid: str) -> None:
-    """Chiede a ogni PWA di chiudere gli avvisi ormai risolti della sessione."""
+def dismiss_webpush_session(sid: str, only_identity: str = "") -> None:
+    """Chiude l'avviso e riallinea il badge su tutte le PWA dell'identita'."""
     if not webpush_ready():
         return
     with db() as conn:
-        subscriptions = [dict(r) for r in conn.execute("SELECT * FROM push_subscriptions")]
-    payload = json.dumps({"type": "dismiss", "session_id": sid})
+        if only_identity:
+            subscriptions = [dict(r) for r in conn.execute(
+                "SELECT * FROM push_subscriptions WHERE identity=?", (only_identity,))]
+        else:
+            subscriptions = [dict(r) for r in conn.execute("SELECT * FROM push_subscriptions")]
     for sub in subscriptions:
+        payload = json.dumps({
+            "type": "dismiss", "session_id": sid,
+            "badge": notification_unread_count(sub["identity"]),
+        })
         try:
             send_webpush(
                 subscription_info={"endpoint": sub["endpoint"],
@@ -1466,6 +1617,7 @@ def dismiss_webpush_session(sid: str) -> None:
                 data=payload,
                 vapid_private_key=CONFIG["webpush_private_key"],
                 vapid_claims={"sub": CONFIG["webpush_subject"] or CONFIG["origin"]},
+                ttl=PUSH_TTL_SECONDS,
                 timeout=15,
             )
         except WebPushException as exc:
@@ -1477,9 +1629,10 @@ def dismiss_webpush_session(sid: str) -> None:
             pass
 
 
-def dismiss_webpush_session_async(sid: str) -> None:
+def dismiss_webpush_session_async(sid: str, only_identity: str = "") -> None:
     if webpush_ready():
-        threading.Thread(target=dismiss_webpush_session, args=(sid,), daemon=True).start()
+        threading.Thread(target=dismiss_webpush_session,
+                         args=(sid, only_identity), daemon=True).start()
 
 
 def deliver_webpush_once() -> int:
@@ -1488,28 +1641,30 @@ def deliver_webpush_once() -> int:
         return 0
     with db() as conn:
         sessions = [dict(r) for r in conn.execute(
-            "SELECT id,name,lifecycle,lifecycle_at,report_summary FROM sessions "
-            "WHERE status='running' AND lifecycle IN (%s)" %
+            "SELECT id,name,lifecycle,lifecycle_at,report_summary,"
+            "notification_suppressed_at FROM sessions "
+            "WHERE lifecycle IN (%s)" %
             ",".join("?" * len(PUSH_LIFECYCLES)), tuple(PUSH_LIFECYCLES))]
         subscriptions = [dict(r) for r in conn.execute("SELECT * FROM push_subscriptions")]
     sent = 0
     for sub in subscriptions:
-        for row in sessions:
+        read = lifecycle_receipt_keys(sub["identity"])
+        unread = [row for row in sessions
+                  if not row.get("notification_suppressed_at")
+                  and push_event_key(row) not in read]
+        badge_count = len(unread)
+        for row in unread:
             key = push_event_key(row)
             if push_was_marked(sub["id"], key):
-                continue
-            if push_is_visible(sub):
-                # Non segnare come consegnato: se l'app passa in background
-                # mentre la richiesta resta aperta, il prossimo giro invia la
-                # push. Finche' e' visibile basta la barra interna.
                 continue
             try:
                 send_webpush(
                     subscription_info={"endpoint": sub["endpoint"],
                                        "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]}},
-                    data=json.dumps(push_payload(row, len(sessions)), ensure_ascii=False),
+                    data=json.dumps(push_payload(row, badge_count), ensure_ascii=False),
                     vapid_private_key=CONFIG["webpush_private_key"],
                     vapid_claims={"sub": CONFIG["webpush_subject"] or CONFIG["origin"]},
+                    ttl=PUSH_TTL_SECONDS,
                     timeout=15,
                 )
                 mark_push(sub["id"], key, row["lifecycle"])
@@ -1535,7 +1690,7 @@ def webpush_loop() -> None:
 
 
 @app.get("/api/sessions")
-async def list_sessions():
+async def list_sessions(request: Request):
     live = sync_status()
     with db() as conn:
         rows = [dict(r) for r in conn.execute(
@@ -1551,7 +1706,39 @@ async def list_sessions():
         decorate(r, live.get(r["tmux_name"]))
         r["undelivered"] = pend.get(r["id"], 0)
         r["messages_total"] = total.get(r["id"], 0)
-    return {"sessions": rows}
+    login = identity(request)
+    ensure_notification_identity(login, rows)
+    read = lifecycle_receipt_keys(login)
+    for r in rows:
+        r["notification_event_key"] = push_event_key(r) if r["lifecycle"] in PUSH_LIFECYCLES else ""
+        r["notification_unread"] = bool(
+            not r.get("notification_suppressed_at")
+            and r["notification_event_key"] and r["notification_event_key"] not in read)
+    return {"sessions": rows,
+            "unread_count": sum(1 for r in rows if r["notification_unread"])}
+
+
+@app.post("/api/notifications/read")
+async def read_notification(request: Request):
+    """Segna letta una transizione su tutti i dispositivi della stessa persona."""
+    body = await request.json()
+    sid = str(body.get("session_id") or "") if isinstance(body, dict) else ""
+    if not UUID_RE.fullmatch(sid):
+        raise HTTPException(400, "session_id non valido")
+    live = sync_status()
+    row = get_session(sid)
+    decorate(row, live.get(row["tmux_name"]))
+    login = identity(request)
+    ensure_notification_identity(login)
+    key = push_event_key(row) if row["lifecycle"] in PUSH_LIFECYCLES else ""
+    if key:
+        with db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO lifecycle_receipts(identity,event_key,read_at) "
+                "VALUES (?,?,?)", (login, key, now()))
+    unread = notification_unread_count(login)
+    dismiss_webpush_session_async(sid, login)
+    return {"read": bool(key), "event_key": key, "unread_count": unread}
 
 
 IDLE_OUTPUT_SECONDS = 120  # oltre questa soglia: «nessun output recente»
@@ -1755,7 +1942,16 @@ def apply_lifecycle(row: dict, last: dict) -> str:
     current_report = report_is_current(row, last)
 
     if row.get("kind") == "login":
-        life = "RUNNING" if row["alive"] else "ENDED_UNREPORTED"
+        if row["alive"]:
+            life = "RUNNING"
+        elif row["exit_code"] == "0":
+            # Il login non e' un agente e non puo' emettere agent-report:
+            # l'uscita pulita del comando di autenticazione e' il suo esito.
+            life = "COMPLETED"
+        elif row["exit_code"] not in ("", "?"):
+            life = "FAILED"
+        else:
+            life = "ENDED_UNREPORTED"
     elif row["status"] == "failed":
         # L'harness non e' mai partito. Non e' una sessione terminata senza
         # report e non deve quindi produrre il relativo avviso Telegram.
@@ -1766,11 +1962,11 @@ def apply_lifecycle(row: dict, last: dict) -> str:
         elif current_report:
             # 1. processo concluso con report → si usa il report
             life = row["report_status"]
-        elif last and last.get("status") == FAILED:
-            life = "DELIVERY_FAILED"
         elif row["exit_code"] not in ("", "0", "?"):
             # 3. exit code diverso da zero → crash
             life = "CRASHED"
+        elif last and last.get("status") == FAILED:
+            life = "DELIVERY_FAILED"
         else:
             # 2. exit code 0 (o sconosciuto) senza report
             life = "ENDED_UNREPORTED"
@@ -2174,6 +2370,16 @@ def _epoch(value: str) -> float:
 
 def runtime_capabilities(prof: dict) -> dict:
     rt = prof.get("runtime") or {}
+    codex_menu = prof.get("harness") == "codex"
+    runtime_note = rt.get("note", "")
+    if codex_menu:
+        # profiles.json è configurazione d'istanza e può conservare la vecchia
+        # nota secondo cui /model non era automatizzabile. La capability
+        # osservata dal wrapper è ora la fonte autoritativa per la UI.
+        runtime_note = ("Modello e consumo token vengono letti dallo stato di Codex; "
+                        "l'effort live resta quello richiesto. Il cambio a caldo apre "
+                        "/model e seleziona modello ed effort soltanto in menu riconosciuti; "
+                        "se il layout cambia non vengono premuti tasti alla cieca.")
     return {
         "profile_id": prof.get("id", ""),
         "supports_model": bool(prof.get("supports_model")),
@@ -2181,9 +2387,13 @@ def runtime_capabilities(prof: dict) -> dict:
         "effort_levels": list(prof.get("effort_levels") or []),
         "default_effort": prof.get("default_effort", ""),
         "model_suggestions": list(prof.get("model_suggestions") or []),
-        # cambio a caldo: possibile solo se il profilo dichiara il comando TUI
-        "live_model_change": bool(rt.get("model_command")),
-        "live_effort_change": bool(rt.get("effort_command")),
+        # Claude espone comandi con argomento; Codex richiede invece di aprire
+        # /model e scegliere modello ed effort nei due menu osservati.
+        "live_model_change": bool(rt.get("model_command")) or codex_menu,
+        "live_effort_change": bool(rt.get("effort_command")) or codex_menu,
+        "live_change_commands": (["/model"] if codex_menu else
+                                 [x for x in ("/model" if rt.get("model_command") else "",
+                                             "/effort" if rt.get("effort_command") else "") if x]),
         # modalita' di collaborazione: dichiarate dal profilo, applicate
         # leggendo la riga di stato della TUI (quindi verificabili a caldo)
         "modes": [{"id": o["id"], "label": o.get("label", o["id"]),
@@ -2195,7 +2405,7 @@ def runtime_capabilities(prof: dict) -> dict:
         "goal_note": (prof.get("goal") or {}).get("note", ""),
         "goal_max_length": int((prof.get("goal") or {}).get("max_length") or 500),
         "readable_state": bool(rt.get("source")),
-        "note": rt.get("note", ""),
+        "note": runtime_note,
     }
 
 
@@ -2306,9 +2516,33 @@ async def set_session_runtime(sid: str, request: Request):
     alive = bool(info) and not (info or {}).get("dead")
 
     applied, pending, errors = [], [], []
+    # In Codex modello ed effort sono una sola operazione interattiva: /model
+    # apre prima il catalogo e poi il menu dell'effort. Il wrapper osserva le
+    # righe numerate e conferma soltanto voci riconosciute.
+    codex_menu = prof.get("harness") == "codex" and alive and bool(model or effort)
+    if codex_menu:
+        target_effort = effort or row.get("effort") or prof.get("default_effort") or "medium"
+        try:
+            res = wrapper_json(row["unix_user"], SESSION_CTL, "model", row["tmux_name"],
+                               row["profile_id"], model, target_effort, timeout=90)
+        except HTTPException as exc:
+            errors.append(f"modello/effort: {exc.detail}")
+            pending.extend(x for x, value in (("model", model), ("effort", effort)) if value)
+        else:
+            if res.get("ok"):
+                value = "/".join(x for x in (model or "corrente", target_effort) if x)
+                applied.append({"field": "modello/effort", "value": value,
+                                "command": res.get("command", "/model"),
+                                "confirmed": int(res.get("confirmed") or 0),
+                                "pane_tail": res.get("pane_tail", "")})
+            else:
+                errors.append("modello/effort: " + res.get("error", "menu /model non riconosciuto"))
+                pending.extend(x for x, value in (("model", model), ("effort", effort)) if value)
     for field, value, template in (("model", model, rt.get("model_command")),
                                    ("effort", effort, rt.get("effort_command"))):
         if not value:
+            continue
+        if codex_menu:
             continue
         if not template:
             pending.append(field)
@@ -3261,7 +3495,8 @@ def _create_session(body: dict) -> dict:
     if environment not in UNIX_USERS:
         raise HTTPException(400, "ambiente non valido: usare PROJECT o SERVER")
     unix_user = UNIX_USERS[environment]
-    prof = profile_by_id(body.get("profile_id", ""))
+    defaults = account_session_default(unix_user)
+    prof = profile_by_id(body.get("profile_id") or defaults["profile_id"])
     if unix_user not in prof.get("allowed_users", []):
         raise HTTPException(400, f"il profilo {prof['id']} non e' consentito per {unix_user}")
 
@@ -3282,8 +3517,13 @@ def _create_session(body: dict) -> dict:
     if perm not in prof.get("permission_modes", {}):
         raise HTTPException(400, f"modalita' permessi non valida: {perm}")
 
-    model = (body.get("model") or "").strip()
-    effort = validate_effort(prof, body.get("effort"))
+    same_default_profile = prof["id"] == defaults["profile_id"]
+    model_value = body.get("model") if "model" in body else (
+        defaults["model"] if same_default_profile else "")
+    effort_value = body.get("effort") if "effort" in body else (
+        defaults["effort"] if same_default_profile else "")
+    model = validate_model(prof, model_value)
+    effort = validate_effort(prof, effort_value)
     session_mode = validate_mode(prof, body.get("mode"))
     goal = validate_goal(prof, body.get("goal"))
     prompt_as_goal = bool(body.get("prompt_as_goal"))
@@ -3428,13 +3668,15 @@ async def post_message(sid: str, request: Request):
     row = get_session(sid)
     body = await request.json()
     text = body.get("text", "")
-    if not isinstance(text, str) or not text.strip():
-        raise HTTPException(400, "testo mancante: scrivi il messaggio da inviare")
+    if not isinstance(text, str):
+        raise HTTPException(400, "il testo del messaggio non e' valido")
     if len(text) > 500_000:
         raise HTTPException(400, "testo troppo lungo (massimo 500 000 caratteri)")
     docs = attach_docs_to_session(row, [str(d) for d in (body.get("document_ids") or [])])
+    if not text.strip() and not docs:
+        raise HTTPException(400, "testo mancante: scrivi un messaggio o allega un documento")
     if docs:
-        text = text.rstrip() + "\n\n" + documents_block(docs)
+        text = ((text.rstrip() + "\n\n") if text.strip() else "") + documents_block(docs)
     # il testo e' salvato prima del tentativo: un errore di tmux non lo perde
     mid = add_message(sid, text, kind="user")
     deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
@@ -3502,12 +3744,27 @@ async def session_action(sid: str, request: Request):
         started = start_tmux_session(
             row, with_contract(row, prompt, initial=True) if prompt.strip() else "",
             prompt_mode_for(prof) if prompt.strip() else "paste")
+        restarted_at = now()
         with db() as conn:
-            conn.execute("UPDATE sessions SET status='running', ended_at='', created_at=? WHERE id=?",
-                         (now(), sid))
-        row["created_at"] = now()
+            conn.execute(
+                "UPDATE sessions SET status='running',ended_at='',created_at=?,exit_code='',"
+                "lifecycle='STARTING',lifecycle_at=?,notification_suppressed_at='' WHERE id=?",
+                (restarted_at, restarted_at, sid))
+            # Il nuovo tentativo ha una propria riga di messaggio. Quella del
+            # tentativo precedente non deve continuare a contare come testo
+            # da reinviare, ma resta nello storico con una nota esplicita.
+            conn.execute(
+                "UPDATE messages SET status=?,note=? WHERE session_id=? AND kind='initial' "
+                "AND status=?", (RESENT, "sostituito dal successivo Restart", sid, FAILED))
+        row.update({"status": "running", "ended_at": "", "created_at": restarted_at,
+                    "exit_code": "", "lifecycle": "STARTING",
+                    "lifecycle_at": restarted_at})
         save_launch_info(sid, started, row)
         register_initial_prompt(row, prompt, started)
+        # Il restart risolve l'evento precedente senza passare dalla normale
+        # transizione di apply_lifecycle: chiudi subito l'avviso anche sulle
+        # altre installazioni PWA della stessa persona.
+        dismiss_webpush_session_async(sid)
     elif action == "delete":
         delete_session(row)
     else:
@@ -3516,11 +3773,16 @@ async def session_action(sid: str, request: Request):
 
 
 def close_session(row: dict) -> None:
-    """Chiude il pane conservando sessione, messaggi, report e trascrizione."""
+    """Chiude il pane e impedisce notifiche tardive fino a un Restart."""
     wrapper(row["unix_user"], SESSION_CTL, "kill", row["tmux_name"], timeout=30)
+    stamp = now()
     with db() as conn:
-        conn.execute("UPDATE sessions SET status='ended', ended_at=? WHERE id=?",
-                     (now(), row["id"]))
+        conn.execute(
+            "UPDATE sessions SET status='ended',ended_at=?,notification_suppressed_at=? "
+            "WHERE id=?", (stamp, stamp, row["id"]))
+    # La chiusura e' una decisione esplicita: rimuove subito l'avviso da ogni
+    # installazione e copre anche lifecycle prodotti in ritardo da una child.
+    dismiss_webpush_session_async(row["id"])
 
 
 def delete_session(row: dict) -> None:
@@ -3842,6 +4104,11 @@ async def upload_documents(request: Request):
     """Upload multiplo in streaming. Nessun file viene mai eseguito."""
     form = await request.form()
     slug = (form.get("project_slug") or "").strip()
+    scope = (form.get("scope") or "private").strip()
+    if scope not in ("private", "repository"):
+        raise HTTPException(400, "scope deve essere private oppure repository")
+    if scope == "repository" and not slug:
+        raise HTTPException(400, "un documento repository richiede un progetto")
     if slug and not SLUG_RE.match(slug):
         raise HTTPException(400, f"slug progetto non valido: {slug}")
     if slug:
@@ -3854,7 +4121,7 @@ async def upload_documents(request: Request):
     saved, errors = [], []
     for up in files:
         try:
-            saved.append(store_upload(up, slug))
+            saved.append(store_upload(up, slug, scope))
         except HTTPException as exc:
             errors.append(f"{up.filename}: {exc.detail}")
         finally:
@@ -3864,7 +4131,7 @@ async def upload_documents(request: Request):
     return {"documents": saved, "errors": errors}
 
 
-def store_upload(up, slug: str) -> dict:
+def store_upload(up, slug: str, scope: str = "private") -> dict:
     name = safe_name(up.filename)
     ext = doc_ext(name)
     if ext not in ALLOWED_DOC_EXT:
@@ -3900,9 +4167,9 @@ def store_upload(up, slug: str) -> dict:
     except OSError:
         pass
     path = str(dest)
-    scope = "private"
     if slug:
-        res = wrapper_json(PROJECT_UNIX_USER, PROJECT_CTL, "knowledge-import", slug, path, name, timeout=300)
+        command = "doc-import" if scope == "repository" else "knowledge-import"
+        res = wrapper_json(PROJECT_UNIX_USER, PROJECT_CTL, command, slug, path, name, timeout=300)
         path, name = res["path"], res["name"]
         shutil.rmtree(staging, ignore_errors=True)
     doc = {
@@ -4165,6 +4432,23 @@ def finalize_escalation_grant(source_row: dict, host_row: dict,
     dismiss_webpush_session_async(source_row["id"])
 
 
+def finalize_escalation_launch_failure(source_row: dict, host_row: dict,
+                                       request_id: str, scope: str, error: str) -> None:
+    """Una child mai partita non puo' diventare una dipendenza concessa."""
+    detail = (error or "avvio sessione host fallito").strip()[:500]
+    with db() as conn:
+        conn.execute(
+            "UPDATE escalation_requests SET status='failed',host_session_id=?,error=?,"
+            "decided_at=COALESCE(NULLIF(decided_at,''),?) WHERE id=?",
+            (host_row["id"], detail, now(), request_id),
+        )
+    summary = f"Avvio della sessione host fallito: {detail}."
+    if scope:
+        summary += " Lo scope amministrativo resta da eseguire e puo' essere rilanciato."
+    system_report(source_row["id"], "NEEDS_HOST_ACTION", summary,
+                  source="escalation-launch")
+
+
 def grant_escalation(source_row: dict, scope: str, request_id: str = "",
                      profile_id: str = "") -> dict:
     """Crea una sola child SERVER per richiesta e collega entrambi i lifecycle."""
@@ -4197,7 +4481,8 @@ def grant_escalation(source_row: dict, scope: str, request_id: str = "",
         if not failed_sid:
             raise
         host_row = get_session(failed_sid)
-        finalize_escalation_grant(source_row, host_row, request_id, scope)
+        finalize_escalation_launch_failure(
+            source_row, host_row, request_id, scope, str(exc.detail))
         return {"session": host_row, "request_id": request_id,
                 "launch_error": str(exc.detail)}
     finalize_escalation_grant(source_row, result["session"], request_id, scope)
@@ -4499,7 +4784,8 @@ def build_accounts() -> dict:
         # catalogo al provider a ogni giro.
         refresh_model_catalog(u)
     return {"accounts": out, "profiles": load_profiles(),
-            "catalog": model_catalog_payload()}
+            "catalog": model_catalog_payload(),
+            "account_defaults": account_session_defaults()}
 
 
 ACCOUNTS_SNAPSHOT = Snapshot(build_accounts)
@@ -4528,6 +4814,29 @@ async def refresh_accounts_models(request: Request):
     return {"catalog": model_catalog_payload(user)[user]}
 
 
+@app.post("/api/accounts/defaults")
+async def save_account_defaults(request: Request):
+    body = await request.json()
+    user = str(body.get("unix_user") or "")
+    if user not in AGENT_UNIX_USERS:
+        raise HTTPException(400, "utente non valido")
+    prof = profile_by_id(str(body.get("profile_id") or ""))
+    if user not in prof.get("allowed_users", []):
+        raise HTTPException(400, f"il profilo {prof['id']} non e' consentito per {user}")
+    model = validate_model(prof, body.get("model"))
+    effort = validate_effort(prof, body.get("effort"))
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO account_session_defaults "
+            "(unix_user,profile_id,model,effort,updated_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(unix_user) DO UPDATE SET profile_id=excluded.profile_id,"
+            "model=excluded.model,effort=excluded.effort,updated_at=excluded.updated_at",
+            (user, prof["id"], model, effort, now()),
+        )
+    ACCOUNTS_SNAPSHOT.invalidate()
+    return {"defaults": account_session_default(user)}
+
+
 @app.post("/api/accounts/login")
 async def accounts_login(request: Request):
     body = await request.json()
@@ -4546,10 +4855,12 @@ async def accounts_login(request: Request):
         "id": sid, "name": f"LOGIN {prof['label']} ({user})", "tmux_name": tmux_name,
         "project_slug": "", "workdir": f"/home/{user}", "environment":
             "SERVER" if user == SERVER_UNIX_USER else "PROJECT",
-        "profile_id": prof["id"], "model": "", "effort": "", "harness_session_id": "",
+        "profile_id": prof["id"], "model": "", "effort": "", "session_mode": "",
+        "goal": "", "harness_session_id": "",
         "executor_enabled": 0, "executor_model": "", "executor_max_agents": 0,
         "permission_mode": "n/a", "unix_user": user,
         "kind": "login", "status": "running", "initial_prompt": "", "parent_session": "",
+        "relation_type": "", "relation_request_id": "",
         "cols": 120, "rows": 34, "created_at": now(), "ended_at": "", "auto_trust": 1,
     }
     # Il pane tmux esiste gia': se la riga non entra nel registro il login

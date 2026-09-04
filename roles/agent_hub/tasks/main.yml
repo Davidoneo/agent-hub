@@ -9,6 +9,9 @@
       - agent_hub_allowed_users | length > 0
       - agent_hub_socket is match('^/run/[A-Za-z0-9_-]+/[A-Za-z0-9._/-]+[.]sock$')
       - "'..' not in agent_hub_socket"
+      - agent_hub_harness_audit_project is match('^[a-z0-9][a-z0-9._-]{0,62}$')
+      - agent_hub_harness_audit_model is match('^[A-Za-z0-9][A-Za-z0-9._/:-]{0,79}$')
+      - agent_hub_harness_audit_effort in ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
     fail_msg: >-
       agent_hub_origin and agent_hub_allowed_users must be set, and
       agent_hub_socket must be a nested socket path below /run. Without these,
@@ -347,7 +350,7 @@
     - Reload systemd
     - Restart agent-hub-telegram
 
-- name: Agent Hub | health check units
+- name: Agent Hub | scheduled maintenance units
   ansible.builtin.template:
     src: "{{ item }}.j2"
     dest: "/etc/systemd/system/{{ item }}"
@@ -357,6 +360,8 @@
   loop:
     - agent-hub-health.service
     - agent-hub-health.timer
+    - agent-hub-harness-update.service
+    - agent-hub-harness-update.timer
   notify: Reload systemd
 
 - name: Agent Hub | enable the private socket
@@ -418,4 +423,11 @@
     name: agent-hub-health.timer
     enabled: true
     state: started
+    daemon_reload: true
+
+- name: Agent Hub | configure the nightly harness update timer
+  ansible.builtin.systemd:
+    name: agent-hub-harness-update.timer
+    enabled: "{{ agent_hub_harness_updates_enabled | bool }}"
+    state: "{{ 'started' if agent_hub_harness_updates_enabled | bool else 'stopped' }}"
     daemon_reload: true

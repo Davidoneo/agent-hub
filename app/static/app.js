@@ -155,7 +155,6 @@ function recordActivity(force = false) {
 
 let pushRegistration = null;
 let pushSubscription = null;
-let pushPresenceTimer = null;
 
 function pushKeyBytes(value) {
   const padded = value + "=".repeat((4 - value.length % 4) % 4);
@@ -180,28 +179,10 @@ function paintPushButton() {
     : "Attiva le notifiche push su questo dispositivo";
 }
 
-async function registerPushSubscription(sub, visible = !document.hidden) {
+async function registerPushSubscription(sub) {
   await post("/api/push/subscriptions", {
-    subscription: sub.toJSON(), visible,
+    subscription: sub.toJSON(),
   }, "registrazione notifiche push");
-}
-
-async function reportPushPresence(visible = !document.hidden) {
-  if (!pushSubscription) return;
-  try {
-    await post("/api/push/presence", {
-      endpoint: pushSubscription.endpoint, visible,
-    }, "presenza notifiche push");
-  } catch (e) { /* il prossimo heartbeat riprova */ }
-}
-
-function reportPushHidden() {
-  if (!pushSubscription || !BOOT) return;
-  fetch("/api/push/presence", {
-    method: "POST", keepalive: true,
-    headers: { "Content-Type": "application/json", "X-CSRF-Token": BOOT.csrf },
-    body: JSON.stringify({ endpoint: pushSubscription.endpoint, visible: false }),
-  }).catch(() => {});
 }
 
 async function setupPush() {
@@ -222,8 +203,6 @@ async function setupPush() {
     toast("Notifiche push non inizializzabili: " + (e.message || e), "err");
   }
   paintPushButton();
-  clearInterval(pushPresenceTimer);
-  pushPresenceTimer = setInterval(() => reportPushPresence(), 30_000);
 
   btn.onclick = async () => {
     btn.disabled = true;
@@ -245,7 +224,7 @@ async function setupPush() {
           userVisibleOnly: true,
           applicationServerKey: pushKeyBytes(cfg.public_key),
         });
-        await registerPushSubscription(pushSubscription, true);
+        await registerPushSubscription(pushSubscription);
         toast("Notifiche push attivate su questo dispositivo");
       }
     } catch (e) {
@@ -309,7 +288,6 @@ const ROUTES = [
   [/^\/meetings\/([^/?]+)/, viewMeeting],
   [/^\/projects$/, viewProjects],
   [/^\/projects\/([^/?]+)/, viewProject],
-  [/^\/documents/, viewDocuments],
   [/^\/new/, viewNewSession],
   [/^\/accounts$/, viewAccounts],
   [/^\/status$/, viewStatus],
@@ -454,6 +432,12 @@ function modelOptions(unixUser, profileId, current) {
   ].filter(Boolean).join("");
 }
 
+function sessionDefault(user) {
+  const fallback = { profile_id: "codex-openai", model: "gpt-5.6-sol", effort: "high" };
+  return Object.assign({}, fallback,
+    (BOOT && BOOT.account_defaults && BOOT.account_defaults[user]) || {});
+}
+
 const EXECUTOR_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 // I sub agent girano sempre come devagent tramite `agent-executor`, che
@@ -579,6 +563,9 @@ const ATTENTION_LIFECYCLES = new Set([
   "ENDED_UNREPORTED", "DELIVERY_FAILED", "POSSIBLY_STALLED", "AUTH_REQUIRED",
   "USAGE_LIMIT", "LAUNCH_FAILED",
 ]);
+// I completamenti sono eventi transitori: generano un toast quando la pagina
+// e' visibile, ma non restano nella barra delle richieste di attenzione.
+const TRANSIENT_NOTICE_LIFECYCLES = new Set(["COMPLETED"]);
 let attentionReady = false;
 let attentionSeen = new Set();
 
@@ -586,49 +573,61 @@ function attentionSignature(s) {
   return `${s.id}:${s.lifecycle}:${s.lifecycle_at || ""}`;
 }
 
-function renderAttention(sessions) {
+function renderAttention(sessions, serverUnreadCount = null) {
   const box = $("#attention");
   if (!box) return;
-  // La barra segnala lavoro attuale, non riesuma errori storici delle sessioni
-  // gia' chiuse (quelli restano consultabili in dashboard).
+  const unread = (sessions || []).filter(s => s.notification_unread);
+  const unreadCount = Number.isInteger(serverUnreadCount) ? serverUnreadCount : unread.length;
+  const navNotice = $("#nav-notice");
+  if (navNotice) {
+    navNotice.textContent = unreadCount ? String(unreadCount) : "";
+    navNotice.classList.toggle("visible", unreadCount > 0);
+  }
+  // Una condizione ancora azionabile resta nella barra mentre la sessione e'
+  // aperta; crash e completamenti chiusi restano invece finche' non vengono
+  // letti su uno qualunque dei dispositivi della stessa identita'.
   const active = (sessions || []).filter(s =>
-    ATTENTION_LIFECYCLES.has(s.lifecycle) && sessionIsOpen(s));
-  const signatures = new Set(active.map(attentionSignature));
+    ATTENTION_LIFECYCLES.has(s.lifecycle) && (sessionIsOpen(s) || s.notification_unread));
+  const visible = active.concat(unread.filter(s => !active.includes(s)));
+  const signatures = new Set(unread.map(attentionSignature));
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.ready.then(reg => {
       if (reg.active) reg.active.postMessage({
-        type: "sync-attention", session_ids: active.map(s => s.id),
+        type: "sync-notifications",
+        event_keys: unread.map(s => s.notification_event_key).filter(Boolean),
+        badge: unreadCount,
       });
     }).catch(() => {});
   }
-  if ("setAppBadge" in navigator && active.length) {
-    navigator.setAppBadge(active.length).catch(() => {});
-  } else if ("clearAppBadge" in navigator && !active.length) {
+  if ("setAppBadge" in navigator && unreadCount) {
+    navigator.setAppBadge(unreadCount).catch(() => {});
+  } else if ("clearAppBadge" in navigator && !unreadCount) {
     navigator.clearAppBadge().catch(() => {});
   }
   const fresh = attentionReady
-    ? active.filter(s => !attentionSeen.has(attentionSignature(s))) : [];
+    ? unread.filter(s => !attentionSeen.has(attentionSignature(s))) : [];
 
   if (fresh.length) {
     const first = fresh[0];
     const label = (LIFECYCLE[first.lifecycle] || [first.lifecycle])[0];
     toast(fresh.length === 1
       ? `${first.name}: ${label}`
-      : `${fresh.length} sessioni richiedono attenzione`, "attention");
+      : `${fresh.length} sessioni hanno nuovi aggiornamenti`, "attention");
   }
   attentionSeen = signatures;
   attentionReady = true;
 
-  if (!active.length) {
+  if (!visible.length) {
     box.innerHTML = "";
     return;
   }
   box.innerHTML = `<div class="attention-panel">
     <div class="attention-title"><span aria-hidden="true">●</span>
-      <b>Richiede attenzione</b><span class="attention-count">${active.length}</span></div>
-    <div class="attention-items">${active.map(s => {
+      <b>Novità e richieste</b><span class="attention-count">${visible.length}</span></div>
+    <div class="attention-items">${visible.map(s => {
       const [label, cls] = LIFECYCLE[s.lifecycle] || [s.lifecycle, "ended"];
       return `<a href="#/session/${encodeURIComponent(s.id)}" class="attention-item">
+        ${s.notification_unread ? '<span class="attention-unread-dot" aria-label="non letto">●</span>' : ""}
         <span class="attention-name">${esc(s.name)}</span>
         <span class="tag ${cls}">${esc(label)}</span>
         <span class="attention-open">Apri →</span></a>`;
@@ -636,11 +635,38 @@ function renderAttention(sessions) {
   </div>`;
 }
 
+function dismissLocalSessionNotification(sid, badge) {
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.ready.then(reg => {
+    if (reg.active) reg.active.postMessage({
+      type: "dismiss", session_id: sid, badge,
+    });
+  }).catch(() => {});
+}
+
+async function markSessionNotificationRead(sid) {
+  const receipt = await post("/api/notifications/read", { session_id: sid },
+    "sincronizzazione notifiche");
+  // La Push inviata dal backend riallinea le altre installazioni. Questo
+  // messaggio chiude subito gli avvisi dello stesso dispositivo, anche quando
+  // la sessione e' stata aperta dalla dashboard invece che dalla notifica.
+  dismissLocalSessionNotification(sid, receipt.unread_count);
+  return receipt;
+}
+
 async function loadAttention() {
   if (document.hidden) return;
   try {
     const d = await api("/api/sessions", {}, "notifiche interne");
-    renderAttention(d.sessions);
+    const match = location.hash.match(/^#\/session\/([^/?#]+)/);
+    const viewed = match ? decodeURIComponent(match[1]) : "";
+    const current = viewed && d.sessions.find(s => s.id === viewed && s.notification_unread);
+    if (current) {
+      const receipt = await markSessionNotificationRead(viewed);
+      current.notification_unread = false;
+      d.unread_count = receipt.unread_count;
+    }
+    renderAttention(d.sessions, d.unread_count);
   } catch (e) {
     // Un polling accessorio non deve coprire la pagina con un errore. Il
     // riquadro corrente resta visibile e il prossimo giro riprova.
@@ -853,7 +879,7 @@ async function viewProjects() {
     try {
       const r = await post("/api/projects", { action: "new", slug }, "creazione progetto");
       const files = $("#np-files").files;
-      if (files && files.length) await uploadFiles(files, r.slug);
+      if (files && files.length) await uploadFiles(files, r.slug, null, "repository");
       toast("Progetto creato: " + r.slug);
       location.hash = "#/projects/" + encodeURIComponent(r.slug);
     } catch (e) { showError(e); $("#np-go").disabled = false; }
@@ -1266,7 +1292,7 @@ async function viewProject(slug) {
   $("#pj-upload").onclick = async () => {
     const files = $("#pj-files").files;
     if (!files || !files.length) { toast("Nessun file selezionato", "err"); return; }
-    try { await uploadFiles(files, slug); toast("Documenti caricati"); route(); }
+    try { await uploadFiles(files, slug, null, "repository"); toast("Documenti caricati"); route(); }
     catch (e) { showError(e); }
   };
   $("#pj-init").onclick = async () => {
@@ -1321,9 +1347,10 @@ function setupDrop(zone, input) {
   });
 }
 
-async function uploadFiles(files, slug, onProgress) {
+async function uploadFiles(files, slug, onProgress, scope = "private") {
   const fd = new FormData();
   if (slug) fd.append("project_slug", slug);
+  fd.append("scope", scope);
   for (const f of files) fd.append("files", f, f.name);
   const send = () => new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -1469,6 +1496,41 @@ async function dirPicker(el, environment, initial, onPick) {
 
 // ----------------------------------------------------------- nuova sessione
 
+// La bozza resta soltanto nel browser e viene rimossa appena il backend ha
+// persistito la nuova sessione. localStorage e' sincrono: anche un cambio
+// schermata immediato dopo la digitazione non perde il prompt.
+function newSessionPromptDraftKey() {
+  return `agenthub-new-session-prompt:${(BOOT && BOOT.user) || "local"}`;
+}
+
+function readNewSessionPromptDraft() {
+  try { return localStorage.getItem(newSessionPromptDraftKey()) || ""; }
+  catch (e) { return ""; }
+}
+
+function writeNewSessionPromptDraft(value) {
+  try {
+    if (value) localStorage.setItem(newSessionPromptDraftKey(), value);
+    else localStorage.removeItem(newSessionPromptDraftKey());
+  } catch (e) { /* storage privato/disabilitato: il form continua a funzionare */ }
+}
+
+function sessionMessageDraftKey(sid) {
+  return `agenthub-session-message:${(BOOT && BOOT.user) || "local"}:${sid}`;
+}
+
+function readSessionMessageDraft(sid) {
+  try { return localStorage.getItem(sessionMessageDraftKey(sid)) || ""; }
+  catch (e) { return ""; }
+}
+
+function writeSessionMessageDraft(sid, value) {
+  try {
+    if (value) localStorage.setItem(sessionMessageDraftKey(sid), value);
+    else localStorage.removeItem(sessionMessageDraftKey(sid));
+  } catch (e) { /* il composer resta utilizzabile anche senza storage */ }
+}
+
 async function viewNewSession() {
   // Oltre al CSRF riallinea il catalogo: uno startup di Claude puo' avere
   // appena rinnovato l'OAuth e reso nuovamente interrogabile /v1/models.
@@ -1565,7 +1627,7 @@ async function viewNewSession() {
           <input type="checkbox" class="sel-doc" value="${esc(x.id)}" style="margin-top:3px;flex:none">
           <span style="min-width:0;overflow-wrap:anywhere">${esc(x.name)}<br>
             <span class="muted mono" style="font-size:11px">${esc(x.path)}</span></span></label>`).join("") ||
-          '<span class="muted">Nessun documento caricato. Vai su Documenti per aggiungerne.</span>'}
+          '<span class="muted">Nessun documento caricato. Usa la scheda Documenti del progetto o caricalo dal dispositivo.</span>'}
       </div>
       ${help("I percorsi completi dei documenti selezionati vengono aggiunti in fondo al prompt iniziale.")}
 
@@ -1599,7 +1661,11 @@ async function viewNewSession() {
     </div>`;
 
   const envSel = $("#s-env"), profSel = $("#s-profile");
+  const promptEl = $("#s-prompt");
   let picker = null;
+
+  promptEl.value = readNewSessionPromptDraft();
+  promptEl.oninput = () => writeNewSessionPromptDraft(promptEl.value);
 
   // Il valore effettivo del modello: la tendina, oppure il campo libero
   // quando è stata scelta la voce «altro…».
@@ -1622,10 +1688,11 @@ async function viewNewSession() {
   }
 
   // I livelli offerti seguono il modello scelto, non solo l'harness.
-  function syncEffort(p, user) {
+  function syncEffort(p, user, preferred = null) {
     const sel = $("#s-effort");
     const { levels, source } = effortLevelsFor(p, user, selectedModel());
-    const wanted = sel.value || p.default_effort || "medium";
+    const wanted = preferred === null
+      ? (sel.value || p.default_effort || "medium") : preferred;
     sel.innerHTML = levels.length
       ? `<option value="">(default dell'harness)</option>` + levels.map(l =>
           `<option value="${esc(l)}">${esc(l)}</option>`).join("")
@@ -1710,16 +1777,18 @@ async function viewNewSession() {
         "Aggiornalo dalla pagina Accounts.";
   }
 
-  function syncProfile() {
+  function syncProfile(useAccountDefault = false) {
     const p = profiles.find(x => x.id === profSel.value);
     const user = envSel.value === "SERVER" ? serverUser() : projectUser();
-    const keep = selectedModel();
+    const preferred = sessionDefault(user);
+    const keep = useAccountDefault && preferred.profile_id === p.id ? preferred.model : "";
     $("#s-model").innerHTML = modelOptions(user, p.id, keep);
     $("#s-model").disabled = !p.supports_model;
     $("#s-perm").innerHTML = Object.keys(p.permission_modes || {}).map(k =>
       `<option value="${esc(k)}"${k === p.default_permission_mode ? " selected" : ""}>${k === "full" ? "full — accesso completo (default)" : esc(k)}</option>`).join("");
     syncModelNote(p, user);
-    syncEffort(p, user);
+    syncEffort(p, user,
+      useAccountDefault && preferred.profile_id === p.id ? preferred.effort : null);
     syncModes(p);
     syncExecutor();
     const allowed = (p.allowed_users || []).includes(user);
@@ -1732,14 +1801,16 @@ async function viewNewSession() {
   }
   function syncEnv() {
     const server = envSel.value === "SERVER";
+    const preferred = sessionDefault(server ? serverUser() : projectUser());
+    if (profiles.some(p => p.id === preferred.profile_id)) profSel.value = preferred.profile_id;
     $("#s-project-wrap").style.display = server ? "none" : "";
     $("#s-workdir").placeholder = server ? `(vuoto = ${serverHome()})` : "(vuoto = radice del progetto)";
     $("#s-picker").style.display = "none";
     picker = null;
-    syncProfile();
+    syncProfile(true);
   }
   envSel.onchange = syncEnv;
-  profSel.onchange = syncProfile;
+  profSel.onchange = () => syncProfile(false);
   $("#s-executor-enabled").onchange = syncExecutor;
   $("#s-mode").onchange = () => syncModes(profiles.find(x => x.id === profSel.value));
   $("#s-docs-toggle").onclick = () => {
@@ -1783,7 +1854,9 @@ async function viewNewSession() {
     $("#s-go").disabled = true;
     try {
       if (files && files.length) {
-        const up = await uploadFiles(files, envSel.value === "PROJECT" ? $("#s-project").value : "");
+        const isProject = envSel.value === "PROJECT";
+        const up = await uploadFiles(files, isProject ? $("#s-project").value : "", null,
+                                     isProject ? "repository" : "private");
         (up.documents || []).forEach(x => docIds.push(x.id));
       }
       const body = {
@@ -1809,10 +1882,12 @@ async function viewNewSession() {
         rows: parseInt($("#s-rows").value, 10) || 30,
       };
       const r = await post("/api/sessions", body, "creazione sessione");
+      writeNewSessionPromptDraft("");
       toast("Sessione avviata (consegna prompt: " + r.delivery + ")");
       location.hash = "#/session/" + r.session.id;
     } catch (e) {
       if (e instanceof ApiError && e.code === "launch_failed" && e.sessionId) {
+        writeNewSessionPromptDraft("");
         toast("Avvio fallito: sessione e prompt sono stati salvati", "err");
         location.hash = "#/session/" + encodeURIComponent(e.sessionId);
       } else {
@@ -2010,11 +2085,11 @@ function lifecycleNote(st) {
 
 // Che cosa è stato realmente eseguito: profilo, modalità permessi e argv
 // effettivo del processo, non ciò che il profilo dichiara in astratto.
-function diagCard(g) {
+function diagCard(g, nested = false) {
   if (!g) return "";
   const argv = (g.argv || []).join(" ");
   const perm = (g.permission_args || []).join(" ");
-  return `<details class="card" id="diag">
+  return `<details class="${nested ? "more" : "card"}" id="diag">
     <summary>Diagnostica: harness, permessi e comando eseguito</summary>
     <div class="kv" style="margin-top:8px">
       <div>Harness</div><div class="mono">${esc(g.harness)}</div>
@@ -2040,6 +2115,22 @@ function diagCard(g) {
              "SQLite: la cronologia degli input resta esattamente quella scritta da te.")}` : ""}
     <div class="row"><button class="small" id="diag-copy">Copia comando</button></div>
   </details>`;
+}
+
+function escalationControls(s, profiles) {
+  if (s.environment !== "PROJECT" || s.lifecycle !== "NEEDS_HOST_ACTION") return "";
+  const choices = profiles.filter(p => (p.allowed_users || []).includes(serverUser()));
+  return `<div class="warnbox escalation-box">
+    <div><b>Azione host richiesta dall'agente</b></div>
+    <div class="muted">Avvia una sessione SERVER con il contesto e la richiesta amministrativa corrente.</div>
+    <div class="row" style="margin-top:8px">
+      <select id="esc-profile" style="flex:1;min-width:220px">
+        ${choices.map(p => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("")}
+      </select>
+      <button class="small" id="esc-go">Escalate to hostagent</button>
+    </div>
+    <textarea id="esc-note" placeholder="Nota facoltativa per l'agente amministrativo…" style="min-height:60px"></textarea>
+  </div>`;
 }
 
 // ------------------------------------------ modello ed effort in esercizio
@@ -2185,7 +2276,8 @@ function runtimeBody(rt) {
     <div class="muted" style="margin-top:6px">${
       (hotModel || hotEffort)
         ? "Il cambio viene eseguito subito nella sessione con i comandi della TUI " +
-          `(${[hotModel ? "/model" : "", hotEffort ? "/effort" : ""].filter(Boolean).join(" e ")}) ` +
+          `(${(cap.live_change_commands || [hotModel ? "/model" : "", hotEffort ? "/effort" : ""]
+              .filter(Boolean)).join(" e ")}) ` +
           "e registrato per i prossimi avvii."
         : "Questo harness non permette il cambio a caldo: il valore viene registrato e " +
           "diventa effettivo al prossimo avvio (pulsante «Restart»)."}</div>
@@ -2205,11 +2297,20 @@ function runtimeBody(rt) {
 
 async function viewSession(sid) {
   sid = decodeURIComponent(sid);
+  // Entrare nella sessione equivale sempre a leggere la relativa notifica:
+  // vale sia per «Apri» sia per link diretti, cronologia e navigazione interna.
+  try {
+    await markSessionNotificationRead(sid);
+    loadAttention();
+  } catch (e) {
+    // La sincronizzazione delle notifiche e' accessoria: un suo errore non deve
+    // impedire l'accesso al terminale e verra' ritentato dal polling globale.
+  }
   const d = await api("/api/sessions/" + encodeURIComponent(sid), {}, "dettaglio sessione");
   const s = d.session;
   const envCls = s.environment === "SERVER" ? "server" : "project";
   const profiles = BOOT.profiles;
-  const allDocs = await api("/api/documents", {}, "elenco documenti");
+  let allDocs = await api("/api/documents", {}, "elenco documenti");
   const isCodexSession = String(s.profile_id || "").toLowerCase().includes("codex");
   const relations = d.relations || { parent: null, children: [] };
   const escalationHost = s.environment === "SERVER" && s.relation_type === "escalation" &&
@@ -2223,15 +2324,14 @@ async function viewSession(sid) {
         ${stateTags(s)}
       </div>
       <div class="muted mono" style="margin-top:6px">${esc(s.unix_user)} · ${esc(s.profile_id)} · ${esc(s.workdir)}</div>
+      ${s.lifecycle === "CRASHED" ? `<div class="errbox compact"><b>Sessione crashata</b>
+        Il processo ${esc(s.profile_id)} è terminato con exit code ${esc(s.exit_code || "sconosciuto")}.
+        Il prompt è rimasto salvato: usa Restart per ripartire.</div>` : ""}
       ${s.executor_enabled ? `<div class="row" style="margin-top:7px">
         <span class="tag running">sub agent ${esc(s.executor_model)}</span>
         <span class="tag idle">max ${esc(s.executor_max_agents)}</span>
         <span class="muted">delega efficiente attiva tramite agent-executor</span>
       </div>` : ""}
-      <details class="runtime" id="runtime">
-        <summary><span class="rt-tags" id="rt-tags">${runtimeTags(null)}</span></summary>
-        <div id="rt-body"><span class="muted">lettura dello stato dell'harness…</span></div>
-      </details>
       ${help("Il processo tmux vive fuori dal cgroup di agent-hub.service: riavviare il backend o chiudere " +
              "il browser non termina la sessione. Lo stato mostrato viene sempre riletto da tmux.")}
     </div>
@@ -2249,7 +2349,6 @@ async function viewSession(sid) {
         <span class="tag ${child.environment === "SERVER" ? "server" : "project"}">${
           esc(child.environment)}</span></div>`).join("")}
     </div>` : ""}
-    ${diagCard(d.diagnostics)}
     <div id="sess-err"></div>
     <div class="terminal-toolbar" aria-label="Scorrimento terminale">
       <span>Schermo live</span>
@@ -2261,9 +2360,12 @@ async function viewSession(sid) {
     <div class="muted" id="ws-state" style="margin-top:6px">connessione…</div>
     <div id="status-strip">${statusStrip(s)}</div>
     <div class="sticky-actions">
+      <div id="escalation-slot">${escalationControls(s, profiles)}</div>
       <textarea id="msg" placeholder="Messaggio o prompt multilinea…"></textarea>
-      <div class="row compose-actions">
+      <div id="msg-attachments" class="message-attachments muted"></div>
+      <div class="row compose-actions" style="margin-top:8px">
         <button class="primary" id="send">Invia</button>
+        <button class="small" id="attach">Allega</button>
         <button class="small" id="msg-toggle">Messaggi</button>
       </div>
       <div class="terminal-keyboard">
@@ -2301,9 +2403,16 @@ async function viewSession(sid) {
         <button class="small danger" id="a-kill">${escalationHost ? "Chiudi solo host" : "Kill"}</button>
         ${escalationHost ? '<button class="small danger" id="a-kill-pair">Chiudi entrambe</button>' : ""}
         <button class="small danger" id="a-delete">Elimina</button>
+        <button class="small runtime-toggle" id="runtime-toggle" title="Mostra il modello corrente e cambialo">
+          <span id="rt-tags">${runtimeTags(null)}</span>
+        </button>
+      </div>
+      <div class="runtime-panel" id="runtime-panel" style="display:none">
+        <div id="rt-body"><span class="muted">lettura dello stato dell'harness…</span></div>
       </div>
       ${help("Invia salva il testo in SQLite prima di consegnarlo: se tmux o la TUI falliscono il testo " +
-             "resta recuperabile dal pulsante «Messaggi». Il tastierino manda un tasto vero alla TUI: " +
+             "resta recuperabile dal pulsante «Messaggi». Gli allegati scelti non vengono comunicati " +
+             "all'agente finché non premi Invia. Il tastierino manda un tasto vero alla TUI: " +
              "le frecce navigano, Space seleziona, Tab cambia campo, Enter conferma ed Esc ferma la generazione lasciando " +
              "viva la sessione. Per Ctrl-C usa il terminale qui sopra.")}
     </div>
@@ -2329,47 +2438,6 @@ async function viewSession(sid) {
            <div>${esc(r.summary || "(nessun riepilogo)")}</div></div>`).join("")}</div>`
         : '<span class="muted">Nessuno stato finale registrato per questa sessione.</span>'}
       <div class="muted mono" style="margin-top:8px">agent-report COMPLETED --summary "…" · SESSION_ID ${esc(sid)}</div>
-    </div>
-
-    <h3>Documenti della sessione</h3>
-    <div class="card">
-      <div id="sess-docs">${(d.documents || []).map(x => docRow(x)).join("") ||
-        '<span class="muted">Nessun documento allegato.</span>'}</div>
-      <label>Aggiungi documenti già caricati</label>
-      <div style="max-height:170px;overflow:auto">
-        ${allDocs.documents.map(x => `<label class="inline" style="display:flex;margin:4px 0">
-          <input type="checkbox" class="add-doc" value="${esc(x.id)}">
-          <span>${esc(x.name)} <span class="muted">· ${esc(ts(x.modified_at))}</span></span></label>`).join("") ||
-          '<span class="muted">Nessun documento disponibile.</span>'}
-      </div>
-      <div class="row" style="margin-top:8px"><button class="small primary" id="doc-attach">Allega e comunica i percorsi</button></div>
-    </div>
-
-    <h3>Continuità</h3>
-    <div class="card">
-      <label>Continua con altro agente</label>
-      <div class="row">
-        <select id="cont-profile" style="flex:1">
-          ${profiles.map(p => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("")}
-        </select>
-        <input id="cont-model" placeholder="modello (opz.)" style="max-width:180px">
-        <button id="cont-go">Continua</button>
-      </div>
-      ${help("Crea una nuova sessione sullo stesso progetto precompilando obiettivo, .agent/HANDOFF.md e git status.")}
-      ${s.environment === "PROJECT" ? `
-      <label style="margin-top:14px">Escalate to hostagent</label>
-      <div class="row">
-        <select id="esc-profile" style="flex:1">
-          ${profiles.filter(p => (p.allowed_users || []).includes(serverUser())).map(p =>
-            `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("")}
-        </select>
-        <button class="small" id="esc-go">Escalate</button>
-      </div>
-      <textarea id="esc-note" placeholder="Nota facoltativa per l'agente amministrativo…" style="min-height:60px"></textarea>` : ""}
-      <details style="margin-top:10px"><summary>Anteprima handoff</summary>
-        <div class="row"><button class="small" id="prev-dev">Handoff altro agente</button>
-        ${s.environment === "PROJECT" ? '<button class="small" id="prev-host">Handoff hostagent</button>' : ""}</div>
-        <pre id="prev-out" style="display:none"></pre></details>
     </div>
 
     <h3>Log</h3>
@@ -2407,12 +2475,61 @@ async function viewSession(sid) {
              "orizzontali delle tabelle stampate dall'agente spariscono ma le celle restano. " +
              "Il log raw completo resta scaricabile per la diagnostica.")}
       <div class="muted mono">raw: /srv/agent-workspace/logs/${esc(s.tmux_name)}.log</div>
-    </div>`;
+    </div>
+
+    <details class="card more session-advanced" id="session-options">
+      <summary><b>Opzioni avanzate</b></summary>
+      <div class="advanced-body">
+        <h3>Continuità</h3>
+        <label>Continua con altro agente</label>
+        <div class="row">
+          <select id="cont-profile" style="flex:1">
+            ${profiles.map(p => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("")}
+          </select>
+          <input id="cont-model" placeholder="modello (opz.)" style="max-width:180px">
+          <button id="cont-go">Continua</button>
+        </div>
+        ${help("Crea una nuova sessione sullo stesso progetto precompilando obiettivo, .agent/HANDOFF.md e git status.")}
+        <details style="margin-top:10px"><summary>Anteprima handoff</summary>
+          <div class="row"><button class="small" id="prev-dev">Handoff altro agente</button>
+          ${s.environment === "PROJECT" ? '<button class="small" id="prev-host">Handoff hostagent</button>' : ""}</div>
+          <pre id="prev-out" style="display:none"></pre>
+        </details>
+        <h3>Diagnostica harness</h3>
+        ${diagCard(d.diagnostics, true)}
+      </div>
+    </details>`;
 
   wireDocActions(view(), []);
   if ($("#diag-copy")) {
     $("#diag-copy").onclick = () => copyText((d.diagnostics.argv || []).join(" "), "Comando copiato");
   }
+  const msgEl = $("#msg");
+  msgEl.value = readSessionMessageDraft(sid);
+  msgEl.oninput = () => writeSessionMessageDraft(sid, msgEl.value);
+
+  let currentLifecycle = s.lifecycle;
+  function paintEscalation(st) {
+    const next = st.lifecycle || "";
+    if (next === currentLifecycle && $("#escalation-slot").dataset.wired === "1") return;
+    currentLifecycle = next;
+    const state = Object.assign({}, s, st, { lifecycle: next });
+    const slot = $("#escalation-slot");
+    slot.innerHTML = escalationControls(state, profiles);
+    slot.dataset.wired = "1";
+    const button = $("#esc-go");
+    if (!button) return;
+    button.onclick = async () => {
+      if (!confirm("Avviare una sessione SERVER privilegiata come hostagent?")) return;
+      try {
+        const r = await post(`/api/sessions/${encodeURIComponent(sid)}/escalate`, {
+          profile_id: $("#esc-profile").value, note: $("#esc-note").value,
+        }, "escalation a hostagent");
+        location.hash = "#/session/" + r.session.id;
+      } catch (e) { showError(e, $("#sess-err")); }
+    };
+  }
+  paintEscalation(s);
 
   // terminale
   const dark = getComputedStyle(document.documentElement).getPropertyValue("--term-bg").trim() || "#000";
@@ -2429,26 +2546,46 @@ async function viewSession(sid) {
   setTimeout(() => { try { fit.fit(); } catch (e) { /* noop */ } }, 60);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/session/${encodeURIComponent(sid)}`);
-  ws.binaryType = "arraybuffer";
+  let ws = null;
+  let terminalDisposed = false;
   const dec = new TextDecoder();
   // gli eventi della WebSocket arrivano anche dopo che si è cambiata pagina:
   // a quel punto gli elementi non esistono più e scriverci abortisce l'handler
   const wsState = txt => { const el = $("#ws-state"); if (el) el.textContent = txt; };
-  ws.onopen = () => {
-    wsState("connesso — chiudere il browser non interrompe la sessione");
-    sendResize();
-  };
-  ws.onmessage = ev => term.write(typeof ev.data === "string" ? ev.data : dec.decode(ev.data));
-  ws.onclose = () => wsState("disconnesso (la sessione tmux resta attiva)");
-  ws.onerror = () => wsState("errore di connessione al terminale");
-  term.onData(data => { if (ws.readyState === 1) ws.send(data); });
+
+  function connectTerminal() {
+    if (terminalDisposed || document.hidden || (ws && (ws.readyState === WebSocket.OPEN ||
+                                   ws.readyState === WebSocket.CONNECTING))) return;
+    const socket = new WebSocket(`${proto}://${location.host}/ws/session/${encodeURIComponent(sid)}`);
+    ws = socket;
+    socket.binaryType = "arraybuffer";
+    socket.onopen = () => {
+      if (ws !== socket) { socket.close(); return; }
+      wsState("connesso — chiudere il browser non interrompe la sessione");
+      sendResize();
+    };
+    socket.onmessage = ev => {
+      if (ws === socket) term.write(typeof ev.data === "string" ? ev.data : dec.decode(ev.data));
+    };
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      wsState("disconnesso (la sessione tmux resta attiva)");
+    };
+    socket.onerror = () => {
+      if (ws === socket) wsState("errore di connessione al terminale");
+    };
+  }
+  connectTerminal();
+  term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
 
   function sendResize() {
+    if (document.hidden) return;
     try { fit.fit(); } catch (e) { return; }
-    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+    }
   }
-  let rt, trTimer = null, stateTimer = null, runtimeTimer = null;
+  let rt, trTimer = null, stateTimer = null, runtimeTimer = null, runtimeOpen = false;
   const onResize = () => { clearTimeout(rt); rt = setTimeout(sendResize, 250); };
   window.addEventListener("resize", onResize);
   // Il layout puo' cambiare senza un resize della finestra (sidebar, scrollbar,
@@ -2456,24 +2593,31 @@ async function viewSession(sid) {
   const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(onResize);
   if (resizeObserver) resizeObserver.observe($("#term"));
   // Una PWA o tab nascosta non deve continuare a imporre al pane tmux le sue
-  // dimensioni, in concorrenza con il PC. Al ritorno la vista viene ricreata,
-  // si riconnette e diventa il client attivo con le dimensioni correnti.
+  // dimensioni, in concorrenza con il PC. Lasciamo pero' intatta la vista:
+  // se WebKit sospende la socket, al ritorno basta riconnetterla senza perdere
+  // composer, posizione di scroll e pannelli aperti.
   const onVisibility = () => {
     if (document.hidden) {
-      try { ws.close(); } catch (e) { /* noop */ }
-    } else if (ws.readyState !== WebSocket.OPEN) {
-      setTimeout(route, 0);
+      return;
+    }
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      connectTerminal();
+    } else if (ws.readyState === WebSocket.OPEN) {
+      sendResize();
+    } else if (ws.readyState === WebSocket.CLOSING) {
+      setTimeout(connectTerminal, 300);
     }
   };
   document.addEventListener("visibilitychange", onVisibility);
   cleanup = () => {
+    terminalDisposed = true;
     window.removeEventListener("resize", onResize);
     document.removeEventListener("visibilitychange", onVisibility);
     if (resizeObserver) resizeObserver.disconnect();
     clearInterval(trTimer);
     clearInterval(stateTimer);
     clearInterval(runtimeTimer);
-    try { ws.close(); } catch (e) { /* noop */ }
+    try { if (ws) ws.close(); } catch (e) { /* noop */ }
     term.dispose();
   };
 
@@ -2543,6 +2687,7 @@ async function viewSession(sid) {
     try {
       const st = await api(`/api/sessions/${encodeURIComponent(sid)}/state`, {}, "stato sessione");
       $("#status-strip").innerHTML = statusStrip(st);
+      paintEscalation(st);
       counters = { messages_total: st.messages_total, undelivered: st.undelivered };
       paintToggle();
       const rb = $("#strip-resend");
@@ -2650,22 +2795,90 @@ async function viewSession(sid) {
     };
   }
 
-  $("#runtime").addEventListener("toggle", () => {
-    if ($("#runtime").open) refreshRuntime();
-  });
-  runtimeTimer = setInterval(() => refreshRuntime($("#runtime").open), 30000);
+  $("#runtime-toggle").onclick = () => {
+    runtimeOpen = !runtimeOpen;
+    $("#runtime-panel").style.display = runtimeOpen ? "block" : "none";
+    $("#runtime-toggle").classList.toggle("active", runtimeOpen);
+    if (runtimeOpen) refreshRuntime();
+  };
+  runtimeTimer = setInterval(() => refreshRuntime(runtimeOpen), 30000);
   refreshRuntime(false);
 
+  // Gli allegati restano nel compositore finché non viene premuto Invia.
+  // Anche l'upload dal dispositivo avviene soltanto in quel momento.
+  let pendingDocIds = new Set();
+  let pendingFiles = [];
+
+  function paintAttachments() {
+    const box = $("#msg-attachments");
+    const docs = allDocs.documents.filter(x => pendingDocIds.has(x.id)).map(x =>
+      `<span class="attachment-chip">${esc(x.name)}<button type="button" data-unattach-doc="${esc(x.id)}" aria-label="Rimuovi ${esc(x.name)}">×</button></span>`);
+    const files = pendingFiles.map((f, i) =>
+      `<span class="attachment-chip">${esc(f.name)} <span class="muted">da caricare</span><button type="button" data-unattach-file="${i}" aria-label="Rimuovi ${esc(f.name)}">×</button></span>`);
+    box.innerHTML = docs.concat(files).join("");
+    $$('[data-unattach-doc]', box).forEach(b => { b.onclick = () => { pendingDocIds.delete(b.dataset.unattachDoc); paintAttachments(); }; });
+    $$('[data-unattach-file]', box).forEach(b => { b.onclick = () => { pendingFiles.splice(Number(b.dataset.unattachFile), 1); paintAttachments(); }; });
+  }
+
+  $("#attach").onclick = async () => {
+    const already = new Set((d.documents || []).map(x => x.id));
+    const available = allDocs.documents;
+    const chosen = await modal("Allega al prossimo messaggio", `
+      ${(d.documents || []).length ? `<label>Già associati alla sessione</label>
+        <div class="attachment-existing">${d.documents.map(x =>
+          `<a href="/api/documents/${encodeURIComponent(x.id)}/download" download>${esc(x.name)}</a>`).join(" · ")}</div>` : ""}
+      <label>Documenti già caricati</label>
+      <div class="attachment-picker">${available.map(x => `<label class="inline">
+        <input type="checkbox" data-attach-doc value="${esc(x.id)}"${pendingDocIds.has(x.id) ? " checked" : ""}>
+        <span>${esc(x.name)}${already.has(x.id) ? ' <span class="muted">· già nella sessione</span>' : ""}<br>
+          <span class="muted mono">${esc(x.path)}</span></span></label>`).join("") ||
+        '<span class="muted">Nessun altro documento disponibile.</span>'}</div>
+      <label>Carica dal dispositivo</label>
+      <input type="file" data-attach-files multiple>
+      ${pendingFiles.length ? `<div class="muted" style="margin-top:6px">Già in attesa: ${esc(pendingFiles.map(f => f.name).join(", "))}</div>` : ""}
+      <div class="help" style="margin-top:10px">La selezione resta nel compositore. I percorsi vengono comunicati all'agente soltanto quando premi Invia.</div>`,
+      { ok: "Aggiungi al messaggio", read: root => ({
+          ids: Array.from(root.querySelectorAll('[data-attach-doc]:checked')).map(x => x.value),
+          files: Array.from(root.querySelector('[data-attach-files]').files || []),
+        }) });
+    if (!chosen) return;
+    pendingDocIds = new Set(chosen.ids);
+    for (const file of chosen.files) {
+      if (!pendingFiles.some(f => f.name === file.name && f.size === file.size && f.lastModified === file.lastModified)) {
+        pendingFiles.push(file);
+      }
+    }
+    paintAttachments();
+  };
+
   $("#send").onclick = async () => {
-    const text = $("#msg").value;
-    if (!text.trim()) { toast("Scrivi un messaggio prima di inviare", "err"); return; }
+    const text = msgEl.value;
+    if (!text.trim() && !pendingDocIds.size && !pendingFiles.length) {
+      toast("Scrivi un messaggio o allega un documento prima di inviare", "err"); return;
+    }
     $("#send").disabled = true;
     $("#sess-err").innerHTML = "";
     try {
+      if (pendingFiles.length) {
+        const isProject = s.environment === "PROJECT";
+        const up = await uploadFiles(pendingFiles, isProject ? s.project_slug : "", null,
+                                     isProject ? "repository" : "private");
+        (up.documents || []).forEach(x => {
+          allDocs.documents.push(x);
+          pendingDocIds.add(x.id);
+        });
+        pendingFiles = [];
+        paintAttachments();
+      }
       // il backend risponde appena il testo è in SQLite: la conferma è
       // immediata e lo stato di consegna arriva dal successivo refresh
-      await post(`/api/sessions/${encodeURIComponent(sid)}/messages`, { text }, "invio messaggio");
-      $("#msg").value = "";
+      await post(`/api/sessions/${encodeURIComponent(sid)}/messages`, {
+        text, document_ids: Array.from(pendingDocIds),
+      }, "invio messaggio");
+      msgEl.value = "";
+      writeSessionMessageDraft(sid, "");
+      pendingDocIds.clear();
+      paintAttachments();
       toast("Messaggio registrato — consegna in corso");
       setTimeout(() => {
         refreshState();
@@ -2675,22 +2888,12 @@ async function viewSession(sid) {
     $("#send").disabled = false;
   };
 
-  $("#doc-attach").onclick = async () => {
-    const ids = $$(".add-doc:checked").map(c => c.value);
-    if (!ids.length) { toast("Seleziona almeno un documento", "err"); return; }
-    try {
-      const r = await post(`/api/sessions/${encodeURIComponent(sid)}/documents`, { document_ids: ids }, "allegato documenti");
-      toast(`Registrati ${r.documents.length} documenti — consegna dei percorsi in corso`);
-      setTimeout(route, 900);
-    } catch (e) { showError(e, $("#sess-err")); }
-  };
-
   async function act(action, confirmMsg) {
     if (confirmMsg && !confirm(confirmMsg)) return;
     try {
       await post(`/api/sessions/${encodeURIComponent(sid)}/action`, { action }, "azione " + action);
       toast("Azione eseguita: " + action);
-      if (action === "delete") location.hash = "#/";
+      if (action === "kill" || action === "delete") location.hash = "#/";
       else if (action === "restart") setTimeout(route, 1200);
     } catch (e) { showError(e, $("#sess-err")); }
   }
@@ -2700,7 +2903,7 @@ async function viewSession(sid) {
     } catch (e) { showError(e, $("#sess-err")); }
   }
   function sendTuiKey(data) {
-    if (ws.readyState !== 1) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
       toast("Terminale non connesso: il tasto non è stato inviato", "err");
       return;
     }
@@ -2734,17 +2937,6 @@ async function viewSession(sid) {
       location.hash = "#/session/" + r.session.id;
     } catch (e) { showError(e, $("#sess-err")); }
   };
-  if ($("#esc-go")) {
-    $("#esc-go").onclick = async () => {
-      if (!confirm("Avviare una sessione SERVER privilegiata come hostagent?")) return;
-      try {
-        const r = await post(`/api/sessions/${encodeURIComponent(sid)}/escalate`, {
-          profile_id: $("#esc-profile").value, note: $("#esc-note").value,
-        }, "escalation a hostagent");
-        location.hash = "#/session/" + r.session.id;
-      } catch (e) { showError(e, $("#sess-err")); }
-    };
-  }
   async function preview(toHost) {
     try {
       const r = await api(`/api/sessions/${encodeURIComponent(sid)}/handoff-preview?to_host=${toHost}`, {}, "anteprima handoff");
@@ -2806,7 +2998,10 @@ async function viewAccounts() {
 }
 
 function renderAccounts(d) {
-  if (BOOT) BOOT.catalog = d.catalog || BOOT.catalog;
+  if (BOOT) {
+    BOOT.catalog = d.catalog || BOOT.catalog;
+    BOOT.account_defaults = d.account_defaults || BOOT.account_defaults;
+  }
   // Il catalogo è letto dal provider con le credenziali dell'utente, quindi
   // ogni riga dice tre cose distinte: se è stato possibile verificarlo, quando,
   // e che cosa il provider offre davvero adesso.
@@ -2832,6 +3027,8 @@ function renderAccounts(d) {
   const block = (user, a) => {
     const cls = user === serverUser() ? "server" : "project";
     const profs = d.profiles.filter(p => (p.allowed_users || []).includes(user) && p.login);
+    const availableProfiles = d.profiles.filter(p => (p.allowed_users || []).includes(user));
+    const defaults = sessionDefault(user);
     return `<div class="card ${cls}">
       <div class="row spread"><b class="mono">${esc(user)}</b>
         <span class="tag ${cls}">${user === serverUser() ? "SERVER — privileged" : "PROJECT — rootless"}</span></div>
@@ -2844,6 +3041,20 @@ function renderAccounts(d) {
         <div>Docker</div><div class="mono">${esc(a.docker || "—")}</div>
         <div>Server tmux</div><div class="mono">${esc(a.tmux_unit || "—")}</div>
       </div>
+      <details open style="margin-top:10px"><summary><b>Default nuove sessioni</b></summary>
+        <div data-defaults="${esc(user)}" style="margin-top:8px">
+          <label>Harness</label>
+          <select data-default-profile>${availableProfiles.map(p =>
+            `<option value="${esc(p.id)}"${p.id === defaults.profile_id ? " selected" : ""}>${esc(p.label)}</option>`
+          ).join("")}</select>
+          <label>Modello</label>
+          <select data-default-model></select>
+          <input data-default-model-other placeholder="id del modello" style="display:none;margin-top:6px">
+          <label>Effort</label>
+          <select data-default-effort></select>
+          <div class="row" style="margin-top:8px"><button class="small primary" data-default-save>Salva default</button></div>
+        </div>
+      </details>
       <details style="margin-top:8px"><summary>Provider OpenCode configurati</summary>
         <pre>${esc(a.opencode_providers || "—")}</pre></details>
       <div style="margin-top:10px"><b>Catalogo modelli</b>${catalog(user)}</div>
@@ -2872,6 +3083,65 @@ function renderAccounts(d) {
           in <span class="mono">~/.local/share/opencode/auth.json</span> dell'utente Unix.</li>
       </ul>
     </div>`;
+
+  $$('[data-defaults]').forEach(card => {
+    const user = card.dataset.defaults;
+    const initial = sessionDefault(user);
+    const profile = $("[data-default-profile]", card);
+    const model = $("[data-default-model]", card);
+    const other = $("[data-default-model-other]", card);
+    const effort = $("[data-default-effort]", card);
+    const chosenModel = () => model.value === "__other__" ? other.value.trim() : model.value;
+    const chosenProfile = () => d.profiles.find(p => p.id === profile.value);
+
+    function syncDefaultEffort(preferred = "") {
+      const p = chosenProfile();
+      const levels = p ? effortLevelsFor(p, user, chosenModel()).levels : [];
+      const wanted = preferred || effort.value || (p && p.default_effort) || "medium";
+      effort.innerHTML = levels.length
+        ? levels.map(level => `<option value="${esc(level)}">${esc(level)}</option>`).join("")
+        : '<option value="">non disponibile</option>';
+      effort.value = levels.includes(wanted) ? wanted : (levels.includes("medium") ? "medium" : "");
+      effort.disabled = !levels.length;
+    }
+
+    function syncDefaultModel(preferred = "", preferredEffort = "") {
+      const p = chosenProfile();
+      model.innerHTML = p && p.supports_model ? modelOptions(user, p.id, preferred)
+        : '<option value="">non disponibile</option>';
+      model.disabled = !(p && p.supports_model);
+      other.style.display = model.value === "__other__" ? "" : "none";
+      other.value = model.value === "__other__" ? preferred : "";
+      syncDefaultEffort(preferredEffort);
+    }
+
+    profile.onchange = () => syncDefaultModel();
+    model.onchange = () => {
+      other.style.display = model.value === "__other__" ? "" : "none";
+      if (model.value === "__other__") other.focus();
+      syncDefaultEffort();
+    };
+    other.oninput = () => syncDefaultEffort();
+    $("[data-default-save]", card).onclick = async event => {
+      event.currentTarget.disabled = true;
+      try {
+        const result = await post("/api/accounts/defaults", {
+          unix_user: user,
+          profile_id: profile.value,
+          model: chosenModel(),
+          effort: effort.disabled ? "" : effort.value,
+        }, "salvataggio default sessione");
+        BOOT.account_defaults = Object.assign({}, BOOT.account_defaults, { [user]: result.defaults });
+        toast(`Default di ${user} salvato`);
+      } catch (e) {
+        showError(e);
+      } finally {
+        event.currentTarget.disabled = false;
+      }
+    };
+    syncDefaultModel(initial.model, initial.effort);
+  });
+
   // `refresh=1` non attende la raccolta: dichiara vecchio ciò che c'è e la fa
   // ripartire. Il ciclo di `liveView` mostra i dati nuovi appena esistono.
   $("#ac-refresh").onclick = async () => {
@@ -3709,11 +3979,7 @@ function applyTheme(mode) {
       loadUsagePanel();
       loadAttention();
       recordActivity(true);
-      reportPushPresence(true);
-    } else {
-      reportPushHidden();
     }
   });
-  window.addEventListener("pagehide", reportPushHidden);
   route();
 })();

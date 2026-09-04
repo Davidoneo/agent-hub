@@ -35,8 +35,8 @@ class ReportCtlBoundaryTests(unittest.TestCase):
                     reported_at TEXT NOT NULL, source TEXT NOT NULL, unix_user TEXT NOT NULL
                 );
                 INSERT INTO sessions (id,name,unix_user,environment) VALUES
-                    ('aaaaaa','project','devagent','PROJECT'),
-                    ('bbbbbb','server','serveragent','SERVER');
+                    ('aaaaaa','project','test-project-agent','PROJECT'),
+                    ('bbbbbb','server','test-server-agent','SERVER');
             """)
 
     def tearDown(self):
@@ -59,11 +59,11 @@ class ReportCtlBoundaryTests(unittest.TestCase):
 
     def test_owner_can_report_and_identity_is_derived(self):
         result = self.run_ctl(
-            "devagent", "report", "aaaaaa", "COMPLETED", "  lavoro   finito  ", "",
+            "test-project-agent", "report", "aaaaaa", "COMPLETED", "  lavoro   finito  ", "",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["unix_user"], "devagent")
+        self.assertEqual(payload["unix_user"], "test-project-agent")
         self.assertEqual(payload["source"], "agent-report")
         self.assertEqual(payload["summary"], "lavoro finito")
         with sqlite3.connect(self.db) as conn:
@@ -73,12 +73,12 @@ class ReportCtlBoundaryTests(unittest.TestCase):
                 "JOIN session_reports ON sessions.id=session_reports.session_id "
                 "WHERE sessions.id='aaaaaa'"
             ).fetchone()
-        self.assertEqual(row, ("COMPLETED", "devagent", "agent-report"))
+        self.assertEqual(row, ("COMPLETED", "test-project-agent", "agent-report"))
         self.assertTrue((self.reports / "aaaaaa.json").is_file())
 
     def test_project_cannot_report_server_session(self):
         result = self.run_ctl(
-            "devagent", "report", "bbbbbb", "COMPLETED", "falso", "",
+            "test-project-agent", "report", "bbbbbb", "COMPLETED", "falso", "",
         )
         self.assertEqual(result.returncode, 3)
         self.assertIn("non appartenente", result.stderr)
@@ -90,7 +90,7 @@ class ReportCtlBoundaryTests(unittest.TestCase):
 
     def test_project_host_action_creates_telegram_approval_request(self):
         result = self.run_ctl(
-            "devagent", "report", "aaaaaa", "NEEDS_HOST_ACTION",
+            "test-project-agent", "report", "aaaaaa", "NEEDS_HOST_ACTION",
             "Installare il pacchetto host X, senza modificare la rete", "",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -105,14 +105,14 @@ class ReportCtlBoundaryTests(unittest.TestCase):
 
     def test_server_host_action_does_not_request_another_escalation(self):
         result = self.run_ctl(
-            "serveragent", "report", "bbbbbb", "NEEDS_HOST_ACTION", "serve presenza fisica", "",
+            "test-server-agent", "report", "bbbbbb", "NEEDS_HOST_ACTION", "serve presenza fisica", "",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["escalation_request_id"], "")
 
     def test_waiting_session_records_structured_dependency(self):
         result = self.run_ctl(
-            "devagent", "report", "aaaaaa", "WAITING_SESSION",
+            "test-project-agent", "report", "aaaaaa", "WAITING_SESSION",
             "attendo la sessione server", "bbbbbb",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -127,7 +127,7 @@ class ReportCtlBoundaryTests(unittest.TestCase):
 
     def test_waiting_session_rejects_missing_target(self):
         result = self.run_ctl(
-            "devagent", "report", "aaaaaa", "WAITING_SESSION",
+            "test-project-agent", "report", "aaaaaa", "WAITING_SESSION",
             "attendo una sessione assente", "cccccc",
         )
         self.assertEqual(result.returncode, 3)
@@ -142,8 +142,8 @@ class ReportCtlBoundaryTests(unittest.TestCase):
 
     def test_legacy_spoofable_arguments_are_rejected(self):
         result = self.run_ctl(
-            "devagent", "report", "aaaaaa", "COMPLETED", "test",
-            "fake-source", "hostagent", "",
+            "test-project-agent", "report", "aaaaaa", "COMPLETED", "test",
+            "fake-source", "test-server-agent", "",
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("uso:", result.stderr)

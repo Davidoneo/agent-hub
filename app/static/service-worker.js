@@ -6,12 +6,21 @@ self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
 self.addEventListener("fetch", () => {});
 
-function closeResolvedNotifications(activeIds = null, onlyId = "") {
-  const active = activeIds ? new Set(activeIds.map(String)) : null;
+function setBadge(count) {
+  const value = Math.max(0, Number(count) || 0);
+  if (value && "setAppBadge" in self.navigator) return self.navigator.setAppBadge(value);
+  if (!value && "clearAppBadge" in self.navigator) return self.navigator.clearAppBadge();
+  return Promise.resolve();
+}
+
+function closeResolvedNotifications(unreadKeys = null, onlyId = "") {
+  const unread = unreadKeys ? new Set(unreadKeys.map(String)) : null;
   return self.registration.getNotifications().then(items => {
     for (const item of items) {
       const sid = String(item.data?.session_id || "");
-      if ((onlyId && sid === onlyId) || (active && sid && !active.has(sid))) item.close();
+      const eventKey = String(item.data?.event_key || "");
+      if ((onlyId && sid === onlyId) ||
+          (unread && (!eventKey || !unread.has(eventKey)))) item.close();
     }
   });
 }
@@ -20,7 +29,9 @@ self.addEventListener("push", event => {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch (e) { data = {}; }
   if (data.type === "dismiss" && data.session_id) {
-    event.waitUntil(closeResolvedNotifications(null, String(data.session_id)));
+    event.waitUntil(Promise.all([
+      closeResolvedNotifications(null, String(data.session_id)), setBadge(data.badge),
+    ]));
     return;
   }
   const title = data.title || "Agent Hub richiede attenzione";
@@ -30,18 +41,27 @@ self.addEventListener("push", event => {
     badge: "/static/icons/icon-192.png",
     tag: data.tag || "agenthub-attention",
     renotify: true,
-    data: { url: data.url || "/#/", session_id: data.session_id || "" },
+    data: {
+      url: data.url || "/#/", session_id: data.session_id || "",
+      lifecycle: data.lifecycle || "",
+      event_key: data.event_key || "",
+    },
   };
   const work = [self.registration.showNotification(title, options)];
-  if (Number(data.badge) > 0 && "setAppBadge" in self.navigator) {
-    work.push(self.navigator.setAppBadge(Number(data.badge)));
-  }
+  work.push(setBadge(data.badge));
   event.waitUntil(Promise.all(work));
 });
 
 self.addEventListener("message", event => {
-  if (event.data?.type === "sync-attention") {
-    event.waitUntil(closeResolvedNotifications(event.data.session_ids || []));
+  const data = event.data || {};
+  if (data.type === "dismiss" && data.session_id) {
+    event.waitUntil(Promise.all([
+      closeResolvedNotifications(null, String(data.session_id)), setBadge(data.badge),
+    ]));
+  } else if (data.type === "sync-notifications") {
+    event.waitUntil(Promise.all([
+      closeResolvedNotifications(data.event_keys || []), setBadge(data.badge),
+    ]));
   }
 });
 

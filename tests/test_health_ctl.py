@@ -105,6 +105,20 @@ class ServiceTemplateTests(unittest.TestCase):
         self.assertIn('"X-Agent-Hub-Session-Id": sid', main)
         self.assertIn("headers=exc.headers", main)
 
+    def test_nightly_harness_update_is_provisioned(self):
+        tasks = (ROOT / "roles/agent_hub/tasks/main.yml").read_text()
+        service = (ROOT / "roles/agent_hub/templates/agent-hub-harness-update.service.j2").read_text()
+        timer = (ROOT / "roles/agent_hub/templates/agent-hub-harness-update.timer.j2").read_text()
+        updater = (ROOT / "libexec/harness-update-ctl").read_text()
+        self.assertIn("agent-hub-harness-update.timer", tasks)
+        self.assertIn("harness-update-ctl --project", service)
+        self.assertIn("OnCalendar={{ agent_hub_harness_update_calendar }}", timer)
+        self.assertIn('checked_update(["/usr/bin/codex", "update"]', updater)
+        self.assertIn('["/usr/bin/opencode", "upgrade", "--method", "npm"]', updater)
+        self.assertIn('as_user(user, ["claude", "update"]', updater)
+        self.assertIn('default="gpt-5.6-sol"', updater)
+        self.assertIn('default="high"', updater)
+
 
 if __name__ == "__main__":
     unittest.main()

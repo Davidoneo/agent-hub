@@ -24,8 +24,10 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -143,6 +145,79 @@ def ensure_server(env):
             return
         time.sleep(0.1)
     die("il server tmux non risponde dopo l'avvio dell'unit", 3)
+
+
+def _launch_spec_dir():
+    """Directory privata per argv troppo grandi da inserire nel comando tmux."""
+    user = me()
+    path = os.path.join(f"/run/user/{user.pw_uid}", "agent-hub-launch")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    current = time.time()
+    for name in os.listdir(path):
+        stale = os.path.join(path, name)
+        try:
+            if name.startswith("launch-") and current - os.stat(stale).st_mtime > 3600:
+                os.unlink(stale)
+        except OSError:
+            pass
+    return path
+
+
+def _write_launch_spec(command):
+    """Salva l'argv in un file 0600: tmux riceve soltanto il percorso corto."""
+    directory = _launch_spec_dir()
+    fd, path = tempfile.mkstemp(prefix="launch-", suffix=".json", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"argv": command}, fh, ensure_ascii=False)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _consume_launch_spec(path):
+    """Legge e rimuove uno spec appartenente all'utente prima dell'exec."""
+    directory = os.path.realpath(_launch_spec_dir())
+    if os.path.dirname(os.path.realpath(path)) != directory:
+        die("percorso launch spec non consentito")
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            os.close(fd)
+            die("launch spec non privato o non appartenente all'utente")
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"launch spec illeggibile: {exc}")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    command = data.get("argv") if isinstance(data, dict) else None
+    if (not isinstance(command, list) or not command or len(command) > 128 or
+            any(not isinstance(value, str) or "\x00" in value for value in command)):
+        die("argv non valido nel launch spec")
+    return command
+
+
+def cmd_launch_spec(argv):
+    """Entry point interno eseguito dal pane tmux; non eleva privilegi."""
+    if len(argv) != 1:
+        die("uso: launch-spec <file>")
+    command = _consume_launch_spec(argv[0])
+    os.execvp(command[0], command)
 
 
 def check_workdir(path, environment):
@@ -339,11 +414,27 @@ def cmd_start(argv):
             os.unlink(os.path.join(LOG_DIR, stale))
         except OSError:
             pass
-    inner = "cd " + shlex.quote(workdir) + " && exec " + " ".join(shlex.quote(c) for c in cmd)
+    launch_spec = ""
+    if delivered_via_argv:
+        # tmux limita la lunghezza del proprio comando. Un handoff ricco di
+        # contesto supera facilmente quella soglia anche se execve lo accetta.
+        # Il pane riceve quindi un comando corto e consuma l'argv da un file
+        # 0600 nella runtime dir dell'utente, rimosso prima di avviare la CLI.
+        launch_spec = _write_launch_spec(cmd)
+        runner = [os.path.realpath(__file__), "launch-spec", launch_spec]
+    else:
+        runner = cmd
+    inner = "cd " + shlex.quote(workdir) + " && exec " + " ".join(
+        shlex.quote(c) for c in runner)
 
     r = tmux("new-session", "-d", "-s", name, "-x", str(cols), "-y", str(rows),
              "-c", workdir, *env_args(env), "bash", "-lc", inner, env=env)
     if r.returncode != 0:
+        if launch_spec:
+            try:
+                os.unlink(launch_spec)
+            except OSError:
+                pass
         die(r.stderr.strip() or "tmux new-session fallito", 3)
 
     tmux("set-option", "-t", name, "history-limit", "50000", env=env)
@@ -546,6 +637,31 @@ def _screen_text(name, env):
     return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
 
 
+def _confirm_trust_prompt(name, trust, env, screen):
+    """Conferma Claude solo dopo avere selezionato esplicitamente «Yes».
+
+    Claude Code 2.1.259 apre il safety check con «No, exit» selezionato. Un
+    semplice Enter, usato in precedenza, termina quindi la CLI con status 1.
+    La selezione viene letta dalla schermata visibile: se la voce attiva non e'
+    riconoscibile non inviamo Enter e lasciamo il dialogo all'utente.
+    """
+    reject_selected = re.compile(r"(?:^|\n)\s*[❯>]\s*No,\s*exit\b", re.IGNORECASE)
+    accept_selected = re.compile(
+        r"(?:^|\n)\s*[❯>]\s*Yes,\s*I\s+trust\s+this\s+folder\b", re.IGNORECASE)
+    if reject_selected.search(screen):
+        r = tmux("send-keys", "-t", name, trust.get("select_key", "Down"), env=env)
+        if r.returncode != 0:
+            return False, (r.stderr or "selezione trust fallita").strip()
+        time.sleep(0.2)
+        screen = _screen_text(name, env)
+    if not accept_selected.search(screen):
+        return False, "la voce «Yes, I trust this folder» non risulta selezionata"
+    r = tmux("send-keys", "-t", name, trust.get("key", "Enter"), env=env)
+    if r.returncode != 0:
+        return False, (r.stderr or "conferma trust fallita").strip()
+    return True, ""
+
+
 def _rate_limit_menu(name, path, env):
     """Gestisce il popup Codex dei limiti senza perdere il messaggio.
 
@@ -614,12 +730,15 @@ def _wait_ready(name, prof, timeout, env, auto_trust=True):
         seen = _pane_text(name, env)
         if trust_rx and any(r.search(seen) for r in trust_rx):
             if auto_trust and not trusted:
-                tmux("send-keys", "-t", name, trust.get("key", "Enter"), env=env)
-                trusted = True
-                time.sleep(1.0)
-                continue
+                accepted, trust_error = _confirm_trust_prompt(name, trust, env, seen)
+                if accepted:
+                    trusted = True
+                    time.sleep(1.0)
+                    continue
+                note = ("la TUI attende la conferma della directory ma la "
+                        f"selezione automatica non e' sicura: {trust_error}")
             note = ("la TUI attende la conferma della directory "
-                    "(«trust this folder»): confermala nel terminale")
+                    "(«trust this folder»): confermala nel terminale") if not note else note
             time.sleep(1.0)
             continue
         if any(r.search(seen) for r in rx):
@@ -886,13 +1005,13 @@ def cmd_login(argv):
     env = base_env()
     ensure_server(env)
     args = login.get("args", [])
-    if prof["harness"] == "claude":
-        # Claude Code: la TUI si apre e riceve /login come primo comando.
-        cmd = [prof["command"]]
-        prompt = "/login"
-    else:
-        cmd = [prof["command"], *args]
-        prompt = None
+    # Il profilo descrive direttamente il comando di autenticazione. Claude
+    # Code espone `auth login`: avviare prima la normale TUI non autenticata e
+    # aspettarne il composer crea un deadlock, perche' il composer compare solo
+    # dopo il login. `prompt` resta disponibile per eventuali harness che
+    # richiedano davvero un comando dentro una TUI gia' pronta.
+    cmd = [prof["command"], *args]
+    prompt = login.get("prompt")
     inner = "exec " + " ".join(shlex.quote(c) for c in cmd)
     r = tmux("new-session", "-d", "-s", name, "-x", "120", "-y", "34",
              "-c", env["HOME"], *env_args(env), "bash", "-lc", inner, env=env)
@@ -900,6 +1019,10 @@ def cmd_login(argv):
         die(r.stderr.strip() or "tmux new-session fallito", 3)
     tmux("set-option", "-t", name, "history-limit", "50000", env=env)
     tmux("set-option", "-t", name, "status", "off", env=env)
+    # Il comando di login termina da solo sia dopo il successo sia dopo un
+    # errore. Conservare il pane morto permette al controller di leggere
+    # l'exit status prima di chiudere tmux e distinguere i due esiti.
+    tmux("set-option", "-t", name, "remain-on-exit", "on", env=env)
     tmux("pipe-pane", "-t", name, "-O",
          "cat >> " + shlex.quote(os.path.join(LOG_DIR, f"{name}.log")), env=env)
     if prompt:
@@ -1188,6 +1311,126 @@ def cmd_command(argv):
     tail = "\n".join(_pane_text(name, env, lines=40).strip().splitlines()[-12:])
     print(json.dumps({"ok": True, "command": text, "pane_tail": tail,
                       "confirmed": len(confirmed)}))
+
+
+def _wait_screen(name, env, marker, timeout=10.0, absent=False):
+    """Attende un marcatore nella schermata visibile, mai nello scrollback."""
+    deadline = time.time() + timeout
+    screen = ""
+    while time.time() < deadline:
+        screen = _screen_text(name, env)
+        present = marker in screen
+        # Durante la chiusura dei menu Codex ridisegna l'alternate screen e
+        # tmux puo' osservare per un istante un frame interamente vuoto. Non e'
+        # ancora una conferma che il menu sia chiuso: attendiamo il primo frame
+        # non vuoto senza il marcatore richiesto.
+        if present != absent and (not absent or screen.strip()):
+            return screen
+        time.sleep(0.15)
+    return ""
+
+
+def _menu_rows(screen):
+    """Righe numerate della TUI come (numero, etichetta, selezionata)."""
+    rows = []
+    for line in screen.splitlines():
+        match = re.match(r"^\s*(?:(›)\s*)?(\d+)\.\s+(.+?)\s*$", line)
+        if match:
+            rows.append((int(match.group(2)), match.group(3), bool(match.group(1))))
+    return rows
+
+
+def _choose_menu_row(name, env, predicate):
+    """Sposta la selezione su una riga osservata e la conferma."""
+    screen = _screen_text(name, env)
+    rows = _menu_rows(screen)
+    current = next((number for number, _label, selected in rows if selected), None)
+    target = next((number for number, label, _selected in rows if predicate(label)), None)
+    if current is None or target is None:
+        return False, "menu non riconosciuto", screen
+    key = "Down" if target > current else "Up"
+    for _ in range(abs(target - current)):
+        if tmux("send-keys", "-t", name, key, env=env).returncode != 0:
+            return False, f"invio {key} fallito", screen
+    if tmux("send-keys", "-t", name, "Enter", env=env).returncode != 0:
+        return False, "invio Enter fallito", screen
+    return True, "", screen
+
+
+def cmd_model(argv):
+    """model <session> <profile-id> <model> <effort> — cambia Codex via /model.
+
+    Codex non accetta `/model <id>`: apre due menu successivi. Selezioniamo
+    soltanto righe che la schermata mostra davvero; se titolo o voce cambiano,
+    il comando si ferma senza premere tasti alla cieca. E' intenzionalmente un
+    contratto stretto, così l'audit notturno intercetta i cambi della TUI.
+    """
+    if len(argv) != 4:
+        die("uso: model <session> <profile-id> <model> <effort>")
+    name = check_session(argv[0])
+    prof = load_profiles().get(argv[1]) or die("profilo sconosciuto")
+    model, effort = argv[2].strip(), argv[3].strip().lower()
+    if prof.get("harness") != "codex":
+        die("il selettore /model interattivo e' supportato solo per Codex")
+    if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,79}", model):
+        die("modello non valido")
+    if effort not in (prof.get("effort_levels") or []):
+        die("effort non valido")
+    env = base_env()
+    if tmux("has-session", "-t", name, env=env).returncode != 0:
+        print(json.dumps({"ok": False, "error": "la sessione tmux non e' attiva"}))
+        return
+
+    ok, err = _type_line(name, env, "/model")
+    screen = _wait_screen(name, env, "Select Model and Effort") if ok else ""
+    if not screen:
+        print(json.dumps({"ok": False, "error": err or "menu modello Codex non riconosciuto"}))
+        return
+    resolved_model = model
+    if not resolved_model:
+        resolved_model = next((label.split()[0] for _number, label, _selected
+                               in _menu_rows(screen) if "(current)" in label), "")
+    wanted_model = ((lambda label: label.split()[0] == resolved_model)
+                    if resolved_model else (lambda label: "(current)" in label))
+    ok, err, screen = _choose_menu_row(name, env, wanted_model)
+    if not ok or not _wait_screen(name, env, "Select Reasoning Level for"):
+        print(json.dumps({"ok": False, "error": err or "menu effort Codex non riconosciuto",
+                          "pane_tail": "\n".join(screen.splitlines()[-16:])}))
+        return
+
+    labels = {
+        "minimal": "Minimal", "low": "Low", "medium": "Medium",
+        "high": "High", "xhigh": "Extra high",
+    }
+    advanced = effort in ("max", "ultra")
+    if advanced:
+        ok, err, screen = _choose_menu_row(name, env, lambda label: label.startswith("More reasoning"))
+        if not ok or not _wait_screen(name, env, "Advanced Reasoning"):
+            print(json.dumps({"ok": False, "error": err or "menu Advanced Reasoning non riconosciuto",
+                              "pane_tail": "\n".join(screen.splitlines()[-16:])}))
+            return
+        wanted = effort.capitalize()
+        ok, err, screen = _choose_menu_row(name, env, lambda label: label.startswith(wanted))
+    else:
+        wanted = labels.get(effort, effort)
+        ok, err, screen = _choose_menu_row(name, env, lambda label: label.startswith(wanted))
+    if not ok:
+        print(json.dumps({"ok": False, "error": err,
+                          "pane_tail": "\n".join(screen.splitlines()[-16:])}))
+        return
+
+    # Non basta osservare la scomparsa del menu: Codex ridisegna prima la
+    # vecchia cornice e aggiorna modello/footer nel frame successivo. Attendiamo
+    # quindi la coppia effettiva modello+effort mostrata dalla TUI.
+    screen = (_wait_screen(name, env, f"{resolved_model} {effort}")
+              if resolved_model else "")
+    if not screen:
+        print(json.dumps({"ok": False, "error": "Codex non ha confermato il modello richiesto",
+                          "pane_tail": "\n".join((screen or _screen_text(name, env)).splitlines()[-16:])}))
+        return
+    tail = "\n".join(screen.strip().splitlines()[-14:])
+    print(json.dumps({"ok": True, "command": "/model", "model": resolved_model,
+                      "effort": effort, "confirmed": 2, "pane_tail": tail}))
 
 
 # ------------------------------------------- modalita' di collaborazione
@@ -1961,12 +2204,13 @@ def cmd_server(argv):
 
 
 COMMANDS = {
-    "start": cmd_start, "send": cmd_send, "deliver": cmd_deliver,
+    "start": cmd_start, "launch-spec": cmd_launch_spec,
+    "send": cmd_send, "deliver": cmd_deliver,
     "await-ready": cmd_await_ready, "keys": cmd_keys, "scroll": cmd_scroll,
     "kill": cmd_kill, "has": cmd_has, "list": cmd_list, "capture": cmd_capture,
     "attach": cmd_attach, "resize": cmd_resize, "login": cmd_login, "info": cmd_info,
     "models": cmd_models, "usage": cmd_usage, "runtime": cmd_runtime,
-    "command": cmd_command, "mode": cmd_mode, "goal": cmd_goal,
+    "command": cmd_command, "model": cmd_model, "mode": cmd_mode, "goal": cmd_goal,
     "server": cmd_server, "version": cmd_version,
 }
 

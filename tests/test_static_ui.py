@@ -41,6 +41,14 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn('tabLink("meetings",', self.app)
         self.assertIn("?tab=meetings", self.app)
 
+    def test_documents_are_nested_under_projects(self):
+        parser = NavParser()
+        parser.feed(self.index)
+        self.assertNotIn("#/documents", parser.hrefs)
+        self.assertNotIn("[/^\\/documents/", self.app)
+        self.assertIn('tabLink("documents",', self.app)
+        self.assertIn('uploadFiles(files, slug, null, "repository")', self.app)
+
     def test_open_session_and_turn_outcome_are_separate(self):
         self.assertIn("function sessionIsOpen", self.app)
         self.assertIn('label = "Turno completato"', self.app)
@@ -86,6 +94,16 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("Chiudi entrambe", self.app)
         self.assertIn("Sessioni collegate", self.app)
 
+    def test_failed_escalation_launch_is_not_marked_granted(self):
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        failed = backend[backend.index("except HTTPException as exc:",
+                                       backend.index("def grant_escalation")):
+                         backend.index("finalize_escalation_grant(source_row, result",
+                                       backend.index("def grant_escalation"))]
+        self.assertIn("finalize_escalation_launch_failure", failed)
+        self.assertNotIn("finalize_escalation_grant(source_row, host_row", failed)
+        self.assertIn("Lo scope amministrativo resta da eseguire", backend)
+
     def test_mobile_tui_controls_cover_structured_answers_and_context(self):
         for control in ("a-left", "a-right", "a-space", "a-tab", "a-context"):
             self.assertIn(f'id="{control}"', self.app)
@@ -129,11 +147,13 @@ class StaticUiContracts(unittest.TestCase):
 
     def test_internal_attention_is_persistent_and_polled(self):
         self.assertIn('id="attention" aria-live="polite"', self.index)
+        self.assertIn('id="nav-notice"', self.index)
         self.assertIn("const ATTENTION_LIFECYCLES", self.app)
         self.assertIn('"NEEDS_INPUT"', self.app)
         self.assertIn("function loadAttention()", self.app)
         self.assertIn("setInterval(loadAttention, 10_000)", self.app)
         self.assertIn(".attention-panel {", self.css)
+        self.assertIn("#nav-notice.visible", self.css)
 
     def test_delivery_failure_is_visible_in_web_attention_only(self):
         backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
@@ -156,12 +176,63 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn('self.addEventListener("notificationclick"', worker)
         self.assertIn('data.type === "dismiss"', worker)
         self.assertIn('self.addEventListener("message"', worker)
-        self.assertIn('type: "sync-attention"', self.app)
+        self.assertIn('type: "sync-notifications"', self.app)
+        self.assertIn('type: "dismiss", session_id: sid, badge', self.app)
+        worker_messages = worker[worker.index('self.addEventListener("message"'):
+                                 worker.index('self.addEventListener("notificationclick"')]
+        self.assertIn('data.type === "dismiss" && data.session_id', worker_messages)
+        self.assertIn('closeResolvedNotifications(null, String(data.session_id))',
+                      worker_messages)
+        session_view = self.app[self.app.index("async function viewSession(sid)"):]
+        self.assertIn("await markSessionNotificationRead(sid)", session_view)
+        self.assertIn('const TRANSIENT_NOTICE_LIFECYCLES = new Set(["COMPLETED"])', self.app)
         self.assertIn("clients.openWindow(target)", worker)
+        self.assertIn("function setBadge(count)", worker)
+        self.assertIn("data.event_keys", worker)
+        self.assertIn('lifecycle: data.lifecycle || ""', worker)
+        self.assertIn('event_key: data.event_key || ""', worker)
         self.assertIn('CREATE TABLE IF NOT EXISTS push_subscriptions', backend)
+        self.assertIn('CREATE TABLE IF NOT EXISTS lifecycle_receipts', backend)
         self.assertIn('@app.post("/api/push/subscriptions")', backend)
+        self.assertIn('@app.post("/api/notifications/read")', backend)
         self.assertIn('@app.post("/api/push/presence")', backend)
-        self.assertIn("Finche' e' visibile basta la barra interna", backend)
+        self.assertIn('"COMPLETED", "NEEDS_INPUT", "NEEDS_HOST_ACTION"', backend)
+        self.assertIn("PUSH_TTL_SECONDS = 300", backend)
+        self.assertEqual(backend.count("ttl=PUSH_TTL_SECONDS"), 2)
+        self.assertIn("Una nuova installazione deve ricevere soltanto transizioni future", backend)
+        self.assertIn('f"historical:{row[\'lifecycle\']}"', backend)
+        self.assertNotIn("push_is_visible", backend)
+        self.assertNotIn("reportPushPresence", self.app)
+
+    def test_crash_wins_over_delivery_failure_and_is_explicit(self):
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        dead_branch = backend[backend.index('elif not row["alive"]:'):
+                              backend.index('elif row["status"] == "starting":',
+                                            backend.index('elif not row["alive"]:'))]
+        self.assertLess(dead_branch.index('row["exit_code"] not in'),
+                        dead_branch.index('last.get("status") == FAILED'))
+        self.assertIn("Sessione crashata", self.app)
+        self.assertIn("Il prompt è rimasto salvato", self.app)
+        self.assertIn("sostituito dal successivo Restart", backend)
+        self.assertIn("lifecycle='STARTING'", backend)
+        restart = backend[backend.index('elif action == "restart":'):
+                          backend.index('elif action == "delete":')]
+        self.assertLess(restart.index("register_initial_prompt(row, prompt, started)"),
+                        restart.index("dismiss_webpush_session_async(sid)"))
+
+    def test_explicit_close_suppresses_late_notifications_until_restart(self):
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        self.assertIn("notification_suppressed_at TEXT DEFAULT ''", backend)
+        self.assertGreaterEqual(
+            backend.count('not row.get("notification_suppressed_at")'), 2)
+        self.assertIn('not r.get("notification_suppressed_at")', backend)
+        close = backend[backend.index("def close_session(row: dict)"):
+                        backend.index("def delete_session(row: dict)")]
+        self.assertIn("notification_suppressed_at=?", close)
+        self.assertIn('dismiss_webpush_session_async(row["id"])', close)
+        restart = backend[backend.index('elif action == "restart":'):
+                          backend.index('elif action == "delete":')]
+        self.assertIn("notification_suppressed_at=''", restart)
 
     def test_iphone_chrome_respects_all_safe_areas(self):
         self.assertIn('<div id="app-chrome">', self.index)
@@ -184,6 +255,12 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("non rinnova le credenziali OAuth", self.app)
         self.assertIn("Il rinnovo automatico Claude non è riuscito", self.app)
 
+    def test_kill_and_delete_return_to_dashboard(self):
+        self.assertIn(
+            'if (action === "kill" || action === "delete") location.hash = "#/";',
+            self.app,
+        )
+
     def test_new_session_keeps_technical_controls_in_advanced_options(self):
         form_start = self.app.index("async function viewNewSession()")
         form_end = self.app.index("  const envSel =", form_start)
@@ -197,6 +274,82 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("Altezza terminale (righe)", form)
         self.assertIn("quanti caratteri", form)
         self.assertIn("quante linee sono visibili", form)
+
+    def test_account_defaults_drive_new_sessions(self):
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        self.assertIn('"profile_id": "codex-openai"', backend)
+        self.assertIn('"model": "gpt-5.6-sol"', backend)
+        self.assertIn('"effort": "high"', backend)
+        self.assertIn('CREATE TABLE IF NOT EXISTS account_session_defaults', backend)
+        self.assertIn('@app.post("/api/accounts/defaults")', backend)
+        self.assertIn('"account_defaults": account_session_defaults()', backend)
+        self.assertIn("function sessionDefault(user)", self.app)
+        self.assertIn('data-default-save', self.app)
+        self.assertIn('post("/api/accounts/defaults"', self.app)
+
+    def test_accounts_login_populates_every_explicit_insert_field(self):
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        login = backend[backend.index("async def accounts_login"):
+                        backend.index("def sh(", backend.index("async def accounts_login"))]
+        for field in ("session_mode", "goal", "relation_type", "relation_request_id"):
+            self.assertIn(f'"{field}": ""', login)
+
+    def test_login_lifecycle_uses_process_exit_instead_of_agent_report(self):
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        lifecycle = backend[backend.index('if row.get("kind") == "login":'):
+                            backend.index('elif row["status"] == "failed":')]
+        self.assertIn('row["exit_code"] == "0"', lifecycle)
+        self.assertIn('life = "COMPLETED"', lifecycle)
+        self.assertIn('life = "FAILED"', lifecycle)
+
+    def test_new_session_prompt_draft_survives_navigation_until_persisted(self):
+        self.assertIn("function newSessionPromptDraftKey()", self.app)
+        self.assertIn('localStorage.getItem(newSessionPromptDraftKey())', self.app)
+        self.assertIn('promptEl.oninput = () => writeNewSessionPromptDraft(promptEl.value)', self.app)
+        self.assertIn('promptEl.value = readNewSessionPromptDraft()', self.app)
+        self.assertEqual(self.app.count('writeNewSessionPromptDraft("")'), 2)
+        launch_failed = self.app.index('e.code === "launch_failed"')
+        self.assertIn('writeNewSessionPromptDraft("")', self.app[launch_failed:launch_failed + 300])
+
+    def test_session_composer_survives_background_and_socket_reconnect(self):
+        self.assertIn("function sessionMessageDraftKey(sid)", self.app)
+        self.assertIn("msgEl.value = readSessionMessageDraft(sid)", self.app)
+        self.assertIn("msgEl.oninput = () => writeSessionMessageDraft(sid, msgEl.value)", self.app)
+        self.assertIn('writeSessionMessageDraft(sid, "")', self.app)
+        self.assertIn("function connectTerminal()", self.app)
+        self.assertIn("if (document.hidden) return;", self.app)
+        visibility = self.app.index("const onVisibility = () =>", self.app.index("async function viewSession"))
+        visibility_block = self.app[visibility:visibility + 500]
+        self.assertIn("connectTerminal()", visibility_block)
+        self.assertNotIn("route", visibility_block)
+
+    def test_kill_returns_to_dashboard(self):
+        self.assertIn('if (action === "kill" || action === "delete") location.hash = "#/";', self.app)
+
+    def test_active_session_composer_owns_model_and_attachments(self):
+        start = self.app.index("async function viewSession(sid)")
+        session = self.app[start:self.app.index("// ---------------------------------------------------------------- accounts", start)]
+        self.assertIn('id="attach">Allega</button>', session)
+        self.assertIn('id="runtime-toggle"', session)
+        self.assertIn("document_ids: Array.from(pendingDocIds)", session)
+        self.assertNotIn("Allega e comunica i percorsi", session)
+        self.assertIn("Gli allegati scelti non vengono comunicati", session)
+
+    def test_session_advanced_options_hold_continuity_and_diagnostics_at_bottom(self):
+        start = self.app.index("async function viewSession(sid)")
+        session = self.app[start:self.app.index("// ---------------------------------------------------------------- accounts", start)]
+        advanced = session.index('id="session-options"')
+        continuity = session.index("<h3>Continuità</h3>")
+        diagnostics = session.index("<h3>Diagnostica harness</h3>")
+        log = session.index("<h3>Log</h3>")
+        self.assertLess(log, advanced)
+        self.assertLess(advanced, continuity)
+        self.assertLess(continuity, diagnostics)
+
+    def test_escalation_is_visible_only_for_agent_request(self):
+        self.assertIn('s.lifecycle !== "NEEDS_HOST_ACTION"', self.app)
+        self.assertIn('<div id="escalation-slot">', self.app)
+        self.assertIn("paintEscalation(st);", self.app)
 
 
 if __name__ == "__main__":

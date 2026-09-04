@@ -39,6 +39,15 @@ agent_hub_config_dir: /etc/agent-hub
 agent_hub_state_dir: /var/lib/agent-hub
 agent_hub_workspace: /srv/agent-workspace
 
+# Nightly updates keep the globally installed Codex/OpenCode binaries and the
+# per-user Claude Code installations current. A Codex PROJECT audit is opened
+# after every nightly update cycle (duplicate reruns on the same day are skipped).
+agent_hub_harness_updates_enabled: true
+agent_hub_harness_update_calendar: "*-*-* 03:20:00"
+agent_hub_harness_audit_project: agent-hub
+agent_hub_harness_audit_model: gpt-5.6-sol
+agent_hub_harness_audit_effort: high
+
 # The SERVER account is the dedicated host administrator. PROJECT remains
 # unprivileged and reaches GitHub only through per-project deploy keys.
 agent_hub_server_admin: false
