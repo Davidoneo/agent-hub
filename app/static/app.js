@@ -28,13 +28,15 @@ function help(text) {
   return `<div class="help">${esc(text)}</div>`;
 }
 
+// Toast e pannello degli avvisi vivono nella stessa pila in sovraimpressione:
+// scendono dall'alto, restano il tempo necessario a leggerli e si ritirano
+// fuori schermo senza spostare la pagina sotto.
 function toast(msg, kind = "ok") {
   const t = $("#toast");
   t.textContent = msg;
-  t.className = kind;
-  t.style.display = "block";
+  t.className = kind + " shown";
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { t.style.display = "none"; },
+  toast._t = setTimeout(() => { t.className = kind; },
     kind === "err" ? 9000 : (kind === "attention" ? 6000 : 3500));
 }
 
@@ -288,6 +290,7 @@ const ROUTES = [
   [/^\/meetings\/([^/?]+)/, viewMeeting],
   [/^\/projects$/, viewProjects],
   [/^\/projects\/([^/?]+)/, viewProject],
+  [/^\/backlog$/, viewBacklog],
   [/^\/new/, viewNewSession],
   [/^\/accounts$/, viewAccounts],
   [/^\/status$/, viewStatus],
@@ -568,9 +571,66 @@ const ATTENTION_LIFECYCLES = new Set([
 const TRANSIENT_NOTICE_LIFECYCLES = new Set(["COMPLETED"]);
 let attentionReady = false;
 let attentionSeen = new Set();
+// Il pannello resta a schermo il tempo di leggerlo e poi si ritira: la
+// condizione non sparisce, resta contata sul badge e riapribile dal pulsante
+// «avvisi». `attentionPinned` tiene aperto quello aperto a mano.
+const ATTENTION_AUTOHIDE_MS = 7000;
+let attentionPinned = false;
+let attentionHideTimer = null;
 
 function attentionSignature(s) {
   return `${s.id}:${s.lifecycle}:${s.lifecycle_at || ""}`;
+}
+
+// La pila degli avvisi parte da sotto la barra superiore: la sua altezza
+// cambia con il ritorno a capo dei pulsanti e con le safe area di iOS.
+function syncChromeHeight() {
+  const chrome = $("#app-chrome");
+  if (!chrome) return;
+  document.documentElement.style.setProperty(
+    "--chrome-h", chrome.offsetHeight + "px");
+}
+
+function attentionHasItems() {
+  const box = $("#attention");
+  return !!(box && box.firstChild);
+}
+
+function closeAttention() {
+  clearTimeout(attentionHideTimer);
+  attentionPinned = false;
+  const box = $("#attention");
+  if (box) box.classList.remove("shown");
+}
+
+function openAttention(pinned = false) {
+  const box = $("#attention");
+  if (!box || !attentionHasItems()) return;
+  clearTimeout(attentionHideTimer);
+  attentionPinned = attentionPinned || pinned;
+  box.classList.add("shown");
+  if (!attentionPinned) {
+    attentionHideTimer = setTimeout(() => box.classList.remove("shown"),
+      ATTENTION_AUTOHIDE_MS);
+  }
+}
+
+function toggleAttention() {
+  const box = $("#attention");
+  if (!box) return;
+  if (box.classList.contains("shown")) closeAttention();
+  else openAttention(true);
+}
+
+function syncAttentionToggle(count) {
+  const btn = $("#attention-toggle");
+  if (!btn) return;
+  btn.style.display = count ? "" : "none";
+  const badge = $("#attention-toggle-count");
+  if (badge) {
+    badge.textContent = count ? String(count) : "";
+    badge.classList.toggle("visible", count > 0);
+  }
 }
 
 function renderAttention(sessions, serverUnreadCount = null) {
@@ -614,16 +674,20 @@ function renderAttention(sessions, serverUnreadCount = null) {
       ? `${first.name}: ${label}`
       : `${fresh.length} sessioni hanno nuovi aggiornamenti`, "attention");
   }
+  const firstRender = !attentionReady;
   attentionSeen = signatures;
   attentionReady = true;
 
+  syncAttentionToggle(visible.length);
   if (!visible.length) {
     box.innerHTML = "";
+    closeAttention();
     return;
   }
   box.innerHTML = `<div class="attention-panel">
     <div class="attention-title"><span aria-hidden="true">●</span>
-      <b>Novità e richieste</b><span class="attention-count">${visible.length}</span></div>
+      <b>Novità e richieste</b><span class="attention-count">${visible.length}</span>
+      <button type="button" class="attention-close" aria-label="Chiudi gli avvisi">×</button></div>
     <div class="attention-items">${visible.map(s => {
       const [label, cls] = LIFECYCLE[s.lifecycle] || [s.lifecycle, "ended"];
       return `<a href="#/session/${encodeURIComponent(s.id)}" class="attention-item">
@@ -633,6 +697,12 @@ function renderAttention(sessions, serverUnreadCount = null) {
         <span class="attention-open">Apri →</span></a>`;
     }).join("")}</div>
   </div>`;
+  $(".attention-close", box).onclick = closeAttention;
+  $$(".attention-item", box).forEach(a => a.addEventListener("click", closeAttention));
+  // Si mostra da solo al primo caricamento e quando arriva qualcosa di nuovo;
+  // negli altri giri di polling aggiorna in silenzio quello gia' a schermo.
+  if (firstRender || fresh.length) openAttention();
+  else if (box.classList.contains("shown")) openAttention(attentionPinned);
 }
 
 function dismissLocalSessionNotification(sid, badge) {
@@ -923,6 +993,87 @@ async function viewProjects() {
       } catch (e) { showError(e); }
     };
   });
+}
+
+// ----------------------------------------------------------------- backlog
+
+const BACKLOG_STATUS = {
+  pending: ["Preparazione in coda", "idle"],
+  pending_transcription: ["Trascrizione in coda", "idle"],
+  processing: ["In elaborazione", "idle"],
+  ready: ["Pronta", "completed"],
+  ready_fallback: ["Pronta (fallback)", "completed"],
+  failed: ["Da riprovare", "failed"],
+};
+
+function backlogSource(value) {
+  return ({ telegram_text: "Telegram · testo",
+            telegram_audio: "Telegram · audio" })[value] || value || "Telegram";
+}
+
+function backlogCard(idea) {
+  const [label, cls] = BACKLOG_STATUS[idea.status] || [idea.status, "ended"];
+  const ready = idea.status === "ready" || idea.status === "ready_fallback";
+  return `<article class="card backlog-card">
+    <div class="row spread backlog-card-head">
+      <div class="grow">
+        <h3>${esc(idea.title || "Idea senza titolo")}</h3>
+        <div class="muted">${esc(backlogSource(idea.source))} · ${esc(ts(idea.created_at))}</div>
+      </div>
+      <span class="tag ${cls}">${esc(label)}</span>
+    </div>
+    ${idea.description ? `<p class="backlog-description">${esc(idea.description)}</p>` : ""}
+    ${idea.error ? `<div class="${idea.status === "failed" ? "errbox compact" : "warnbox"}">${
+      idea.status === "ready_fallback"
+        ? "L'idea e' disponibile, ma la preparazione AI non e' riuscita: e' stato usato un prompt fedele deterministico."
+        : esc(idea.error)}</div>` : ""}
+    <div class="row backlog-actions">
+      ${ready ? `<a class="plain" href="#/new?backlog=${encodeURIComponent(idea.id)}"><button class="primary small">Prepara sessione</button></a>` : ""}
+      ${idea.status === "failed" ? `<button class="small" data-backlog-retry="${esc(idea.id)}">Riprova</button>` : ""}
+      <button class="small danger" data-backlog-delete="${esc(idea.id)}">Elimina</button>
+    </div>
+  </article>`;
+}
+
+async function viewBacklog() {
+  const d = await api("/api/backlog", {}, "backlog");
+  const active = d.ideas.some(x => ["pending", "pending_transcription", "processing"].includes(x.status));
+  view().innerHTML = `<div class="row spread backlog-heading">
+      <div><h2>Backlog</h2><p class="muted">Una raccolta di idee, indipendente dalle sessioni operative.</p></div>
+      <span class="projects-count">${d.ideas.length}</span>
+    </div>
+    <div class="card backlog-source-note">
+      <b>Le idee arrivano dal bot Telegram dedicato.</b>
+      <p class="muted">Scrivi al bot oppure inviagli una nota vocale; qui trovi la raccolta già organizzata.</p>
+    </div>
+    <section class="backlog-list" aria-label="Idee raccolte">
+      ${d.ideas.map(backlogCard).join("") || '<div class="card muted">Nessuna idea. Scrivi o registra una nota vocale nel bot Telegram dedicato.</div>'}
+    </section>`;
+  $$('[data-backlog-delete]').forEach(button => {
+    button.onclick = async () => {
+      if (!confirm("Eliminare definitivamente questa idea dal Backlog?")) return;
+      try {
+        await api(`/api/backlog/${encodeURIComponent(button.dataset.backlogDelete)}`,
+                  { method: "DELETE" }, "eliminazione idea");
+        toast("Idea eliminata"); route();
+      } catch (e) { showError(e); }
+    };
+  });
+  $$('[data-backlog-retry]').forEach(button => {
+    button.onclick = async () => {
+      try {
+        await post(`/api/backlog/${encodeURIComponent(button.dataset.backlogRetry)}/retry`, {},
+                   "nuovo tentativo idea");
+        toast("Nuovo tentativo avviato"); route();
+      } catch (e) { showError(e); }
+    };
+  });
+  if (active) {
+    const timer = setTimeout(() => {
+      if ((location.hash || "#/backlog").startsWith("#/backlog")) route();
+    }, 3000);
+    cleanup = () => clearTimeout(timer);
+  }
 }
 
 let openDocContextMenu = null;
@@ -1536,16 +1687,29 @@ async function viewNewSession() {
   // appena rinnovato l'OAuth e reso nuovamente interrogabile /v1/models.
   await refreshBoot();
   const preProject = qparams().get("project") || "";
-  const [d, docs] = await Promise.all([
+  const backlogId = qparams().get("backlog") || "";
+  const [d, docs, backlogData] = await Promise.all([
     api("/api/projects", {}, "elenco progetti"),
     api("/api/documents", {}, "elenco documenti"),
+    backlogId
+      ? api(`/api/backlog/${encodeURIComponent(backlogId)}`, {}, "idea del backlog")
+      : Promise.resolve({ idea: null }),
   ]);
+  const backlogIdea = backlogData.idea;
   const profiles = BOOT.profiles;
 
-  view().innerHTML = `<h2>Nuova sessione</h2>
+  view().innerHTML = `<h2>${backlogIdea ? "Prepara sessione" : "Nuova sessione"}</h2>
     <div class="card">
+      ${backlogIdea ? `<div class="backlog-origin">
+        <div class="muted">Dal Backlog</div>
+        <b>${esc(backlogIdea.title)}</b>
+        <p>${esc(backlogIdea.description)}</p>
+        <label class="inline"><input type="checkbox" id="s-use-backlog-prompt" checked>
+          Inserisci il prompt preparato</label>
+        <div class="muted">Se lo deselezioni, la sessione verra' creata senza prompt iniziale.</div>
+      </div>` : ""}
       <label>Nome sessione</label>
-      <input id="s-name" placeholder="es. rifattorizza API">
+      <input id="s-name" placeholder="es. rifattorizza API" value="${esc(backlogIdea ? backlogIdea.title : "")}">
 
       <label>Ambiente</label>
       <select id="s-env">
@@ -1605,8 +1769,10 @@ async function viewNewSession() {
         <div class="muted" id="s-executor-note" style="margin-top:6px"></div>
       </div>
 
-      <label id="s-prompt-label">Prompt iniziale (multilinea, opzionale)</label>
-      <textarea id="s-prompt" placeholder="Descrivi la macro-task…"></textarea>
+      <div id="s-prompt-wrap">
+        <label id="s-prompt-label">Prompt iniziale (multilinea, opzionale)</label>
+        <textarea id="s-prompt" placeholder="Descrivi la macro-task…"></textarea>
+      </div>
       <div class="row" style="justify-content:flex-end;gap:8px;margin-top:6px">
         <span class="muted" style="font-size:12px">Modalità</span>
         <select id="s-mode" style="width:auto;min-width:200px;padding:6px 8px;font-size:13px"></select>
@@ -1664,8 +1830,15 @@ async function viewNewSession() {
   const promptEl = $("#s-prompt");
   let picker = null;
 
-  promptEl.value = readNewSessionPromptDraft();
-  promptEl.oninput = () => writeNewSessionPromptDraft(promptEl.value);
+  if (backlogIdea) {
+    promptEl.value = backlogIdea.prepared_prompt;
+    $("#s-use-backlog-prompt").onchange = () => {
+      $("#s-prompt-wrap").style.display = $("#s-use-backlog-prompt").checked ? "" : "none";
+    };
+  } else {
+    promptEl.value = readNewSessionPromptDraft();
+    promptEl.oninput = () => writeNewSessionPromptDraft(promptEl.value);
+  }
 
   // Il valore effettivo del modello: la tendina, oppure il campo libero
   // quando è stata scelta la voce «altro…».
@@ -1876,7 +2049,7 @@ async function viewNewSession() {
                           $("#s-executor-enabled").checked,
         executor_model: $("#s-executor-model").value,
         executor_max_agents: parseInt($("#s-executor-max").value, 10) || 2,
-        prompt: $("#s-prompt").value,
+        prompt: backlogIdea && !$("#s-use-backlog-prompt").checked ? "" : $("#s-prompt").value,
         document_ids: docIds,
         cols: parseInt($("#s-cols").value, 10) || 100,
         rows: parseInt($("#s-rows").value, 10) || 30,
@@ -3981,6 +4154,30 @@ function applyTheme(mode) {
   };
   $("#usage-toggle").onclick = () =>
     applyUsagePanel(document.body.classList.contains("usage-off"));
+  // Riapertura: il pulsante in testata e il contatore accanto a «Dashboard»
+  // richiamano il pannello ritirato senza aspettare un nuovo evento.
+  $("#attention-toggle").onclick = toggleAttention;
+  $("#nav-notice").onclick = (e) => {
+    if (!attentionHasItems()) return;
+    e.preventDefault(); e.stopPropagation();
+    toggleAttention();
+  };
+  // Mentre il puntatore o il fuoco sono sul pannello non si ritira: la lettura
+  // di un elenco lungo non viene interrotta a meta'.
+  syncChromeHeight();
+  window.addEventListener("resize", syncChromeHeight);
+  if ("ResizeObserver" in window) {
+    new ResizeObserver(syncChromeHeight).observe($("#app-chrome"));
+  }
+  const attentionBox = $("#attention");
+  attentionBox.addEventListener("pointerenter", () => clearTimeout(attentionHideTimer));
+  attentionBox.addEventListener("focusin", () => clearTimeout(attentionHideTimer));
+  attentionBox.addEventListener("pointerleave", () => {
+    if (attentionBox.classList.contains("shown")) openAttention(attentionPinned);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeAttention();
+  });
   try {
     await refreshBoot();
   } catch (e) {

@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""Bot Telegram dedicato alla raccolta di idee per il Backlog di Agent Hub.
+
+Accetta soltanto la chat associata tramite codice monouso. Ogni testo libero
+diventa un'idea; note vocali, audio e documenti audio vengono scaricati nello
+staging privato e trascritti dal worker di Agent Hub.
+
+Uso:
+    backlog-telegram-ctl run
+    backlog-telegram-ctl check
+    backlog-telegram-ctl menu
+"""
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG_FILE = "/etc/agent-hub/backlog-telegram.env"
+DB = "/var/lib/agent-hub/agent-hub.sqlite3"
+STATE_DIR = Path("/var/lib/agent-hub/backlog-telegram")
+STATE = STATE_DIR / "state.json"
+AUDIO_DIR = Path("/var/lib/agent-hub/backlog-audio")
+API = "https://api.telegram.org"
+AUDIO_MAX = 25 * 1024 * 1024
+AUDIO_EXTENSIONS = {
+    ".ogg", ".oga", ".opus", ".mp3", ".m4a", ".mp4", ".wav", ".webm",
+    ".aac", ".flac",
+}
+MENU = [
+    ("backlog", "Numero e ultime idee raccolte"),
+    ("aiuto", "Come inviare una nuova idea"),
+]
+
+
+class TelegramError(Exception):
+    pass
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def load_config():
+    cfg = {
+        "token": "", "chat_id": "", "pairing_code": "", "origin": "",
+        "poll_timeout": "25",
+    }
+    keys = {
+        "AGENT_HUB_BACKLOG_TG_TOKEN": "token",
+        "AGENT_HUB_BACKLOG_TG_CHAT_ID": "chat_id",
+        "AGENT_HUB_BACKLOG_TG_PAIRING_CODE": "pairing_code",
+        "AGENT_HUB_BACKLOG_TG_ORIGIN": "origin",
+        "AGENT_HUB_BACKLOG_TG_POLL_TIMEOUT": "poll_timeout",
+    }
+    try:
+        for line in Path(CONFIG_FILE).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            mapped = keys.get(name.strip())
+            if mapped:
+                cfg[mapped] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for env_name, mapped in keys.items():
+        if env_name in os.environ:
+            cfg[mapped] = os.environ[env_name].strip()
+    return cfg
+
+
+def init_config():
+    """Crea una configurazione locale sicura senza sovrascrivere quella esistente."""
+    target = Path(CONFIG_FILE)
+    if target.exists():
+        print(f"configurazione già presente: {target}")
+        return 0
+    origin = os.environ.get("AGENT_HUB_BACKLOG_TG_ORIGIN", "").strip()
+    if not origin:
+        try:
+            for line in Path("/etc/agent-hub/config.env").read_text().splitlines():
+                if line.startswith("AGENT_HUB_ORIGIN="):
+                    origin = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+    content = "\n".join([
+        "# Bot Telegram dedicato esclusivamente alla raccolta idee.",
+        "# Inserire il token creato con @BotFather e riavviare il servizio.",
+        "AGENT_HUB_BACKLOG_TG_TOKEN=",
+        "AGENT_HUB_BACKLOG_TG_CHAT_ID=",
+        f"AGENT_HUB_BACKLOG_TG_PAIRING_CODE={secrets.token_urlsafe(18)}",
+        f"AGENT_HUB_BACKLOG_TG_ORIGIN={origin}",
+        "AGENT_HUB_BACKLOG_TG_POLL_TIMEOUT=25",
+        "",
+        "# Gratis e locale per default. OpenAI è opzionale e a consumo.",
+        "AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER=local",
+        "AGENT_HUB_BACKLOG_OPENAI_API_KEY=",
+        "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL=gpt-transcribe",
+        "",
+    ])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(content)
+    try:
+        import grp
+        os.chown(target, 0, grp.getgrnam("agenthub").gr_gid)
+    except (KeyError, PermissionError):
+        pass
+    print(f"creata configurazione: {target}")
+    return 0
+
+
+def load_state():
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_name(f"{STATE.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, STATE)
+
+
+def chat_id_of(cfg, state):
+    return str(cfg.get("chat_id") or state.get("chat_id") or "").strip()
+
+
+def db(readonly=False):
+    if readonly:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    else:
+        conn = sqlite3.connect(DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def call(cfg, method, params=None, timeout=60):
+    if not cfg.get("token"):
+        raise TelegramError("token non configurato")
+    data = urllib.parse.urlencode(params or {}).encode()
+    request = urllib.request.Request(
+        f"{API}/bot{cfg['token']}/{method}", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise TelegramError(f"HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise TelegramError(str(exc)) from exc
+    if not payload.get("ok"):
+        raise TelegramError(str(payload.get("description") or "risposta Telegram non valida"))
+    return payload.get("result")
+
+
+def backlog_url(cfg):
+    origin = (cfg.get("origin") or "").rstrip("/")
+    return f"{origin}/#/backlog" if origin else ""
+
+
+def send(cfg, chat_id, text, *, button=False):
+    params = {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"}
+    url = backlog_url(cfg)
+    if button and url:
+        params["reply_markup"] = json.dumps({
+            "inline_keyboard": [[{"text": "Apri Backlog", "url": url}]],
+        })
+    call(cfg, "sendMessage", params, timeout=30)
+
+
+def help_text():
+    return (
+        "Backlog idee\n\n"
+        "Scrivi qui qualunque idea oppure registra una nota vocale. Puoi anche "
+        "inviare un file audio. Il bot la salva subito; trascrizione e preparazione "
+        "di titolo, descrizione e prompt continuano in background.\n\n"
+        "/backlog — mostra le idee più recenti\n"
+        "/aiuto — mostra queste istruzioni"
+    )
+
+
+def backlog_text(text, update_id):
+    text = text.strip()
+    if not text:
+        raise ValueError("idea vuota")
+    idea_id, stamp = str(uuid.uuid4()), now()
+    source_ref = f"backlog-telegram:{update_id}"
+    with db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO backlog_ideas "
+                "(id,raw_text,source,source_ref,status,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (idea_id, text, "telegram_text", source_ref, "pending", stamp, stamp))
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT id FROM backlog_ideas WHERE source_ref=?", (source_ref,)).fetchone()
+            if row:
+                return row["id"]
+            raise
+    return idea_id
+
+
+def audio_descriptor(message):
+    if message.get("voice"):
+        item = message["voice"]
+        return item.get("file_id", ""), "nota-vocale.ogg", int(item.get("file_size") or 0)
+    if message.get("audio"):
+        item = message["audio"]
+        return (item.get("file_id", ""), item.get("file_name") or "audio.mp3",
+                int(item.get("file_size") or 0))
+    document = message.get("document") or {}
+    if str(document.get("mime_type") or "").startswith("audio/"):
+        return (document.get("file_id", ""), document.get("file_name") or "audio",
+                int(document.get("file_size") or 0))
+    return "", "", 0
+
+
+def _safe_audio_suffix(name, remote_path):
+    suffix = Path(name).suffix.lower() or Path(remote_path).suffix.lower()
+    return suffix if suffix in AUDIO_EXTENSIONS else ".ogg"
+
+
+def download_audio(cfg, file_id, name, size, update_id):
+    if size > AUDIO_MAX:
+        raise TelegramError("audio troppo grande: limite 25 MiB")
+    source_ref = f"backlog-telegram:{update_id}"
+    with db(readonly=True) as conn:
+        old = conn.execute(
+            "SELECT id FROM backlog_ideas WHERE source_ref=?", (source_ref,)).fetchone()
+    if old:
+        return old["id"]
+
+    file_info = call(cfg, "getFile", {"file_id": file_id}, timeout=30) or {}
+    remote_path = str(file_info.get("file_path") or "")
+    if not remote_path:
+        raise TelegramError("Telegram non ha restituito il percorso dell'audio")
+    if int(file_info.get("file_size") or 0) > AUDIO_MAX:
+        raise TelegramError("audio troppo grande: limite 25 MiB")
+
+    idea_id, stamp = str(uuid.uuid4()), now()
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    target = AUDIO_DIR / f"{idea_id}{_safe_audio_suffix(name, remote_path)}"
+    partial = target.with_name(target.name + ".part")
+    url = f"{API}/file/bot{cfg['token']}/{urllib.parse.quote(remote_path, safe='/')}"
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response, open(partial, "wb") as output:
+            total = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > AUDIO_MAX:
+                    raise TelegramError("audio troppo grande: limite 25 MiB")
+                output.write(chunk)
+        os.chmod(partial, 0o600)
+        os.replace(partial, target)
+        with db() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO backlog_ideas "
+                    "(id,title,description,source,source_ref,audio_path,audio_name,status,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (idea_id, "Nota vocale in elaborazione",
+                     "Trascrizione e preparazione in corso.", "telegram_audio", source_ref,
+                     str(target), Path(name).name[:200], "pending_transcription", stamp, stamp))
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    "SELECT id FROM backlog_ideas WHERE source_ref=?", (source_ref,)).fetchone()
+                if row:
+                    target.unlink(missing_ok=True)
+                    return row["id"]
+                raise
+    except Exception:
+        partial.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        raise
+    return idea_id
+
+
+def backlog_summary():
+    with db(readonly=True) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM backlog_ideas").fetchone()[0]
+        rows = conn.execute(
+            "SELECT title,status FROM backlog_ideas ORDER BY created_at DESC LIMIT 5"
+        ).fetchall()
+    if not rows:
+        return "Backlog vuoto. Scrivi un'idea o manda una nota vocale."
+    labels = {
+        "pending": "in preparazione", "pending_transcription": "in trascrizione",
+        "processing": "in elaborazione", "ready": "pronta",
+        "ready_fallback": "pronta (fallback)", "failed": "da riprovare",
+    }
+    lines = [f"Backlog: {count} idee", ""]
+    for row in rows:
+        lines.append(f"• {row['title'] or 'Idea senza titolo'} — "
+                     f"{labels.get(row['status'], row['status'])}")
+    return "\n".join(lines)
+
+
+def _pairing_request(text, code):
+    parts = text.strip().split(None, 1)
+    return (len(parts) == 2 and parts[0].lower().split("@")[0] == "/start"
+            and bool(code) and hmac.compare_digest(parts[1].strip(), code))
+
+
+def handle_update(cfg, state, update):
+    message = update.get("message") or {}
+    sender = str((message.get("chat") or {}).get("id") or "")
+    text = str(message.get("text") or "").strip()
+    file_id, audio_name, audio_size = audio_descriptor(message)
+    if not sender or (not text and not file_id):
+        return
+
+    paired_chat = chat_id_of(cfg, state)
+    if not paired_chat:
+        if _pairing_request(text, cfg.get("pairing_code", "")):
+            state["chat_id"] = sender
+            save_state(state)
+            send(cfg, sender, "Chat associata al Backlog.\n\n" + help_text())
+            log("chat Backlog associata")
+        else:
+            log(f"messaggio da chat non associata {sender}: ignorato")
+        return
+    if sender != paired_chat:
+        log("messaggio da chat non autorizzata: ignorato")
+        return
+
+    command = text.split(None, 1)[0].lower().split("@")[0] if text.startswith("/") else ""
+    if command in {"/start", "/aiuto", "/help"}:
+        send(cfg, sender, help_text())
+    elif command == "/backlog":
+        send(cfg, sender, backlog_summary(), button=True)
+    elif command == "/chatid":
+        send(cfg, sender, f"Questa chat: {sender}")
+    elif command:
+        send(cfg, sender, "Comando non riconosciuto.\n\n" + help_text())
+    elif file_id:
+        idea_id = download_audio(
+            cfg, file_id, audio_name, audio_size, update["update_id"])
+        send(cfg, sender,
+             f"Idea vocale salvata ({idea_id[:8]}). La trascrivo e preparo in background.",
+             button=True)
+    else:
+        idea_id = backlog_text(text, update["update_id"])
+        send(cfg, sender, f"Idea salvata ({idea_id[:8]}). La sto preparando.", button=True)
+
+
+def poll_updates(cfg, state):
+    timeout = max(1, min(50, int(cfg.get("poll_timeout") or 25)))
+    updates = call(cfg, "getUpdates", {
+        "offset": state.get("offset", 0), "timeout": timeout,
+        "allowed_updates": json.dumps(["message"]),
+    }, timeout=timeout + 20)
+    for update in updates or []:
+        state["offset"] = int(update["update_id"]) + 1
+        try:
+            handle_update(cfg, state, update)
+        except Exception as exc:  # noqa: BLE001
+            sender = str(((update.get("message") or {}).get("chat") or {}).get("id") or "")
+            log(f"update {update.get('update_id')}: {exc}")
+            if sender and sender == chat_id_of(cfg, state):
+                try:
+                    send(cfg, sender, f"Non sono riuscito a salvare l'idea: {str(exc)[:400]}")
+                except TelegramError:
+                    pass
+    save_state(state)
+
+
+def setup_menu(cfg):
+    call(cfg, "setMyCommands", {"commands": json.dumps(
+        [{"command": command, "description": description} for command, description in MENU])},
+         timeout=30)
+
+
+def run():
+    state = load_state()
+    while True:
+        cfg = load_config()
+        if not cfg.get("token"):
+            time.sleep(15)
+            continue
+        fingerprint = json.dumps(MENU, ensure_ascii=False)
+        if state.get("menu_fingerprint") != fingerprint:
+            try:
+                setup_menu(cfg)
+                state["menu_fingerprint"] = fingerprint
+                save_state(state)
+            except TelegramError as exc:
+                log(f"menu: {exc}")
+        try:
+            poll_updates(cfg, state)
+        except TelegramError as exc:
+            log(f"getUpdates: {exc}")
+            time.sleep(10)
+        except sqlite3.Error as exc:
+            log(f"database: {exc}")
+            time.sleep(10)
+
+
+def check():
+    cfg, state = load_config(), load_state()
+    result = {
+        "config_file": CONFIG_FILE,
+        "token_presente": bool(cfg.get("token")),
+        "chat_id": chat_id_of(cfg, state) or "(non associata)",
+        "pairing_code": "presente" if cfg.get("pairing_code") else "assente",
+        "trascrizione": "locale (faster-whisper)",
+    }
+    if cfg.get("token"):
+        try:
+            me = call(cfg, "getMe", timeout=20) or {}
+            result["bot"] = f"@{me.get('username')} ({me.get('first_name')})"
+        except TelegramError as exc:
+            result["bot"] = f"token non valido o rete assente: {exc}"
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if cfg.get("token") and result.get("bot", "").startswith("@") else 1
+
+
+def menu():
+    cfg = load_config()
+    setup_menu(cfg)
+    print("menu Backlog aggiornato")
+
+
+COMMANDS = {"run": run, "check": check, "menu": menu, "init-config": init_config}
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if action not in COMMANDS:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return COMMANDS[action]() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

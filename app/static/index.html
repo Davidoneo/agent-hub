@@ -22,6 +22,7 @@
 <header>
   <div class="brand">Agent&nbsp;Hub</div>
   <div class="header-right">
+    <button class="ghost small" id="attention-toggle" style="display:none" title="Mostra gli avvisi recenti">avvisi <span id="attention-toggle-count"></span></button>
     <button class="ghost small" id="push-toggle" style="display:none" title="Attiva le notifiche push di Agent Hub">notifiche</button>
     <button class="ghost small" id="usage-toggle" title="Mostra o nasconde il pannello del consumo">consumo</button>
     <button class="ghost small" id="help-toggle" title="Mostra o nasconde le spiegazioni">? aiuti</button>
@@ -33,12 +34,18 @@
 <nav id="nav">
   <a href="#/">Dashboard <span id="nav-notice" aria-label="nuovi aggiornamenti"></span></a>
   <a href="#/projects">Progetti</a>
+  <a href="#/backlog">Backlog</a>
   <a href="#/new">Nuova sessione</a>
   <a href="#/accounts">Accounts</a>
   <a href="#/status">Status</a>
 </nav>
 
-<div id="attention" aria-live="polite"></div>
+</div>
+<!-- Gli avvisi non occupano piu' spazio nella pagina: scendono dall'alto in
+     sovraimpressione, si ritirano da soli e si riaprono dal pulsante «avvisi». -->
+<div id="notice-stack">
+  <div id="attention" aria-live="polite"></div>
+  <div id="toast" role="status"></div>
 </div>
 <div id="banner"></div>
 <div id="layout">
@@ -46,7 +53,6 @@
   <aside id="side"><div id="usage-panel"></div></aside>
 </div>
 
-<div id="toast"></div>
 
 <script src="/static/vendor/xterm.js?v=__ASSET_VERSION__"></script>
 <script src="/static/vendor/addon-fit.js?v=__ASSET_VERSION__"></script>

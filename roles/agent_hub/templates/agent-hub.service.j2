@@ -3,7 +3,9 @@
 Description=Agent Hub - persistent agent sessions behind a private web UI
 Documentation=file://{{ agent_hub_root }}/README.md
 Requires=agent-hub.socket
-After=network-online.target agent-hub.socket{% if agent_hub_require_tailscale %} tailscaled.service{% endif %}
+# An After= dependency on a missing unit is harmless. Keeping this line free of
+# inline Jinja also avoids trim_blocks joining it to the following directive.
+After=network-online.target agent-hub.socket tailscaled.service
 Wants=network-online.target
 
 [Service]

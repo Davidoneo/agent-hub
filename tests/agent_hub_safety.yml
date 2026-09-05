@@ -19,6 +19,7 @@
           - hub.agent_hub_socket is match('^/run/[^/]+/[^/]+[.]sock$')
           - hub.agent_hub_manage_tailscale_serve | bool
           - not hub.agent_hub_github_audit_enabled | bool
+          - not hub.agent_hub_backlog_telegram_enabled | bool
           - hub.agent_hub_service_deploy_profiles | length == 0
 
     - name: Confirm canonical source layout
@@ -29,6 +30,7 @@
         - "{{ playbook_dir }}/../bin/agent-report"
         - "{{ playbook_dir }}/../bin/agent-telegram"
         - "{{ playbook_dir }}/../libexec/telegram-outbox-ctl"
+        - "{{ playbook_dir }}/../libexec/backlog-telegram-ctl"
         - "{{ playbook_dir }}/../libexec/git-ssh-ctl"
       register: canonical_sources
 

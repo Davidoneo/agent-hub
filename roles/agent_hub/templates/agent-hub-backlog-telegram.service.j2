@@ -1,0 +1,44 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Agent Hub - dedicated Telegram Backlog collector
+After=network-online.target agent-hub.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ agent_hub_service_user }}
+Group={{ agent_hub_service_user }}
+ExecStart={{ agent_hub_libexec }}/backlog-telegram-ctl run
+Restart=always
+RestartSec=10
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={{ agent_hub_state_dir }}
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-hub-backlog-telegram
+
+[Install]
+WantedBy=multi-user.target

@@ -24,6 +24,7 @@ agent_hub_install: true
 | `agent-hub.socket` | systemd-owned Unix listener, mode `0600` |
 | `agent-hub.service` | FastAPI/uvicorn receives that listener by file descriptor and serves the UI/API |
 | `agent-hub-telegram.service` | Optional status/approval/share bot, the only component reaching the internet |
+| `agent-hub-backlog-telegram.service` | Optional dedicated collector for text and voice ideas |
 | `agent-hub-health.timer` | Deterministic host health snapshot every 30 minutes |
 | `agent-hub-harness-update.timer` | Nightly harness updates followed by a Codex compatibility audit |
 | `/usr/local/libexec/agent-hub/*-ctl` | Root-owned wrappers, the privilege boundary |
@@ -82,9 +83,28 @@ agent_hub_telegram_enabled: true
 agent_hub_telegram_token: "{{ vault_agent_hub_telegram_token }}"
 ```
 
-The bot keeps status commands on demand, handles host-escalation yes/no and
-meeting approvals, and delivers `agent-telegram` text/link/file shares. It does
-not push routine report, lifecycle, or health messages.
+The status bot keeps status commands on demand, handles host-escalation yes/no
+and meeting approvals, and delivers `agent-telegram` text/link/file shares. It
+does not collect ideas and does not push routine report, lifecycle, or health
+messages.
+
+The Backlog collector is a second, dedicated bot. It accepts free text, Telegram
+voice notes, audio and audio documents only from its paired chat:
+
+```yaml
+agent_hub_backlog_telegram_enabled: true
+```
+
+On first deployment the role creates the root-owned
+`/etc/agent-hub/backlog-telegram.env` with an empty BotFather token and a random
+pairing code. Complete `AGENT_HUB_BACKLOG_TG_TOKEN`, restart
+`agent-hub-backlog-telegram`, then send `/start <pairing-code>` to that bot.
+The default `AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER=local` uses
+`faster-whisper` and cannot incur API charges. OpenAI transcription is an
+explicit opt-in: set the provider to `openai` and add the dedicated API key;
+merely inserting a key does not switch provider. Title, description and the
+private launch prompt are prepared by an ephemeral read-only Codex run, with a
+deterministic fallback if Codex is temporarily unavailable.
 
 Standards-based Web Push is also opt-in. The role generates the VAPID private
 key directly on the host; do not put that key in inventory:

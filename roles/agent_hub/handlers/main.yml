@@ -18,3 +18,8 @@
   ansible.builtin.systemd:
     name: agent-hub-telegram
     state: restarted
+
+- name: Restart agent-hub-backlog-telegram
+  ansible.builtin.systemd:
+    name: agent-hub-backlog-telegram
+    state: restarted

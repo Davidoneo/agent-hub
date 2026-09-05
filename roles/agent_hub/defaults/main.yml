@@ -113,6 +113,11 @@ agent_hub_telegram_enabled: false
 agent_hub_telegram_token: ""
 agent_hub_telegram_chat_ids: []
 
+# Bot separato, dedicato esclusivamente alla raccolta di idee testuali e vocali.
+# Il servizio può essere predisposto senza token e resta inerte finché
+# /etc/agent-hub/backlog-telegram.env non viene completato dall'amministratore.
+agent_hub_backlog_telegram_enabled: false
+
 # Claude Code does not expose a refresh-only command. When its renewable OAuth
 # access token expires, the usage reader may perform one safe-mode startup per
 # Unix account every 20 hours and stop it before any model turn is sent.

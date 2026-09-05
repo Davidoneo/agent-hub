@@ -100,6 +100,7 @@
     - { path: "{{ agent_hub_workspace }}/reports", group: "{{ agent_hub_agent_group }}", mode: "0755" }
     - { path: "{{ agent_hub_workspace }}/knowledge", group: "{{ agent_hub_agent_group }}", mode: "2775" }
     - { path: "{{ agent_hub_workspace }}/uploads", group: "{{ agent_hub_agent_group }}", mode: "2775" }
+    - { path: "{{ agent_hub_state_dir }}/backlog-audio", mode: "0700" }
 
 - name: Agent Hub | application code
   ansible.builtin.copy:
@@ -120,6 +121,16 @@
     mode: "0755"
   when: agent_hub_telegram_enabled | bool
   notify: Restart agent-hub-telegram
+
+- name: Agent Hub | dedicated Telegram Backlog collector code
+  ansible.builtin.copy:
+    src: "{{ agent_hub_source_root }}/libexec/backlog-telegram-ctl"
+    dest: "{{ agent_hub_libexec }}/backlog-telegram-ctl"
+    owner: root
+    group: root
+    mode: "0755"
+  when: agent_hub_backlog_telegram_enabled | bool
+  notify: Restart agent-hub-backlog-telegram
 
 - name: Agent Hub | privileged wrappers
   ansible.builtin.copy:
@@ -211,6 +222,33 @@
     virtualenv: "{{ agent_hub_root }}/.venv"
     virtualenv_command: python3 -m venv
   notify: Restart agent-hub
+
+- name: Agent Hub | local audio transcription fallback
+  ansible.builtin.pip:
+    name: faster-whisper
+    virtualenv: "{{ agent_hub_root }}/.venv"
+    virtualenv_command: python3 -m venv
+  when: agent_hub_backlog_telegram_enabled | bool
+  notify: Restart agent-hub
+
+- name: Agent Hub | initialize dedicated Backlog bot configuration
+  ansible.builtin.command:
+    argv:
+      - "{{ agent_hub_libexec }}/backlog-telegram-ctl"
+      - init-config
+    creates: "{{ agent_hub_config_dir }}/backlog-telegram.env"
+  environment:
+    AGENT_HUB_BACKLOG_TG_ORIGIN: "{{ agent_hub_origin }}"
+  when: agent_hub_backlog_telegram_enabled | bool
+
+- name: Agent Hub | protect dedicated Backlog bot configuration
+  ansible.builtin.file:
+    path: "{{ agent_hub_config_dir }}/backlog-telegram.env"
+    state: file
+    owner: root
+    group: "{{ agent_hub_service_user }}"
+    mode: "0640"
+  when: agent_hub_backlog_telegram_enabled | bool
 
 - name: Agent Hub | generate the host-local Web Push VAPID key
   ansible.builtin.command:
@@ -360,6 +398,18 @@
     - Reload systemd
     - Restart agent-hub-telegram
 
+- name: Agent Hub | dedicated Telegram Backlog collector unit
+  ansible.builtin.template:
+    src: agent-hub-backlog-telegram.service.j2
+    dest: /etc/systemd/system/agent-hub-backlog-telegram.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: agent_hub_backlog_telegram_enabled | bool
+  notify:
+    - Reload systemd
+    - Restart agent-hub-backlog-telegram
+
 - name: Agent Hub | scheduled maintenance units
   ansible.builtin.template:
     src: "{{ item }}.j2"
@@ -387,6 +437,14 @@
     enabled: true
     state: started
     daemon_reload: true
+
+- name: Agent Hub | enable the dedicated Telegram Backlog collector
+  ansible.builtin.systemd:
+    name: agent-hub-backlog-telegram
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: agent_hub_backlog_telegram_enabled | bool
 
 # The socket must be live before switching Tailscale's root handler.  In an
 # upgrade the service may still be running the retired TCP unit until its

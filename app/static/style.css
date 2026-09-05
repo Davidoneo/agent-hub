@@ -315,44 +315,77 @@ details.more .kv { margin-top: 6px; }
 .status-details > summary { font-size: 14px; font-weight: 600; }
 .status-details-body { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
 
+/* ------------------------------------------------- avvisi in sovraimpressione
+   Toast e pannello «Novità e richieste» condividono la stessa pila: scendono
+   dal bordo superiore, restano sopra la pagina qualche secondo e si ritirano
+   fuori schermo. Nessuno dei due occupa spazio nel flusso, così la barra
+   superiore resta compatta; il pulsante «avvisi» li riapre quando servono. */
+#notice-stack {
+  /* Sotto la barra superiore (z-index 10) e sopra la pagina: gli avvisi
+     sembrano scendere da dietro l'intestazione e rientrarci, senza mai
+     coprire i pulsanti che li riaprono. --chrome-h la misura app.js. */
+  position: fixed; z-index: 5; display: flex; flex-direction: column; gap: 6px;
+  top: calc(var(--chrome-h, 96px) + 6px);
+  right: max(8px, env(safe-area-inset-right));
+  width: min(360px, calc(100vw - 16px)); pointer-events: none;
+}
+#notice-stack > * {
+  pointer-events: auto;
+  transform: translateY(calc(-100% - var(--chrome-h, 96px))); opacity: 0; visibility: hidden;
+  transition: transform .26s ease, opacity .26s ease, visibility .26s;
+}
+#notice-stack > .shown { transform: translateY(0); opacity: 1; visibility: visible; }
+@media (prefers-reduced-motion: reduce) {
+  #notice-stack > * { transition: none; }
+}
+
 #toast {
-  position: fixed; left: 50%; transform: translateX(-50%);
-  bottom: calc(20px + env(safe-area-inset-bottom));
-  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-  padding: 10px 16px; max-width: 92vw; display: none; z-index: 50; font-size: 14px;
-  box-shadow: 0 6px 24px rgba(0,0,0,.25); white-space: pre-wrap;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+  padding: 7px 11px; font-size: 12.5px; line-height: 1.35;
+  box-shadow: 0 6px 20px rgba(0,0,0,.28); white-space: pre-wrap;
 }
 #toast.err { border-color: var(--danger); color: var(--danger); }
 #toast.ok { border-color: var(--ok); }
 #toast.attention { border-color: var(--warn); color: var(--fg); }
 
-#attention {
-  max-width: 1100px; margin: 0 auto;
-  padding: 0 calc(14px + env(safe-area-inset-right)) 0
-    calc(14px + env(safe-area-inset-left));
-}
 .attention-panel {
-  margin-top: 8px; padding: 8px 10px; border: 1px solid var(--warn);
-  border-left: 4px solid var(--warn); border-radius: 10px;
-  background: color-mix(in srgb, var(--warn) 8%, var(--panel));
-  box-shadow: var(--shadow);
+  padding: 6px 9px; border: 1px solid var(--warn);
+  border-left: 3px solid var(--warn); border-radius: 9px;
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+  box-shadow: 0 6px 20px rgba(0,0,0,.28);
 }
-.attention-title { display: flex; align-items: center; gap: 6px; font-size: 13px; }
-.attention-title > span:first-child { color: var(--warn); font-size: 10px; }
-.attention-unread-dot { color: var(--danger); font-size: 9px; }
+.attention-title {
+  display: flex; align-items: center; gap: 5px; font-size: 12px;
+}
+.attention-title > span:first-child { color: var(--warn); font-size: 8px; }
+.attention-title b { font-weight: 600; }
+.attention-unread-dot { color: var(--danger); font-size: 8px; }
 .attention-count {
-  min-width: 20px; padding: 0 6px; border-radius: 999px; text-align: center;
-  background: var(--warn); color: var(--panel); font-size: 11px; font-weight: 700;
+  min-width: 17px; padding: 0 5px; border-radius: 999px; text-align: center;
+  background: var(--warn); color: var(--panel); font-size: 10px; font-weight: 700;
 }
-.attention-items { max-height: 132px; overflow: auto; }
+.attention-close {
+  margin-left: auto; border: 0; background: none; color: var(--muted);
+  font-size: 15px; line-height: 1; padding: 0 2px; cursor: pointer;
+}
+.attention-close:hover { color: var(--fg); }
+.attention-items { max-height: 168px; overflow: auto; }
 .attention-item {
-  display: flex; align-items: center; gap: 7px; padding: 6px 0;
+  display: flex; align-items: center; gap: 6px; padding: 4px 0;
   border-top: 1px solid color-mix(in srgb, var(--warn) 24%, transparent);
-  color: inherit; text-decoration: none; font-size: 13px;
+  color: inherit; text-decoration: none; font-size: 12px;
 }
-.attention-item:first-child { margin-top: 5px; }
-.attention-name { flex: 1; min-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attention-item:first-child { margin-top: 4px; }
+.attention-item .tag { font-size: 10px; padding: 1px 5px; }
+.attention-name { flex: 1; min-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attention-open { color: var(--accent); white-space: nowrap; }
+#attention-toggle-count {
+  display: none; min-width: 15px; padding: 0 4px; margin-left: 2px;
+  border-radius: 999px; background: var(--danger); color: white;
+  font-size: 10px; font-weight: 800;
+}
+#attention-toggle-count.visible { display: inline-block; }
+
 #banner { max-width: 1100px; margin: 0 auto; padding: 0 14px; }
 .errbox {
   border: 1px solid var(--danger); border-left: 4px solid var(--danger);
@@ -521,7 +554,7 @@ body.help-on .help { display: block; }
   }
   .dpad .arrow-key { min-height: 40px; padding: 0; }
   .key-row { gap: 4px; }
-  .attention-item .tag { max-width: 42vw; overflow: hidden; text-overflow: ellipsis; }
+  .attention-item .tag { max-width: 38vw; overflow: hidden; text-overflow: ellipsis; }
 }
 
 /* ---------------------------------------------- dialoghi applicativi
@@ -636,4 +669,25 @@ body.help-on .help { display: block; }
 .meeting-detail ul li + li { margin-top: 8px; }
 @media (max-width: 520px) {
   .meeting-row .row { flex-wrap: wrap; }
+}
+
+/* Backlog: una raccolta leggibile prima che diventi lavoro operativo. */
+.backlog-heading { align-items: flex-start; margin-bottom: 14px; }
+.backlog-heading h2 { margin-bottom: 3px; }
+.backlog-heading p { margin: 0; }
+.backlog-source-note { margin-bottom: 14px; }
+.backlog-source-note p { margin: 5px 0 0; }
+.backlog-list { display: grid; gap: 12px; }
+.backlog-card { margin: 0; }
+.backlog-card h3 { margin: 0 0 2px; overflow-wrap: anywhere; }
+.backlog-card-head { align-items: flex-start; }
+.backlog-description { margin: 12px 0; white-space: pre-wrap; }
+.backlog-actions { margin-top: 12px; }
+.backlog-origin {
+  margin-bottom: 16px; padding: 12px; border-left: 4px solid var(--accent);
+  border-radius: 8px; background: color-mix(in srgb, var(--accent) 9%, var(--panel));
+}
+.backlog-origin p { margin: 5px 0 10px; }
+@media (max-width: 520px) {
+  .backlog-card-head { align-items: stretch; flex-direction: column; }
 }

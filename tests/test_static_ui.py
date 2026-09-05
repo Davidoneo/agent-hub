@@ -49,6 +49,25 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn('tabLink("documents",', self.app)
         self.assertIn('uploadFiles(files, slug, null, "repository")', self.app)
 
+    def test_backlog_is_a_primary_collection_and_session_prep_is_opt_in(self):
+        parser = NavParser()
+        parser.feed(self.index)
+        self.assertIn("#/backlog", parser.hrefs)
+        self.assertIn('[/^\\/backlog$/, viewBacklog]', self.app)
+        self.assertIn("Una raccolta di idee, indipendente dalle sessioni operative", self.app)
+        self.assertIn("Le idee arrivano dal bot Telegram dedicato", self.app)
+        self.assertNotIn('id="backlog-text"', self.app)
+        self.assertIn("Prepara sessione", self.app)
+        self.assertIn('id="s-use-backlog-prompt" checked', self.app)
+        self.assertIn("!$(\"#s-use-backlog-prompt\").checked ? \"\"", self.app)
+        backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE IF NOT EXISTS backlog_ideas", backend)
+        self.assertIn('@app.get("/api/backlog")', backend)
+        self.assertNotIn('@app.post("/api/backlog")', backend)
+        self.assertIn('@app.delete("/api/backlog/{bid}")', backend)
+        self.assertIn("https://api.openai.com/v1/audio/transcriptions", backend)
+        self.assertIn("BACKLOG_CTL", backend)
+
     def test_open_session_and_turn_outcome_are_separate(self):
         self.assertIn("function sessionIsOpen", self.app)
         self.assertIn('label = "Turno completato"', self.app)
@@ -154,6 +173,21 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("setInterval(loadAttention, 10_000)", self.app)
         self.assertIn(".attention-panel {", self.css)
         self.assertIn("#nav-notice.visible", self.css)
+
+    def test_attention_overlays_the_page_and_can_be_reopened(self):
+        # Gli avvisi non stanno piu' nel flusso della pagina: scendono
+        # dall'alto in sovraimpressione, si ritirano da soli e si riaprono
+        # dal pulsante in testata o dal contatore accanto a «Dashboard».
+        self.assertIn('id="notice-stack"', self.index)
+        self.assertIn('id="attention-toggle"', self.index)
+        self.assertIn("#notice-stack {", self.css)
+        notice_rule = self.css.split("#notice-stack {", 1)[1].split("}", 1)[0]
+        self.assertIn("position: fixed", notice_rule)
+        self.assertIn("#notice-stack > .shown", self.css)
+        self.assertIn("ATTENTION_AUTOHIDE_MS", self.app)
+        self.assertIn("function toggleAttention()", self.app)
+        self.assertIn('$("#attention-toggle").onclick = toggleAttention', self.app)
+        self.assertIn('$("#nav-notice").onclick', self.app)
 
     def test_delivery_failure_is_visible_in_web_attention_only(self):
         backend = (ROOT / "app/main.py").read_text(encoding="utf-8")

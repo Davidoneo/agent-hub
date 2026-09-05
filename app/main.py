@@ -39,6 +39,8 @@ import termios
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -93,6 +95,7 @@ CONFIG = {
 SESSION_CTL = "/usr/local/libexec/agent-hub/session-ctl"
 PROJECT_CTL = "/usr/local/libexec/agent-hub/project-ctl"
 HEALTH_CTL = "/usr/local/libexec/agent-hub/health-ctl"
+BACKLOG_CTL = "/usr/local/libexec/agent-hub/backlog-ctl"
 # Il socket resta in /run/agent-hub, una directory privata all'account del
 # servizio. I file di input devono invece essere attraversabili dagli account
 # che eseguono gli harness; tmpfiles crea questa directory con gruppo
@@ -131,6 +134,18 @@ MEETING_WHISPER_CACHE = os.environ.get("AGENT_HUB_WHISPER_CACHE", "/var/lib/agen
 MEETING_WORKERS_ENABLED = os.environ.get("AGENT_HUB_MEETING_WORKERS", "1") != "0"
 MEETING_REPORT_CTL = "/usr/local/libexec/agent-hub/meeting-report-ctl"
 MEETING_CTL_USER = os.environ.get("AGENT_HUB_SERVICE_USER", "agenthub")
+
+# -------------------------------------------------------- backlog / idee
+
+BACKLOG_AUDIO_DIR = Path(os.environ.get(
+    "AGENT_HUB_BACKLOG_AUDIO_DIR", "/var/lib/agent-hub/backlog-audio"))
+BACKLOG_TELEGRAM_CONFIG = os.environ.get(
+    "AGENT_HUB_BACKLOG_TELEGRAM_CONFIG", "/etc/agent-hub/backlog-telegram.env")
+BACKLOG_TRANSCRIBE_MODEL = os.environ.get(
+    "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL", "gpt-transcribe")
+BACKLOG_WORKERS_ENABLED = os.environ.get("AGENT_HUB_BACKLOG_WORKERS", "1") != "0"
+BACKLOG_AUDIO_MAX = int(os.environ.get(
+    "AGENT_HUB_BACKLOG_AUDIO_MAX", str(25 * 1024 * 1024)))
 
 # ------------------------------------- perimetro della sessione post-riunione
 #
@@ -584,6 +599,29 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_telegram_outbox_status
                 ON telegram_outbox(status, created_at);
+            -- Raccolta di idee separata dalle sessioni. Il prompt e' preparato
+            -- in anticipo ma resta invisibile finche' l'operatore non apre il
+            -- composer di una nuova sessione partendo dall'idea.
+            CREATE TABLE IF NOT EXISTS backlog_ideas (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                prepared_prompt TEXT NOT NULL DEFAULT '',
+                raw_text TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'telegram',
+                source_ref TEXT NOT NULL DEFAULT '',
+                audio_path TEXT NOT NULL DEFAULT '',
+                audio_name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                processor TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_backlog_source_ref
+                ON backlog_ideas(source_ref) WHERE source_ref<>'';
+            CREATE INDEX IF NOT EXISTS idx_backlog_status_created
+                ON backlog_ideas(status, created_at);
             -- Sottoscrizioni Web Push per singola installazione/browser. Gli
             -- endpoint sono credenziali di consegna e restano nel DB privato.
             CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -1761,6 +1799,271 @@ async def read_notification(request: Request):
     unread = notification_unread_count(login)
     dismiss_webpush_session_async(sid, login)
     return {"read": bool(key), "event_key": key, "unread_count": unread}
+# --------------------------------------------------------------- backlog
+
+def backlog_payload(row: sqlite3.Row | dict, *, include_prompt: bool = False) -> dict:
+    item = dict(row)
+    payload = {
+        "id": item["id"], "title": item.get("title") or "Idea senza titolo",
+        "description": item.get("description") or "",
+        "source": item.get("source") or "telegram", "status": item.get("status") or "pending",
+        "processor": item.get("processor") or "", "error": item.get("error") or "",
+        "created_at": item.get("created_at") or "", "updated_at": item.get("updated_at") or "",
+    }
+    if include_prompt:
+        payload["prepared_prompt"] = item.get("prepared_prompt") or ""
+    return payload
+
+
+def get_backlog_idea(bid: str) -> dict:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM backlog_ideas WHERE id=?", (bid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "idea non trovata")
+    return dict(row)
+
+
+@app.get("/api/backlog")
+async def list_backlog():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backlog_ideas ORDER BY created_at DESC, rowid DESC").fetchall()
+    return {"ideas": [backlog_payload(r) for r in rows]}
+
+
+@app.get("/api/backlog/{bid}")
+async def backlog_detail(bid: str):
+    return {"idea": backlog_payload(get_backlog_idea(bid), include_prompt=True)}
+
+
+def remove_backlog_audio(path: str) -> None:
+    if not path:
+        return
+    try:
+        resolved = Path(path).resolve()
+        root = BACKLOG_AUDIO_DIR.resolve()
+        if resolved.parent == root and resolved.is_file():
+            resolved.unlink()
+    except OSError:
+        pass
+
+
+@app.delete("/api/backlog/{bid}")
+async def delete_backlog(bid: str):
+    row = get_backlog_idea(bid)
+    with db() as conn:
+        conn.execute("DELETE FROM backlog_ideas WHERE id=?", (bid,))
+    remove_backlog_audio(row.get("audio_path") or "")
+    return {"deleted": True}
+
+
+@app.post("/api/backlog/{bid}/retry")
+async def retry_backlog(bid: str):
+    row = get_backlog_idea(bid)
+    status = "pending" if row.get("raw_text") else "pending_transcription"
+    with db() as conn:
+        conn.execute(
+            "UPDATE backlog_ideas SET status=?,error='',updated_at=? WHERE id=?",
+            (status, now(), bid))
+    return {"idea": backlog_payload(get_backlog_idea(bid))}
+
+
+def _backlog_transcription_config() -> dict[str, str]:
+    """Provider esplicito: il default locale non puo' generare costi API."""
+    values = {"provider": "local", "api_key": "", "model": BACKLOG_TRANSCRIBE_MODEL}
+    names = {
+        "AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER": "provider",
+        "AGENT_HUB_BACKLOG_OPENAI_API_KEY": "api_key",
+        "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL": "model",
+    }
+    try:
+        for line in Path(BACKLOG_TELEGRAM_CONFIG).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            mapped = names.get(key.strip())
+            if mapped:
+                values[mapped] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for env_name, mapped in names.items():
+        if env_name in os.environ:
+            values[mapped] = os.environ[env_name].strip()
+    values["provider"] = values["provider"].lower()
+    if values["provider"] not in {"local", "openai"}:
+        raise RuntimeError("provider trascrizione non valido: usare local oppure openai")
+    if values["provider"] == "openai" and not values["api_key"]:
+        raise RuntimeError("provider OpenAI selezionato ma API key assente")
+    if not MODEL_RE.fullmatch(values["model"]):
+        raise RuntimeError("modello trascrizione non valido")
+    return values
+
+
+def _multipart(fields: dict[str, str], field: str, name: str,
+               content: bytes, content_type: str) -> tuple[bytes, str]:
+    boundary = "----AgentHubBacklog" + os.urandom(12).hex()
+    body = bytearray()
+    for key, value in fields.items():
+        body.extend((f"--{boundary}\r\n"
+                     f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                     f"{value}\r\n").encode())
+    body.extend((f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{field}"; filename="{name}"\r\n'
+                 f"Content-Type: {content_type}\r\n\r\n").encode())
+    body.extend(content)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    return bytes(body), boundary
+
+
+def _openai_transcribe(path: str, key: str, model: str) -> str:
+    p = Path(path)
+    data = p.read_bytes()
+    if len(data) > BACKLOG_AUDIO_MAX:
+        raise RuntimeError("audio troppo grande per la trascrizione")
+    content_type = {
+        ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg",
+        ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".mp3": "audio/mpeg",
+        ".wav": "audio/wav", ".webm": "audio/webm",
+    }.get(p.suffix.lower(), "application/octet-stream")
+    body, boundary = _multipart(
+        {"model": model, "language": "it"},
+        "file", p.name, data, content_type)
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions", data=body,
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"OpenAI transcription HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RuntimeError(f"OpenAI transcription: {exc}") from exc
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise RuntimeError("OpenAI ha restituito una trascrizione vuota")
+    return text
+
+
+def _local_transcribe(path: str) -> str:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError("fallback locale faster_whisper non installato") from exc
+    cache = Path(MEETING_WHISPER_CACHE)
+    cache.mkdir(parents=True, exist_ok=True)
+    global _WHISPER_MODEL
+    with _WHISPER_MODEL_LOCK:
+        if _WHISPER_MODEL is None:
+            _WHISPER_MODEL = WhisperModel(
+                MEETING_WHISPER_MODEL, device="cpu", compute_type="int8",
+                download_root=str(cache))
+        model = _WHISPER_MODEL
+    segments, _info = model.transcribe(path, language="it", vad_filter=True, beam_size=5)
+    text = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
+    if not text:
+        raise RuntimeError("trascrizione locale vuota")
+    return text
+
+
+def _fallback_backlog_metadata(text: str) -> dict:
+    compact = re.sub(r"\s+", " ", text).strip()
+    title = re.split(r"(?<=[.!?])\s+", compact, maxsplit=1)[0][:90].rstrip(" .,:;-")
+    title = title or "Nuova idea"
+    return {
+        "title": title,
+        "description": compact[:1200],
+        "prepared_prompt": (
+            "Valuta e implementa, se appropriato, la seguente idea. Prima verifica il "
+            "contesto esistente, chiarisci le ambiguita' che cambiano materialmente il risultato, "
+            "poi realizza e verifica la soluzione:\n\n" + text.strip()),
+    }
+
+
+def _prepare_backlog_metadata(text: str) -> tuple[dict, str, str]:
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "-u", PROJECT_UNIX_USER, BACKLOG_CTL, "prepare"],
+            input=text, capture_output=True, text=True, timeout=240)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout).strip()[:500] or
+                               "preparatore Codex non riuscito")
+        payload = json.loads(result.stdout)
+        values = {k: str(payload.get(k) or "").strip()
+                  for k in ("title", "description", "prepared_prompt")}
+        if not all(values.values()):
+            raise RuntimeError("il preparatore ha restituito campi incompleti")
+        values["title"] = values["title"][:200]
+        values["description"] = values["description"][:4000]
+        values["prepared_prompt"] = values["prepared_prompt"][:20_000]
+        return values, "openai-codex", ""
+    except Exception as exc:  # il backlog resta usabile anche durante limiti OAuth
+        return _fallback_backlog_metadata(text), "deterministic-fallback", str(exc)[:1000]
+
+
+def _claim_backlog() -> dict | None:
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM backlog_ideas WHERE status IN ('pending','pending_transcription') "
+            "ORDER BY created_at, rowid LIMIT 1").fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE backlog_ideas SET status='processing',updated_at=? WHERE id=?",
+            (now(), row["id"]))
+        return dict(row)
+
+
+def _process_backlog(row: dict) -> None:
+    bid, raw = row["id"], (row.get("raw_text") or "").strip()
+    processors = []
+    try:
+        if not raw:
+            audio = row.get("audio_path") or ""
+            if not audio or not Path(audio).is_file():
+                raise RuntimeError("audio Telegram non disponibile")
+            transcription = _backlog_transcription_config()
+            if transcription["provider"] == "local":
+                raw = _local_transcribe(audio)
+                processors.append(f"local-whisper:{MEETING_WHISPER_MODEL}")
+            else:
+                raw = _openai_transcribe(
+                    audio, transcription["api_key"], transcription["model"])
+                processors.append(f"openai:{transcription['model']}")
+            with db() as conn:
+                conn.execute(
+                    "UPDATE backlog_ideas SET raw_text=?,updated_at=? WHERE id=?",
+                    (raw, now(), bid))
+        metadata, processor, warning = _prepare_backlog_metadata(raw)
+        processors.append(processor)
+        status = "ready_fallback" if warning else "ready"
+        with db() as conn:
+            conn.execute(
+                "UPDATE backlog_ideas SET title=?,description=?,prepared_prompt=?,"
+                "status=?,processor=?,error=?,audio_path='',updated_at=? WHERE id=?",
+                (metadata["title"], metadata["description"], metadata["prepared_prompt"],
+                 status, "+".join(processors), warning, now(), bid))
+        remove_backlog_audio(row.get("audio_path") or "")
+    except Exception as exc:
+        with db() as conn:
+            conn.execute(
+                "UPDATE backlog_ideas SET status='failed',processor=?,error=?,updated_at=? "
+                "WHERE id=?", ("+".join(processors), str(exc)[:2000], now(), bid))
+
+
+def _backlog_worker() -> None:
+    while True:
+        try:
+            row = _claim_backlog()
+            if row:
+                _process_backlog(row)
+                continue
+        except Exception:
+            pass
+        time.sleep(2)
 
 
 IDLE_OUTPUT_SECONDS = 120  # oltre questa soglia: «nessun output recente»
@@ -6694,6 +6997,7 @@ async def service_worker():
 
 @app.get("/")
 @app.get("/projects")
+@app.get("/backlog")
 @app.get("/sessions")
 @app.get("/meetings")
 @app.get("/accounts")
@@ -6717,6 +7021,11 @@ with db() as _conn:
     _conn.execute(
         "UPDATE escalation_requests SET status='approved_queued' "
         "WHERE status='granting'")
+    # Un worker interrotto non perde l'idea: al riavvio riparte dal testo gia'
+    # trascritto, oppure dall'audio ancora presente nello staging privato.
+    _conn.execute(
+        "UPDATE backlog_ideas SET status=CASE WHEN raw_text<>'' THEN 'pending' "
+        "ELSE 'pending_transcription' END WHERE status='processing'")
 sweep_runtime()
 threading.Thread(target=delivery_loop, daemon=True).start()
 threading.Thread(target=sweep_loop, daemon=True).start()
@@ -6727,6 +7036,8 @@ if webpush_ready():
 if MEETING_WORKERS_ENABLED:
     threading.Thread(target=_meeting_worker, daemon=True).start()
     threading.Thread(target=_action_worker, daemon=True).start()
+if BACKLOG_WORKERS_ENABLED:
+    threading.Thread(target=_backlog_worker, daemon=True).start()
 
 
 def prime_snapshots() -> None:
