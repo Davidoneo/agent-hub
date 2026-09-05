@@ -571,6 +571,10 @@ const ATTENTION_LIFECYCLES = new Set([
 const TRANSIENT_NOTICE_LIFECYCLES = new Set(["COMPLETED"]);
 let attentionReady = false;
 let attentionSeen = new Set();
+// La dashboard non ha un poller proprio: condivide lo snapshot gia' letto da
+// loadAttention. Conserviamo soltanto i campi che cambiano il significato
+// delle card, cosi' durata e ultimo-output non causano un ridisegno ogni 10s.
+let dashboardStateVersion = "";
 // Il pannello resta a schermo il tempo di leggerlo e poi si ritira: la
 // condizione non sparisce, resta contata sul badge e riapribile dal pulsante
 // «avvisi». `attentionPinned` tiene aperto quello aperto a mano.
@@ -580,6 +584,26 @@ let attentionHideTimer = null;
 
 function attentionSignature(s) {
   return `${s.id}:${s.lifecycle}:${s.lifecycle_at || ""}`;
+}
+
+function dashboardSnapshotVersion(sessions) {
+  return JSON.stringify((sessions || []).map(s => [
+    s.id, !!s.alive, s.status || "", s.lifecycle || "", s.lifecycle_at || "",
+    !!s.lifecycle_reported, s.report_status || "", s.reported_at || "",
+    s.report_summary || "", s.waiting_for_session || "", Number(s.undelivered) || 0,
+  ]));
+}
+
+function dashboardRouteIsActive() {
+  return (location.hash.replace(/^#/, "").split("?")[0] || "/") === "/";
+}
+
+async function refreshDashboardFromSnapshot(snapshot) {
+  if (!dashboardRouteIsActive() || !dashboardStateVersion) return false;
+  const next = dashboardSnapshotVersion(snapshot.sessions);
+  if (next === dashboardStateVersion) return false;
+  await viewDashboard(snapshot);
+  return true;
 }
 
 // La pila degli avvisi parte da sotto la barra superiore: la sua altezza
@@ -737,6 +761,10 @@ async function loadAttention() {
       d.unread_count = receipt.unread_count;
     }
     renderAttention(d.sessions, d.unread_count);
+    // Questo stesso snapshot ha appena prodotto toast/badge: se l'utente e'
+    // sulla dashboard, applica anche li' la transizione (per esempio
+    // RUNNING -> COMPLETED) senza aspettare refresh o un secondo fetch.
+    await refreshDashboardFromSnapshot(d);
   } catch (e) {
     // Un polling accessorio non deve coprire la pagina con un errore. Il
     // riquadro corrente resta visibile e il prossimo giro riprova.
@@ -798,8 +826,9 @@ function sessionCard(s) {
   </div>`;
 }
 
-async function viewDashboard() {
-  const d = await api("/api/sessions", {}, "elenco sessioni");
+async function viewDashboard(snapshot = null) {
+  const d = snapshot || await api("/api/sessions", {}, "elenco sessioni");
+  dashboardStateVersion = dashboardSnapshotVersion(d.sessions);
   // La collocazione dipende esclusivamente dal pane tmux. Un report COMPLETED
   // chiude il turno, ma non archivia una sessione ancora viva.
   const open = d.sessions.filter(sessionIsOpen);

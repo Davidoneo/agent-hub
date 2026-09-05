@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Small contracts for the navigation and two-axis session status UI."""
 
+import json
+import subprocess
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
@@ -173,6 +175,56 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("setInterval(loadAttention, 10_000)", self.app)
         self.assertIn(".attention-panel {", self.css)
         self.assertIn("#nav-notice.visible", self.css)
+
+    def test_dashboard_reuses_attention_snapshot_for_running_to_completed(self):
+        """Il poll globale deve aggiornare anche la dashboard gia' aperta."""
+        self.assertIn("await refreshDashboardFromSnapshot(d)", self.app)
+        self.assertIn("const d = snapshot || await api", self.app)
+
+        # Esegue le funzioni reali del frontend senza avviare init(): uno
+        # snapshot invariato non ridisegna, RUNNING -> COMPLETED invece si'.
+        prefix = self.app[:self.app.index("// ---------------------------------------------------------------- progetti")]
+        route_stubs = """\
+function viewMeetings() {} function viewMeeting() {}
+function viewProjects() {} function viewProject() {}
+function viewBacklog() {} function viewNewSession() {}
+function viewAccounts() {} function viewStatus() {} function viewSession() {}
+"""
+        probe = r'''
+let renders = 0;
+viewDashboard = async snapshot => {
+  renders += 1;
+  dashboardStateVersion = dashboardSnapshotVersion(snapshot.sessions);
+};
+globalThis.location = {hash: "#/"};
+const running = {sessions: [{id: "s1", alive: true, status: "running",
+  lifecycle: "RUNNING", lifecycle_at: "2026-09-05T10:00:00+02:00"}]};
+const completed = {sessions: [{id: "s1", alive: true, status: "running",
+  lifecycle: "COMPLETED", lifecycle_at: "2026-09-05T10:01:00+02:00",
+  lifecycle_reported: true, report_status: "COMPLETED",
+  reported_at: "2026-09-05T10:01:00+02:00", report_summary: "finito"}]};
+dashboardStateVersion = dashboardSnapshotVersion(running.sessions);
+(async () => {
+  const same = await refreshDashboardFromSnapshot(running);
+  const changed = await refreshDashboardFromSnapshot(completed);
+  globalThis.location.hash = "#/session/s1";
+  dashboardStateVersion = dashboardSnapshotVersion(running.sessions);
+  const sessionRoute = await refreshDashboardFromSnapshot(completed);
+  process.stdout.write(JSON.stringify({same, changed, sessionRoute, renders,
+    tag: lifecycleTag(completed.sessions[0])}));
+})().catch(error => { console.error(error); process.exit(1); });
+'''
+        result = subprocess.run(
+            ["node", "-e", route_stubs + prefix + probe], check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["same"], False)
+        self.assertEqual(observed["changed"], True)
+        self.assertEqual(observed["sessionRoute"], False)
+        self.assertEqual(observed["renders"], 1)
+        self.assertIn("Turno completato", observed["tag"])
 
     def test_attention_overlays_the_page_and_can_be_reopened(self):
         # Gli avvisi non stanno piu' nel flusso della pagina: scendono
