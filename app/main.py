@@ -61,6 +61,7 @@ except ImportError:  # il ruolo installa il supporto; utile per test/source chec
 import transcript as tr
 import delivery_queue as delivery
 import tui_state
+import usage_limit
 
 # ----------------------------------------------------------------- config
 
@@ -216,6 +217,9 @@ REPORT_STATUSES = ("COMPLETED", "NEEDS_INPUT", "WAITING_SESSION",
 CONTROLLER_STATUSES = ("RUNNING", "STARTING", "LAUNCH_FAILED", "CRASHED",
                        "ENDED_UNREPORTED", "DELIVERY_FAILED", "POSSIBLY_STALLED",
                        "AUTH_REQUIRED", "USAGE_LIMIT")
+# Stati in cui la sessione e' viva ma non puo' lavorare: la TUI continua a
+# ridisegnare, e nessuno di quei secondi e' elaborazione.
+BLOCKED_LIFECYCLES = ("AUTH_REQUIRED", "USAGE_LIMIT")
 
 ALLOWED_DOC_EXT = {
     ".pdf": "application/pdf",
@@ -322,7 +326,6 @@ def validate_model(prof: dict, value) -> str:
 
 CONTROLLER_DEFAULTS = {
     "stall_seconds": 900,
-    "scan_bytes": 24000,
     "sweep_seconds": 30,
     # Turno consegnato, nessun report, log PTY fermo da questi secondi: il
     # controller sollecita una volta sola il contratto di stato finale.
@@ -331,6 +334,13 @@ CONTROLLER_DEFAULTS = {
     # Intervallo massimo fra due scritture nel log ancora considerato «lavoro»
     # continuo. Oltre questa soglia il silenzio e' attesa, non elaborazione.
     "work_gap_seconds": 120,
+    # Ripresa automatica di una sessione ferma sul limite d'uso: intervallo fra
+    # due tentativi (e margine dopo l'istante di reset dichiarato), attesa da
+    # usare quando nessuna finestra dichiara un istante, e numero chiuso di
+    # tentativi. `resume_max_attempts` a 0 disattiva la ripresa automatica.
+    "resume_retry_seconds": 900,
+    "resume_blind_seconds": 3600,
+    "resume_max_attempts": 8,
     "patterns": {"AUTH_REQUIRED": [], "USAGE_LIMIT": []},
 }
 _CONTROLLER: dict = {"mtime": -1.0, "data": {}, "compiled": {}}
@@ -357,8 +367,10 @@ def controller_config() -> dict:
             if key in loaded:
                 data[key] = loaded[key]
         data["stall_seconds"] = max(60, int(data["stall_seconds"]))
-        data["scan_bytes"] = max(1000, min(1_000_000, int(data["scan_bytes"])))
         data["sweep_seconds"] = max(10, min(600, int(data["sweep_seconds"])))
+        data["resume_retry_seconds"] = max(60, min(86400, int(data["resume_retry_seconds"])))
+        data["resume_blind_seconds"] = max(300, min(604800, int(data["resume_blind_seconds"])))
+        data["resume_max_attempts"] = max(0, min(50, int(data["resume_max_attempts"])))
         nudge = int(data["nudge_seconds"])
         data["nudge_seconds"] = 0 if nudge <= 0 else max(60, nudge)
         data["work_gap_seconds"] = max(30, min(3600, int(data["work_gap_seconds"])))
@@ -366,7 +378,7 @@ def controller_config() -> dict:
         data = dict(CONTROLLER_DEFAULTS)
     compiled = {}
     for state, patterns in (data.get("patterns") or {}).items():
-        if state not in ("AUTH_REQUIRED", "USAGE_LIMIT"):
+        if state not in usage_limit.STATES:
             continue
         good = []
         for p in patterns or []:
@@ -626,6 +638,16 @@ def init_db() -> None:
                 error TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 processed_at TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS usage_resume_attempts (
+                session_id TEXT NOT NULL,
+                -- lifecycle_at del blocco: raggruppa i tentativi di UN blocco,
+                -- cosi' un limite nuovo riparte da un budget di tentativi nuovo
+                blocked_at TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                outcome TEXT NOT NULL,      -- attempted | sent | failed | skipped
+                detail TEXT DEFAULT '',
+                PRIMARY KEY (session_id, blocked_at, attempted_at)
             );
             CREATE TABLE IF NOT EXISTS project_contexts (
                 project_slug TEXT PRIMARY KEY,
@@ -1845,36 +1867,6 @@ LIFECYCLE_LABEL = {
 }
 
 
-def log_tail_text(row: dict, limit: int) -> str:
-    """Coda del log PTY, ripulita dalle sequenze ANSI: solo per i pattern."""
-    try:
-        path = log_path(row)
-        size = path.stat().st_size
-        with open(path, "rb") as fh:
-            if size > limit:
-                fh.seek(size - limit)
-            data = fh.read()
-    except OSError:
-        return ""
-    return tr.clean_capture(data)
-
-
-def match_known_error(row: dict) -> str:
-    """AUTH_REQUIRED / USAGE_LIMIT dai pattern configurabili. '' se nessuno."""
-    cfg = controller_config()
-    compiled = _CONTROLLER.get("compiled") or {}
-    if not any(compiled.values()):
-        return ""
-    text = log_tail_text(row, cfg["scan_bytes"])
-    if not text:
-        return ""
-    for state in ("AUTH_REQUIRED", "USAGE_LIMIT"):
-        for rx in compiled.get(state, []):
-            if rx.search(text):
-                return state
-    return ""
-
-
 _PANE_SCREEN_CACHE: dict[str, tuple[int, str]] = {}
 
 
@@ -1900,6 +1892,21 @@ def pane_screen_text(row: dict) -> str:
         text = ""
     _PANE_SCREEN_CACHE[row["tmux_name"]] = (stamp, text)
     return text
+
+
+def match_known_error(row: dict) -> str:
+    """AUTH_REQUIRED / USAGE_LIMIT dai pattern configurabili. '' se nessuno.
+
+    Si guarda lo schermo *visibile*, non la coda del log PTY. Un limite d'uso e
+    un login scaduto sono stati che la TUI continua a mostrare finche' durano,
+    quindi lo schermo basta a riconoscerli; lo scrollback invece conserva anche
+    la frase che un agente ha soltanto citato — comprese, letteralmente, le
+    sessioni che discutono di questi pattern — e la trasformerebbe in uno stato
+    di sistema falso che non sparisce piu'.
+    """
+    controller_config()          # ricompila i pattern se il file e' cambiato
+    return usage_limit.blocked_state(_CONTROLLER.get("compiled") or {},
+                                     pane_screen_text(row))
 
 
 def report_is_current(row: dict, last: dict) -> bool:
@@ -2088,7 +2095,8 @@ def controller_sweep() -> int:
     Serve perche' gli stati devono essere veri anche a browser chiuso: e' qui
     che i pane morti vengono raccolti, che il tempo di lavoro viene sommato e
     che POSSIBLY_STALLED, AUTH_REQUIRED e USAGE_LIMIT compaiono in tempo utile
-    perche' un notificatore li veda.
+    perche' un notificatore li veda — ed e' qui che una sessione ferma sul
+    limite d'uso viene ripresa quando il limite rientra.
     """
     live = sync_status()
     with db() as conn:
@@ -2102,6 +2110,10 @@ def controller_sweep() -> int:
             maybe_nudge(row, row.get("last_message") or {})
         except Exception:  # noqa: BLE001
             pass       # un sollecito non riuscito non deve fermare lo sweep
+        try:
+            maybe_resume_after_reset(row)
+        except Exception:  # noqa: BLE001
+            pass       # una ripresa non riuscita verra' ritentata al giro dopo
     for row in rows:
         try:
             release_dependency(row, by_id)
@@ -2135,6 +2147,161 @@ def release_dependency(row: dict, sessions: dict[str, dict]) -> bool:
     mid = add_message(row["id"], text, kind="dependency")
     deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
     return True
+
+
+# ------------------------------------------ ripresa dopo il reset del limite
+#
+# Una sessione ferma sul limite d'uso non ha perso niente: il processo della
+# harness e' vivo nel suo tmux e la conversazione e' ancora in memoria. Non
+# serve quindi preparare una sessione nuova — ricostruire il contesto da disco
+# costerebbe token proprio nel momento in cui il budget e' appena rientrato —
+# basta ridarle un turno quando il limite rientra.
+#
+# Quando rientri lo dichiara il provider in `provider_usage.resets_at`, ma quel
+# valore non e' una prova: l'istante letto dall'API e quello applicato dalla
+# TUI possono divergere, e alcune finestre non lo dichiarano affatto. L'unica
+# verifica vera e' il tentativo: prima di consegnare si rilegge lo schermo, e
+# se l'ostacolo e' ancora li' non si tocca niente e si riprova piu' tardi.
+#
+# Il testo viaggia come messaggio `control`, e la scelta e' deliberata: cosi'
+# non entra nella coda durevole — un tentativo fallito non puo' quindi bloccare
+# i messaggi umani in attesa dietro di se' — non invalida l'ultimo report e non
+# fa scattare il sollecito. Resta pero' scritto nella cronologia della
+# sessione, con il suo esito, perche' un turno che l'agente non ha chiesto deve
+# essere visibile a chi legge dopo.
+
+# Il marcatore e' la prima frase del testo, quindi la prima cosa che compare nel
+# composer: cercarlo sullo schermo dice se il tentativo precedente e' rimasto
+# li' senza essere accettato. Senza questo controllo, otto tentativi falliti su
+# una sessione ancora bloccata impilerebbero otto copie del testo nel composer,
+# e il primo Invio umano le manderebbe tutte insieme.
+RESUME_MARKER = "Il limite d'uso della harness risulta rientrato"
+RESUME_TEXT = (RESUME_MARKER + ". Riprendi il lavoro rimasto in sospeso, "
+               "ripartendo da dove si era interrotto.")
+# Attesa massima che la TUI stia zitta prima di incollare. Molto piu' corta di
+# quella dei messaggi umani: mentre aspettiamo teniamo occupata la sessione, e
+# questo testo — a differenza di un messaggio dell'utente — possiamo permetterci
+# di riprovarlo al giro successivo invece di insistere.
+RESUME_BUSY_CAP = 20.0
+
+
+def usage_windows(user: str, provider: str) -> list:
+    """Finestre di consumo note per questo account Unix e questo provider."""
+    with db() as conn:
+        row = conn.execute("SELECT payload FROM provider_usage "
+                           "WHERE unix_user=? AND provider=?", (user, provider)).fetchone()
+    if not row:
+        return []
+    try:
+        windows = json.loads(row["payload"] or "{}").get("windows")
+    except (ValueError, TypeError):
+        return []
+    return windows if isinstance(windows, list) else []
+
+
+def resume_attempts(sid: str, blocked_at: str) -> tuple:
+    """Quanti tentativi ha gia' avuto QUESTO blocco, e quando l'ultimo."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, MAX(attempted_at) AS last FROM usage_resume_attempts "
+            "WHERE session_id=? AND blocked_at=?", (sid, blocked_at)).fetchone()
+    return (int(row["n"] or 0), _epoch(row["last"] or "")) if row else (0, 0.0)
+
+
+def record_resume_attempt(sid: str, blocked_at: str, stamp: str,
+                          outcome: str, detail: str = "") -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO usage_resume_attempts "
+            "(session_id,blocked_at,attempted_at,outcome,detail) VALUES (?,?,?,?,?)",
+            (sid, blocked_at, stamp, outcome, (detail or "")[:500]))
+
+
+def resume_provider(prof: dict) -> str:
+    """Provider di cui leggere il consumo per questo profilo, '' se nessuno.
+
+    Il legame passa dalla harness dichiarata nel profilo, non da un elenco
+    scritto qui: un profilo nuovo che usi una harness gia' misurata funziona
+    senza toccare il codice, e uno che usi un provider senza consumo leggibile
+    resta fuori invece di attendere un istante che nessuno gli dara' mai.
+    """
+    harness = str(prof.get("harness") or "")
+    return harness if harness in USAGE_PROVIDERS else ""
+
+
+def maybe_resume_after_reset(row: dict) -> bool:
+    """Programma un tentativo di ripresa per una sessione ferma sul limite."""
+    cfg = controller_config()
+    if not cfg["resume_max_attempts"] or row.get("kind") != "agent":
+        return False
+    if row.get("lifecycle") != "USAGE_LIMIT" or not row.get("alive"):
+        return False
+    if row.get("status") != "running":
+        return False
+    blocked_at = row.get("lifecycle_at") or ""
+    if not blocked_at:
+        return False               # senza l'istante del blocco non c'e' attesa
+    try:
+        prof = profile_by_id(row["profile_id"])
+    except HTTPException:
+        return False
+    provider = resume_provider(prof)
+    if not provider:
+        return False
+    attempts, last_at = resume_attempts(row["id"], blocked_at)
+    if not usage_limit.resume_due(
+            now=time.time(), blocked_at=_epoch(blocked_at),
+            windows=usage_windows(row["unix_user"], provider),
+            attempts=attempts, last_attempt_at=last_at,
+            retry_seconds=cfg["resume_retry_seconds"],
+            blind_seconds=cfg["resume_blind_seconds"],
+            max_attempts=cfg["resume_max_attempts"]):
+        return False
+    stamp = now()
+    # Registrato prima di provare: se il backend cade a meta' consegna il
+    # tentativo resta contato, e la sessione non viene martellata al riavvio.
+    record_resume_attempt(row["id"], blocked_at, stamp, "attempted")
+    threading.Thread(target=resume_worker, args=(dict(row), blocked_at, stamp),
+                     daemon=True).start()
+    return True
+
+
+def resume_worker(row: dict, blocked_at: str, stamp: str) -> None:
+    """Verifica che l'ostacolo ci sia ancora, poi consegna il turno di ripresa."""
+    sid = row["id"]
+    with _DELIVERY_GUARD:
+        if sid in _DELIVERY_ACTIVE:
+            record_resume_attempt(sid, blocked_at, stamp, "skipped",
+                                  "consegna gia' in corso su questa sessione")
+            return
+        _DELIVERY_ACTIVE.add(sid)
+    try:
+        fresh = get_session(sid)
+        info = tmux_sessions(fresh["unix_user"]).get(fresh["tmux_name"])
+        decorate(fresh, info)
+        if fresh.get("lifecycle") != "USAGE_LIMIT":
+            # Fra lo sweep e adesso il limite e' rientrato da solo: puo' averlo
+            # fatto la harness (Claude Code riprende da se') o l'utente. In
+            # entrambi i casi un turno in piu' sarebbe rumore.
+            record_resume_attempt(sid, blocked_at, stamp, "skipped",
+                                  f"la sessione non e' piu' bloccata: {fresh.get('lifecycle')}")
+            return
+        if RESUME_MARKER in pane_screen_text(fresh):
+            record_resume_attempt(sid, blocked_at, stamp, "skipped",
+                                  "il tentativo precedente e' ancora sullo schermo")
+            return
+        text = with_contract(fresh, RESUME_TEXT, initial=False)
+        mid = add_message(sid, text, kind="control")
+        ok, err = deliver_text(fresh, mid, text, wait_ready=False,
+                               count_attempt=True, busy_cap=RESUME_BUSY_CAP)
+        record_resume_attempt(sid, blocked_at, stamp,
+                              "sent" if ok else "failed", err)
+    except Exception as exc:  # noqa: BLE001
+        record_resume_attempt(sid, blocked_at, stamp, "failed", f"errore interno: {exc}")
+    finally:
+        with _DELIVERY_GUARD:
+            _DELIVERY_ACTIVE.discard(sid)
+        _DELIVERY_WAKE.set()
 
 
 def sweep_loop() -> None:
@@ -2221,6 +2388,14 @@ def accumulate_work(row: dict) -> None:
     # un salto piu' lungo della soglia e' silenzio, non elaborazione: si
     # riparte dal nuovo mtime senza sommare l'attesa
     added = int(delta) if 0 < delta <= controller_config()["work_gap_seconds"] else 0
+    if row.get("lifecycle") in BLOCKED_LIFECYCLES:
+        # La TUI ridisegna anche mentre la sessione e' ferma su un limite d'uso
+        # o su un login scaduto: lo spinner e il conto alla rovescia scrivono
+        # sul PTY esattamente come il lavoro vero. Quei secondi sono attesa, e
+        # contarli faceva risultare «11h di lavoro» una sessione che per undici
+        # ore non ha elaborato niente. Il probe avanza comunque, cosi' alla
+        # ripresa il conteggio riparte dall'istante giusto.
+        added = 0
     total = int(row.get("work_seconds") or 0) + added
     try:
         with db() as conn:

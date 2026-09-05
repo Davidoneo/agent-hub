@@ -118,6 +118,42 @@ agent_hub_harness_update_calendar: "*-*-* 03:20:00"
 agent_hub_harness_audit_project: agent-hub
 ```
 
+## Blocking states and automatic resume
+
+`controller.json` carries the controller thresholds and the patterns that let a
+live session be recognised as *blocked* rather than *working*. They are matched
+against the pane the TUI is showing right now, never the PTY scrollback, so
+they must be text that stays on screen for as long as the obstacle lasts — and
+an agent that merely quotes the sentence in its own output does not create a
+false state. The file is re-read whenever it changes, so tuning a threshold
+needs no service restart.
+
+This matters more than it looks: with no `USAGE_LIMIT` pattern the harness
+spinner keeps the PTY log moving, so a session parked on a usage limit stays
+`RUNNING` forever, its wait is billed as work time, and no notification is ever
+raised. `AUTH_REQUIRED` ships empty on purpose — those screens were not
+verified for every harness, and a wrong pattern would freeze a healthy session.
+
+Once a session is recognised as `USAGE_LIMIT`, Agent Hub keeps it alive instead
+of preparing a replacement: the harness process still holds the whole
+conversation in memory, and rebuilding that from a transcript would spend the
+budget that has just come back. It waits for the reset instant published in
+`provider_usage`, leaves `resume_retry_seconds` of grace so a harness that
+resumes on its own goes first (Claude Code does, with
+`autoContinueAtUsageLimit`), re-reads the pane to confirm both that the
+obstacle is still there and that the previous attempt is not still sitting
+unaccepted in the composer, and only then hands the session one more turn -
+otherwise repeated attempts would stack up and all go out on the first human
+Enter. The attempt travels as a
+`control` message: a failed one can never block the human messages queued
+behind it, and every attempt is recorded in `usage_resume_attempts`. After
+`resume_max_attempts` the session stays visibly parked and the decision goes
+back to a person; set that to `0` to disable the resume altogether.
+
+A Codex goal parked with `Goal hit usage limits` stays parked: the resumed turn
+carries the work forward, but re-arming the goal itself still needs `/goal
+resume` typed in the session.
+
 ## Exposure
 
 systemd creates `/run/agent-hub/agent-hub.sock` with no group/other access and

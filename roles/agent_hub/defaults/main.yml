@@ -48,6 +48,51 @@ agent_hub_harness_audit_project: agent-hub
 agent_hub_harness_audit_model: gpt-5.6-sol
 agent_hub_harness_audit_effort: high
 
+# Deterministic controller. Thresholds are re-read from controller.json at
+# every access, so tuning one needs no service restart.
+#
+# `patterns` is how the controller learns that a live session is blocked rather
+# than working. They are matched against the *visible* pane, never the PTY
+# scrollback, so they must be text the TUI keeps on screen for as long as the
+# obstacle lasts. Without them USAGE_LIMIT can never be reached: the session
+# stays "at work" for hours, its wait is billed as work time, and no
+# notification is ever raised. AUTH_REQUIRED ships empty on purpose - the login
+# screens were not verified for every harness, and a wrong pattern would freeze
+# a healthy session into a state nobody asked for.
+agent_hub_controller_stall_seconds: 900
+agent_hub_controller_sweep_seconds: 30
+agent_hub_controller_nudge_seconds: 240
+agent_hub_controller_work_gap_seconds: 120
+# Automatic resume of a session parked on a usage limit: retry interval (also
+# the grace left to the harness's own auto-resume after the announced reset),
+# the wait used when no window announces a reset instant, and a closed number
+# of attempts. Set the attempts to 0 to disable the resume entirely.
+agent_hub_controller_resume_retry_seconds: 900
+agent_hub_controller_resume_blind_seconds: 3600
+agent_hub_controller_resume_max_attempts: 8
+#
+# Every pattern is anchored to the shape the TUI actually draws - a line start,
+# or a literal that includes the command the footer offers. A looser wording
+# would match an agent that merely writes the sentence in its own output, and
+# that is not a hypothetical: the very session that introduced these patterns
+# flagged itself the moment it printed them. Screen matching makes such a false
+# positive self-healing (it goes away when the text scrolls off) but the
+# patterns still have to earn their specificity.
+#
+# Known gap, accepted: Claude's /rate-limit-options menu, shown instead of the
+# automatic wait when the reset is more than 24h out, is not recognised - its
+# rows are too close to ordinary prose to match safely.
+agent_hub_controller_patterns:
+  AUTH_REQUIRED: []
+  USAGE_LIMIT:
+    # Codex: the error banner carries the TUI's own bullet, and a parked goal
+    # keeps its state in the footer, next to the command that resumes it.
+    - "(?m)^\\s*■ You've hit your usage limit"
+    - "(?m)^\\s*Usage limit reached\\. You've reached your usage limit"
+    - "Goal hit usage limits \\(/goal resume\\)"
+    # Claude Code: the status line of a wait armed by autoContinueAtUsageLimit.
+    - "(?m)^\\s*Continuing automatically when your limit resets"
+
 # The SERVER account is the dedicated host administrator. PROJECT remains
 # unprivileged and reaches GitHub only through per-project deploy keys.
 agent_hub_server_admin: false

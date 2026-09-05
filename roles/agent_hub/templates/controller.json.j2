@@ -1,0 +1,10 @@
+{{ {
+  "stall_seconds": agent_hub_controller_stall_seconds | int,
+  "sweep_seconds": agent_hub_controller_sweep_seconds | int,
+  "nudge_seconds": agent_hub_controller_nudge_seconds | int,
+  "work_gap_seconds": agent_hub_controller_work_gap_seconds | int,
+  "resume_retry_seconds": agent_hub_controller_resume_retry_seconds | int,
+  "resume_blind_seconds": agent_hub_controller_resume_blind_seconds | int,
+  "resume_max_attempts": agent_hub_controller_resume_max_attempts | int,
+  "patterns": agent_hub_controller_patterns,
+} | to_nice_json }}

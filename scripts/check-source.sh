@@ -30,6 +30,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
   tests/test_telegram_outbox_ctl.py \
   tests/test_claude_refresh.py tests/test_session_ctl_delivery.py \
   tests/test_delivery_queue.py tests/test_harness_update_ctl.py \
-  tests/test_session_ctl_conversation.py
+  tests/test_session_ctl_conversation.py tests/test_usage_limit.py
 git diff --check
 echo "Source checks: OK"

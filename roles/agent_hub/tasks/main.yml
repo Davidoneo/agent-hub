@@ -246,6 +246,16 @@
   notify:
     - Restart agent-hub
 
+# Thresholds and blocking-state patterns. Re-read on change, so this file
+# deliberately does not notify a restart.
+- name: Agent Hub | controller thresholds and blocking-state patterns
+  ansible.builtin.template:
+    src: controller.json.j2
+    dest: "{{ agent_hub_config_dir }}/controller.json"
+    owner: root
+    group: root
+    mode: "0644"
+
 - name: Agent Hub | service deploy-key profiles
   ansible.builtin.template:
     src: service-deploy.json.j2
