@@ -1076,16 +1076,7 @@ def _claude_runtime(harness_sid):
     --session-id. Nessuna euristica sul percorso, nessun contenuto di
     conversazione viene letto o restituito.
     """
-    root = os.path.join(me().pw_dir, ".claude", "projects")
-    path = ""
-    try:
-        for entry in os.scandir(root):
-            cand = os.path.join(entry.path, f"{harness_sid}.jsonl")
-            if entry.is_dir() and os.path.isfile(cand):
-                path = cand
-                break
-    except OSError:
-        pass
+    path = _claude_jsonl(harness_sid)
     if not path:
         return {"state": "pending", "reason": "nessuna trascrizione: l'harness non ha ancora risposto"}
 
@@ -1148,27 +1139,7 @@ def _codex_runtime(workdir, since):
     rollout corrispondono si prende il piu' recente; se nessuno corrisponde si
     dichiara `pending` invece di indovinare.
     """
-    root = os.path.join(me().pw_dir, ".codex", "sessions")
-    best, best_mtime = "", 0.0
-    for dirpath, _dirs, files in os.walk(root):
-        for f in files:
-            if not (f.startswith("rollout-") and f.endswith(".jsonl")):
-                continue
-            p = os.path.join(dirpath, f)
-            try:
-                st = os.stat(p)
-            except OSError:
-                continue
-            if st.st_mtime < since - 60 or st.st_mtime <= best_mtime:
-                continue
-            try:
-                with open(p, encoding="utf-8", errors="replace") as fh:
-                    head = json.loads(fh.readline() or "{}")
-            except (OSError, ValueError):
-                continue
-            if (head.get("payload") or {}).get("cwd") != workdir:
-                continue
-            best, best_mtime = p, st.st_mtime
+    best = _codex_rollout(workdir, since)
     if not best:
         return {"state": "pending", "reason": "nessun rollout Codex per questa directory"}
 
@@ -1210,6 +1181,312 @@ def _codex_runtime(workdir, since):
         "last_at": last_at if re.match(r"^[0-9T:.+\-Z]{10,40}$", last_at) else "",
         "source": "~/.codex/sessions/…/" + os.path.basename(best),
     }
+
+
+# ------------------------------------------------------- conversazione
+#
+# La trascrizione ricostruita dal log PTY e' il rendering di uno schermo nel
+# tempo. Claude Code e Codex vivono pero' nel buffer alternativo del terminale:
+# non producono scrollback e ridisegnano solo la finestra visibile, quindi dal
+# log si recupera l'ultima schermata e poco altro, spezzata dalla cornice della
+# TUI. La conversazione vera esiste gia' in forma strutturata negli stessi file
+# di stato usati qui sopra per modello e token: la trascrizione JSONL di Claude
+# Code e il rollout di Codex. Questa sezione li rende testo semplice.
+#
+# A differenza di `runtime`, qui il contenuto della conversazione viene
+# restituito: e' esattamente cio' che l'utente legge nel proprio terminale, e
+# l'Hub lo serve come text/plain con nosniff.
+
+MAX_CONV_BYTES = 64 * 1024 * 1024
+CONV_DETAILS = ("text", "full", "verbose")
+CONV_IN_LINES = 12          # righe di input di uno strumento
+CONV_OUT_LINES = 24         # righe di output di uno strumento
+CONV_LINE_CHARS = 2000      # tetto per riga, contro output a riga unica
+
+# Iniezioni della harness che nel terminale non compaiono come testo scritto
+# dall'utente: promemoria di sistema, output dei comandi slash locali, eco del
+# comando invocato. Restano visibili solo con dettaglio `verbose`.
+CONV_NOISE_RE = re.compile(
+    r"<(system-reminder|local-command-stdout|local-command-stderr|"
+    r"command-message|command-name|command-args|command-contents)>"
+    r".*?</\1>[ \t]*\n?", re.S)
+CONV_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _conv_entries(path):
+    """Righe JSON del file di stato, dalla piu' vecchia alla piu' recente."""
+    with open(path, "rb") as fh:
+        if os.fstat(fh.fileno()).st_size > MAX_CONV_BYTES:
+            fh.seek(-MAX_CONV_BYTES, os.SEEK_END)
+            fh.readline()  # scarta la riga tronca
+        for raw in fh:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+def _conv_when(stamp):
+    try:
+        dt = datetime.fromisoformat(str(stamp or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    try:
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _conv_clean(text, detail):
+    """Testo stampabile: niente controlli, niente iniezioni della harness."""
+    out = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if detail != "verbose":
+        out = CONV_NOISE_RE.sub("", out)
+    out = CONV_CTRL_RE.sub("", out)
+    lines = [ln[:CONV_LINE_CHARS].rstrip() for ln in out.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+class Conversation:
+    """Accumula la conversazione come testo, con un dettaglio scelto.
+
+    I marcatori sono ASCII fra parentesi quadre (`[Utente · …]`, `[tool]`,
+    `[out]`) proprio perche' devono restare riconoscibili una volta incollati
+    altrove e non assomigliare alla cornice di una TUI.
+    """
+
+    def __init__(self, detail):
+        self.detail = detail
+        self.out = []
+
+    def _push(self, lines):
+        if self.out and self.out[-1]:
+            self.out.append("")
+        self.out.extend(lines)
+
+    def message(self, who, when, text):
+        body = _conv_clean(text, self.detail)
+        if not body:
+            return
+        self._push([f"[{who}" + (f" · {when}]" if when else "]")] + body.split("\n"))
+
+    def _body(self, text, limit):
+        body = _conv_clean(text, self.detail)
+        if not body:
+            return []
+        lines = body.split("\n")
+        if self.detail != "verbose" and len(lines) > limit:
+            extra = len(lines) - limit
+            lines = lines[:limit] + [f"… (+{extra} righe)"]
+        return ["    " + ln for ln in lines]
+
+    def call(self, name, note, body):
+        if self.detail == "text":
+            return
+        head = f"  [tool] {name}" + (f" — {note}" if note else "")
+        self._push([head] + self._body(body, CONV_IN_LINES))
+
+    def result(self, text, failed=False):
+        if self.detail == "text":
+            return
+        body = self._body(text, CONV_OUT_LINES)
+        if not body:
+            return
+        self.out.append("  [err]" if failed else "  [out]")
+        self.out.extend(body)
+
+    def render(self):
+        while self.out and not self.out[-1]:
+            self.out.pop()
+        return "\n".join(self.out) + ("\n" if self.out else "")
+
+
+# ------------------------------------------------------- Claude Code
+
+def _claude_jsonl(harness_sid):
+    """Percorso della trascrizione JSONL della sessione, stringa vuota se assente."""
+    root = os.path.join(me().pw_dir, ".claude", "projects")
+    try:
+        for entry in os.scandir(root):
+            cand = os.path.join(entry.path, f"{harness_sid}.jsonl")
+            if entry.is_dir() and os.path.isfile(cand):
+                return cand
+    except OSError:
+        pass
+    return ""
+
+
+def _claude_tool_input(name, data):
+    """Argomento significativo di una chiamata a strumento, non il JSON intero."""
+    if not isinstance(data, dict):
+        return str(data or "")
+    for key in ("command", "file_path", "path", "pattern", "url", "query", "prompt"):
+        if data.get(key):
+            head = str(data[key])
+            rest = [f"{k}: {v}" for k, v in data.items()
+                    if k not in (key, "description") and isinstance(v, (str, int, float, bool))]
+            return head + ("\n" + "\n".join(rest) if rest and name in ("Edit", "Write") else "")
+    try:
+        return json.dumps(data, ensure_ascii=False)[:4000]
+    except (TypeError, ValueError):
+        return ""
+
+
+def _claude_result(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text") or "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _claude_conversation(path, detail):
+    conv = Conversation(detail)
+    for d in _conv_entries(path):
+        kind = d.get("type")
+        if kind not in ("user", "assistant"):
+            continue
+        if d.get("isSidechain") and detail != "verbose":
+            continue  # turni di un subagente: non sono la conversazione principale
+        when = _conv_when(d.get("timestamp"))
+        who = "Claude" if kind == "assistant" else "Utente"
+        content = (d.get("message") or {}).get("content")
+        blocks = ([{"type": "text", "text": content}] if isinstance(content, str)
+                  else [b for b in (content or []) if isinstance(b, dict)])
+        for b in blocks:
+            btype = b.get("type")
+            if btype == "text":
+                conv.message(who, when, b.get("text"))
+            elif btype == "thinking" and detail == "verbose":
+                conv.message(f"{who} · ragionamento", when, b.get("thinking"))
+            elif btype == "tool_use":
+                name = str(b.get("name") or "tool")[:60]
+                data = b.get("input") or {}
+                note = str(data.get("description") or "")[:200] if isinstance(data, dict) else ""
+                conv.call(name, note, _claude_tool_input(name, data))
+            elif btype == "tool_result":
+                conv.result(_claude_result(b.get("content")), bool(b.get("is_error")))
+    return conv.render()
+
+
+# ------------------------------------------------------------- Codex
+
+def _codex_rollout(workdir, since):
+    """Rollout della sessione: stesso cwd, avviato dopo `since`. Vuoto se assente."""
+    root = os.path.join(me().pw_dir, ".codex", "sessions")
+    best, best_mtime = "", 0.0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            if not (f.startswith("rollout-") and f.endswith(".jsonl")):
+                continue
+            p = os.path.join(dirpath, f)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if st.st_mtime < since - 60 or st.st_mtime <= best_mtime:
+                continue
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    head = json.loads(fh.readline() or "{}")
+            except (OSError, ValueError):
+                continue
+            if (head.get("payload") or {}).get("cwd") != workdir:
+                continue
+            best, best_mtime = p, st.st_mtime
+    return best
+
+
+def _codex_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text") or "") for b in content if isinstance(b, dict))
+    return ""
+
+
+def _codex_command(command):
+    """`['/bin/bash', '-lc', '…']` diventa il solo comando eseguito."""
+    if isinstance(command, str):
+        return command
+    parts = [str(p) for p in (command or [])]
+    if len(parts) >= 3 and parts[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") \
+            and parts[1] in ("-lc", "-c"):
+        return parts[2]
+    return " ".join(parts)
+
+
+def _codex_conversation(path, detail):
+    conv = Conversation(detail)
+    for d in _conv_entries(path):
+        payload = d.get("payload") or {}
+        if payload.get("type") != "item_completed":
+            continue
+        item = payload.get("item") or {}
+        when = _conv_when(d.get("timestamp"))
+        kind = item.get("type")
+        if kind == "UserMessage":
+            conv.message("Utente", when, _codex_text(item.get("content")))
+        elif kind == "AgentMessage":
+            conv.message("Codex", when, _codex_text(item.get("content")))
+        elif kind == "Reasoning" and detail == "verbose":
+            conv.message("Codex · ragionamento", when,
+                         "\n".join(str(s) for s in (item.get("summary_text") or [])))
+        elif kind == "CommandExecution":
+            code = item.get("exit_code")
+            conv.call("exec", "" if code in (0, "0", None) else f"exit {code}",
+                      _codex_command(item.get("command")))
+            conv.result(item.get("aggregated_output") or "", code not in (0, "0", None))
+        elif kind == "FileChange":
+            changes = item.get("changes") or {}
+            conv.call("file-change", "", "\n".join(
+                f"{(v or {}).get('type', '?')}: {k}" for k, v in changes.items()))
+    return conv.render()
+
+
+def cmd_conversation(argv):
+    """conversation <profile-id> <workdir> [harness-session-id] [since] [detail]
+
+    Conversazione della sessione come testo semplice, letta dal file di stato
+    della harness. `detail` vale `text` (soli messaggi), `full` (con le
+    chiamate a strumento, output troncato) o `verbose` (nulla di troncato,
+    ragionamenti e promemoria di sistema inclusi).
+
+    Se il file non esiste ancora l'uscita e' vuota con esito 0: e' il segnale
+    che il chiamante usa per ricadere sulla trascrizione dello schermo.
+    """
+    if len(argv) < 2:
+        die("uso: conversation <profile-id> <workdir> [harness-session-id] [since] [detail]")
+    prof = load_profiles().get(argv[0]) or die("profilo sconosciuto")
+    workdir = os.path.realpath(argv[1])
+    harness_sid = argv[2] if len(argv) > 2 else ""
+    try:
+        since = float(argv[3]) if len(argv) > 3 and argv[3] else 0.0
+    except ValueError:
+        since = 0.0
+    detail = (argv[4] if len(argv) > 4 else "full") or "full"
+    if detail not in CONV_DETAILS:
+        die("dettaglio non valido: usa " + ", ".join(CONV_DETAILS))
+    source = (prof.get("runtime") or {}).get("source", "")
+    text = ""
+    try:
+        if source == "claude-jsonl" and harness_sid and UUID_RE.fullmatch(harness_sid):
+            path = _claude_jsonl(harness_sid)
+            text = _claude_conversation(path, detail) if path else ""
+        elif source == "codex-rollout":
+            path = _codex_rollout(workdir, since)
+            text = _codex_conversation(path, detail) if path else ""
+    except OSError:
+        text = ""
+    sys.stdout.write(text)
 
 
 def cmd_runtime(argv):
@@ -2210,6 +2487,7 @@ COMMANDS = {
     "kill": cmd_kill, "has": cmd_has, "list": cmd_list, "capture": cmd_capture,
     "attach": cmd_attach, "resize": cmd_resize, "login": cmd_login, "info": cmd_info,
     "models": cmd_models, "usage": cmd_usage, "runtime": cmd_runtime,
+    "conversation": cmd_conversation,
     "command": cmd_command, "model": cmd_model, "mode": cmd_mode, "goal": cmd_goal,
     "server": cmd_server, "version": cmd_version,
 }

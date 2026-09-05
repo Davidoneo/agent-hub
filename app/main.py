@@ -3828,13 +3828,25 @@ async def sessions_cleanup(request: Request):
 # Due rappresentazioni distinte dello stesso materiale:
 #   - il log raw (flusso PTY integrale) resta intatto per la diagnostica ed e'
 #     servito solo come allegato da scaricare, mai come testo nel browser;
-#   - la trascrizione e' testo semplice, senza ANSI/OSC/controlli, ricavata da
-#     `tmux capture-pane -p -J -S -` oppure emulando lo schermo sul log raw.
+#   - la trascrizione di schermo e' testo semplice, senza ANSI/OSC/controlli,
+#     ricavata da `tmux capture-pane -p -J -S -` oppure emulando lo schermo sul
+#     log raw;
+#   - la conversazione e' letta dal file di stato della harness (trascrizione
+#     JSONL di Claude Code, rollout di Codex) ed e' l'unica fonte completa.
+#
+# La terza esiste perche' le due precedenti non possono essere complete: Claude
+# Code e Codex disegnano nel buffer alternativo del terminale, che non ha
+# scrollback, e ridisegnano soltanto la finestra visibile. Dal PTY si recupera
+# quindi l'ultima schermata e i pochi ridisegni a schermo intero, non la
+# conversazione: per un log da mezzo megabyte restano meno di cento righe,
+# ripetute e intervallate dalla cornice della TUI.
 
 MAX_RAW_SCAN = 8_000_000          # byte di log raw analizzati per la trascrizione
-MAX_TRANSCRIPT_BYTES = 1_000_000  # tetto della risposta
+MAX_TRANSCRIPT_BYTES = 4_000_000  # tetto della risposta
 DEFAULT_TAIL_LINES = 3000
 MAX_TAIL_LINES = 50_000
+TRANSCRIPT_SOURCES = ("auto", "native", "tmux", "log")
+TRANSCRIPT_DETAILS = ("text", "full", "verbose")
 
 _TRANSCRIPT_CACHE: dict[str, tuple[tuple, str]] = {}
 
@@ -3882,9 +3894,29 @@ def raw_transcript(row: dict) -> str:
     return text
 
 
-def build_transcript(row: dict, source: str) -> tuple[str, str]:
+def native_transcript(row: dict, detail: str) -> str:
+    """Conversazione letta dal file di stato della harness, come l'utente Unix.
+
+    Vuota quando l'harness non ne espone uno (OpenCode) o non ha ancora scritto
+    nulla: in quel caso il chiamante ricade sulla trascrizione dello schermo.
+    """
+    try:
+        prof = profile_by_id(row["profile_id"])
+    except HTTPException:
+        return ""
+    if not (prof.get("runtime") or {}).get("source"):
+        return ""
+    data = wrapper_bytes(row["unix_user"], SESSION_CTL, "conversation", row["profile_id"],
+                         row["workdir"], row.get("harness_session_id") or "",
+                         str(_epoch(row["created_at"])), detail, timeout=90)
+    return data.decode("utf-8", "replace")
+
+
+def build_transcript(row: dict, source: str, detail: str = "full") -> tuple[str, str]:
     """Restituisce (testo, sorgente effettiva) secondo la strategia richiesta."""
     running = row["status"] == "running"
+    if source == "native":
+        return native_transcript(row, detail), "native"
     if source == "tmux":
         if running:
             return tmux_transcript(row), "tmux"
@@ -3895,7 +3927,15 @@ def build_transcript(row: dict, source: str) -> tuple[str, str]:
     if source == "log":
         return raw_transcript(row), "log"
 
-    # auto: si preferisce tmux quando offre davvero uno scrollback. Le TUI che
+    # auto: la conversazione della harness viene prima di tutto, perche' e'
+    # l'unica fonte completa e senza cornice. Le altre restano per OpenCode,
+    # per le sessioni avviate prima che l'Hub passasse --session-id e per
+    # vedere davvero cosa c'e' sullo schermo.
+    native = native_transcript(row, detail)
+    if native.strip():
+        return native, "native"
+
+    # Poi si preferisce tmux quando offre davvero uno scrollback. Le TUI che
     # vivono nello schermo alternativo (Claude Code) non ne hanno, quindi in
     # quel caso il log raw emulato e' l'unica fonte con lo storico completo.
     if running:
@@ -3917,20 +3957,24 @@ def build_transcript(row: dict, source: str) -> tuple[str, str]:
 
 @app.get("/api/sessions/{sid}/transcript", response_class=PlainTextResponse)
 async def session_transcript(sid: str, source: str = "auto", tail: int = DEFAULT_TAIL_LINES,
-                             chrome: str = "hide"):
+                             chrome: str = "hide", detail: str = "full"):
     row = get_session(sid)
-    if source not in ("auto", "tmux", "log"):
-        raise HTTPException(400, "sorgente non valida: usa auto, tmux oppure log")
+    if source not in TRANSCRIPT_SOURCES:
+        raise HTTPException(400, "sorgente non valida: usa " + ", ".join(TRANSCRIPT_SOURCES))
     if chrome not in ("hide", "show"):
         raise HTTPException(400, "chrome non valido: usa hide oppure show")
+    if detail not in TRANSCRIPT_DETAILS:
+        raise HTTPException(400, "dettaglio non valido: usa " + ", ".join(TRANSCRIPT_DETAILS))
     try:
         tail = max(50, min(MAX_TAIL_LINES, int(tail)))
     except (TypeError, ValueError):
         tail = DEFAULT_TAIL_LINES
-    text, used = build_transcript(row, source)
+    text, used = build_transcript(row, source, detail)
     # La cornice si toglie prima del taglio, cosi' `tail` conta righe di
-    # contenuto e non separatori.
-    if chrome == "hide" and text.strip():
+    # contenuto e non separatori. La conversazione della harness non ne ha:
+    # toglierla li' significherebbe solo cancellare righe scritte dall'agente.
+    stripped = chrome == "hide" and used != "native"
+    if stripped and text.strip():
         text = tr.strip_chrome(text)
     if not text.strip():
         text = "(nessuna trascrizione disponibile per questa sessione)"
@@ -3943,7 +3987,10 @@ async def session_transcript(sid: str, source: str = "auto", tail: int = DEFAULT
         "Content-Type": "text/plain; charset=utf-8",
         "X-Content-Type-Options": "nosniff",
         "X-Transcript-Source": used,
-        "X-Transcript-Chrome": chrome,
+        # cio' che e' stato davvero applicato: la conversazione della harness
+        # non ha cornice da togliere e il dettaglio non tocca lo schermo
+        "X-Transcript-Chrome": "hide" if stripped else "show",
+        "X-Transcript-Detail": detail if used == "native" else "n/a",
         "X-Transcript-Lines": str(text.count("\n") + 1),
         "X-Transcript-Truncated": "1" if truncated else "0",
         "Cache-Control": "no-store",

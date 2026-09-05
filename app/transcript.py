@@ -316,8 +316,15 @@ _CHROME_RULES = (
     # contatore di token fra parentesi, oppure "* <verbo> for <durata>"
     re.compile(r"\(\d+[hms][^)]*tokens\)\s*$"),
     re.compile(r"^\s*\*\s+\S+\s+for\s+\d+[hms]\b"),
+    # spinner senza contatore, subito dopo l'invio: "* Frolicking…"
+    re.compile(r"^\s*[✻✽✢✳✶✷✸✹✺✱✲*]\s+\w[\w' -]*…\s*$"),
     # footer di stato Claude Code
     re.compile(r"⏵⏵"),
+    # coda destra del footer: "● high · /effort", "/rc active"
+    re.compile(r"^\s*[●○]\s+\S+\s+·\s+/\w[\w-]*\s*$"),
+    re.compile(r"^\s*/\w[\w-]*\s+active\s*$"),
+    # suggerimento che Claude Code stampa mentre lavora
+    re.compile(r"^\s*Still working\.\s+Check in from your phone\s*$"),
     # footer di stato Codex: "gpt-5.6-sol xhigh · ~"
     re.compile(r"^\s*\S+\s+(?:minimal|low|medium|high|xhigh)\s*·\s*~\s*$"),
 )

@@ -2355,9 +2355,13 @@ async function viewSession(sid) {
       <button class="small" id="term-page-up" title="Scorri indietro di una pagina nella cronologia tmux">Pagina su</button>
       <button class="small" id="term-page-down" title="Scorri avanti di una pagina nella cronologia tmux">Pagina giù</button>
       <button class="small" id="term-live" title="Torna subito all'output più recente">In fondo / live</button>
+      <button class="small" id="term-copy" title="Copia negli appunti lo schermo del terminale">Copia schermo</button>
     </div>
     <div id="term"></div>
     <div class="muted" id="ws-state" style="margin-top:6px">connessione…</div>
+    <div class="muted" id="term-hint" style="margin-top:4px">Le TUI catturano il mouse: per selezionare col puntatore tieni
+      premuto Maiusc mentre trascini. «Copia schermo» copia tutto lo schermo senza selezionare,
+      la conversazione completa sta nel riquadro Log.</div>
     <div id="status-strip">${statusStrip(s)}</div>
     <div class="sticky-actions">
       <div id="escalation-slot">${escalationControls(s, profiles)}</div>
@@ -2453,13 +2457,20 @@ async function viewSession(sid) {
         <label class="inline"><input type="checkbox" id="tr-auto"> aggiornamento automatico</label>
         <select id="tr-source" class="small">
           <option value="auto">sorgente automatica</option>
+          <option value="native">conversazione della harness</option>
           <option value="tmux">schermo tmux (capture-pane)</option>
           <option value="log">storico dal log raw</option>
+        </select>
+        <select id="tr-detail" class="small" title="Quanto mostrare della conversazione della harness">
+          <option value="full" selected>con gli strumenti</option>
+          <option value="text">solo i messaggi</option>
+          <option value="verbose">tutto, senza tagli</option>
         </select>
         <select id="tr-tail" class="small">
           <option value="500">ultime 500 righe</option>
           <option value="3000" selected>ultime 3000 righe</option>
           <option value="20000">ultime 20000 righe</option>
+          <option value="50000">tutte le righe</option>
         </select>
         <select id="tr-chrome" class="small">
           <option value="hide" selected>cornice TUI nascosta</option>
@@ -2468,12 +2479,15 @@ async function viewSession(sid) {
         <span class="muted" id="tr-meta"></span>
       </div>
       <pre id="tr-out" class="transcript">(premi Aggiorna per caricare la trascrizione)</pre>
-      ${help("La trascrizione è testo semplice: le sequenze ANSI/OSC sono rimosse e il contenuto viene " +
-             "sempre inserito come testo, mai come HTML. Con la cornice nascosta spariscono separatori, " +
-             "riga di input vuota, spinner e footer di stato, che la TUI ridisegna a ogni refresh e che " +
-             "spezzano i blocchi lunghi da copiare; il testo non viene mai deduplicato, quindi le righe " +
-             "orizzontali delle tabelle stampate dall'agente spariscono ma le celle restano. " +
-             "Il log raw completo resta scaricabile per la diagnostica.")}
+      ${help("La trascrizione è sempre testo semplice: le sequenze ANSI/OSC sono rimosse e il contenuto " +
+             "viene inserito come testo, mai come HTML. «Conversazione della harness» la legge dai file " +
+             "che Claude Code e Codex scrivono a ogni turno: è l'unica fonte completa, perché le loro TUI " +
+             "disegnano nel buffer alternativo del terminale, che non ha scrollback, e dal log raw si " +
+             "recupera poco più dell'ultima schermata. Il dettaglio sceglie se mostrare anche le chiamate " +
+             "agli strumenti e se troncarne l'output. Le due sorgenti di schermo restano per OpenCode, " +
+             "per le sessioni più vecchie e per vedere cosa c'è davvero sul terminale: lì la cornice " +
+             "nascosta toglie separatori, riga di input vuota, spinner e footer di stato, senza mai " +
+             "deduplicare il testo. Il log raw completo resta scaricabile per la diagnostica.")}
       <div class="muted mono">raw: /srv/agent-workspace/logs/${esc(s.tmux_name)}.log</div>
     </div>
 
@@ -2921,6 +2935,20 @@ async function viewSession(sid) {
   $("#term-page-up").onclick = () => scrollTerminal("scroll-up");
   $("#term-page-down").onclick = () => scrollTerminal("scroll-down");
   $("#term-live").onclick = () => scrollTerminal("scroll-bottom");
+  // Con il mouse tracking attivo la selezione col puntatore richiede Maiusc:
+  // il pulsante copia lo schermo intero senza chiedere di selezionare nulla.
+  $("#term-copy").onclick = async () => {
+    const sel = term.getSelection();
+    if (sel) { await copyText(sel, "Selezione copiata"); return; }
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/transcript` +
+        "?source=tmux&chrome=show&tail=50000",
+        { headers: { Accept: "text/plain" }, cache: "no-store" });
+      const text = await r.text();
+      if (!r.ok) throw new ApiError(r.status, text.slice(0, 300), "schermo");
+      await copyText(text, "Schermo copiato");
+    } catch (e) { showError(e, $("#sess-err")); }
+  };
   $("#a-kill").onclick = () => act("kill", escalationHost
     ? "Chiudere soltanto la sessione host? La sessione chiamante resterà aperta."
     : "Terminare la sessione tmux?");
@@ -2952,7 +2980,8 @@ async function viewSession(sid) {
   // come text/plain e finisce in un <pre> via textContent.
   const trUrl = () => `/api/sessions/${encodeURIComponent(sid)}/transcript` +
     `?source=${encodeURIComponent($("#tr-source").value)}&tail=${encodeURIComponent($("#tr-tail").value)}` +
-    `&chrome=${encodeURIComponent(($("#tr-chrome") || { value: "hide" }).value)}`;
+    `&chrome=${encodeURIComponent(($("#tr-chrome") || { value: "hide" }).value)}` +
+    `&detail=${encodeURIComponent(($("#tr-detail") || { value: "full" }).value)}`;
 
   // la fetch può concludersi dopo un cambio pagina: gli elementi vanno
   // rileggi ogni volta e possono essere spariti
@@ -2968,7 +2997,12 @@ async function viewSession(sid) {
       if (!$("#tr-out")) return;
       const stick = !scroll || out.scrollTop + out.clientHeight >= out.scrollHeight - 40;
       out.textContent = text;
-      const src = r.headers.get("X-Transcript-Source") || "?";
+      const SOURCES = {
+        native: "conversazione della harness", tmux: "schermo tmux",
+        log: "log raw emulato", snapshot: "schermo salvato alla chiusura",
+      };
+      const raw = r.headers.get("X-Transcript-Source") || "?";
+      const src = SOURCES[raw] || raw;
       const lines = r.headers.get("X-Transcript-Lines") || "?";
       const cut = r.headers.get("X-Transcript-Truncated") === "1";
       trMeta(`${lines} righe · sorgente ${src}${cut ? " · troncata alle ultime righe" : ""} · ${new Date().toLocaleTimeString()}`);
@@ -2982,6 +3016,7 @@ async function viewSession(sid) {
   $("#tr-source").onchange = () => loadTranscript();
   $("#tr-tail").onchange = () => loadTranscript();
   $("#tr-chrome").onchange = () => loadTranscript();
+  $("#tr-detail").onchange = () => loadTranscript();
   $("#tr-open").onclick = () => window.open(trUrl(), "_blank", "noopener");
   $("#tr-copy").onclick = () => copyText($("#tr-out").textContent, "Trascrizione copiata");
   $("#tr-auto").onchange = () => {
