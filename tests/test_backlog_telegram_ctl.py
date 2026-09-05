@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Contratti del bot Telegram dedicato al Backlog."""
+import ast
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sqlite3
 import tempfile
 import unittest
+import urllib
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -37,6 +42,23 @@ CFG = {
     "token": "test-token", "chat_id": "primary", "pairing_code": "pair-secret",
     "origin": "https://hub.example", "poll_timeout": "1",
 }
+
+
+def backend_transcription_functions():
+    """Carica solo gli helper cloud, senza avviare l'applicazione ASGI."""
+    source = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"_multipart", "_cloud_transcribe", "_groq_transcribe"}
+    selected = [node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in wanted]
+    namespace = {
+        "os": os, "json": json, "urllib": urllib, "Path": Path,
+        "BACKLOG_AUDIO_MAX": 25 * 1024 * 1024,
+    }
+    exec(compile(ast.Module(body=selected, type_ignores=[]), "main.py", "exec"),
+         namespace)
+    return namespace
 
 
 class BacklogTelegramTests(unittest.TestCase):
@@ -134,6 +156,8 @@ class BacklogTelegramTests(unittest.TestCase):
             text = Path(bot.CONFIG_FILE).read_text(encoding="utf-8")
         self.assertIn("AGENT_HUB_BACKLOG_TG_TOKEN=", text)
         self.assertIn("AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER=local", text)
+        self.assertIn("AGENT_HUB_BACKLOG_GROQ_API_KEY=", text)
+        self.assertIn("AGENT_HUB_BACKLOG_GROQ_MODEL=whisper-large-v3", text)
         self.assertIn("AGENT_HUB_BACKLOG_OPENAI_API_KEY=", text)
         self.assertNotIn("AGENT_HUB_BACKLOG_TG_PAIRING_CODE=\n", text)
 
@@ -143,12 +167,52 @@ class BacklogTelegramTests(unittest.TestCase):
         self.assertNotIn("telegram_audio", existing)
         self.assertNotIn('(\"backlog\",', existing)
 
+    def test_check_reports_the_configured_cloud_provider(self):
+        cfg = dict(CFG, transcribe_provider="groq",
+                   groq_model="whisper-large-v3")
+        with mock.patch.object(bot, "load_config", return_value=cfg), \
+             mock.patch.object(bot, "load_state", return_value={}), \
+             mock.patch.object(bot, "call", return_value={
+                 "username": "IdeeBacklogBot", "first_name": "Backlog"}), \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(bot.check(), 0)
+        payload = json.loads(printed.call_args.args[0])
+        self.assertEqual(payload["trascrizione"], "Groq (whisper-large-v3)")
+
     def test_backend_uses_dedicated_config_and_never_auto_enables_paid_api(self):
         backend = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
         self.assertIn('"/etc/agent-hub/backlog-telegram.env"', backend)
-        self.assertIn('values = {"provider": "local"', backend)
-        self.assertIn('if values["provider"] == "openai" and not values["api_key"]', backend)
+        self.assertIn('"provider": "local"', backend)
+        self.assertIn('not in {"local", "openai", "groq"}', backend)
+        self.assertIn('if values["provider"] == "openai" and not values["openai_api_key"]',
+                      backend)
+        self.assertIn('if values["provider"] == "groq" and not values["groq_api_key"]',
+                      backend)
+        self.assertIn('"https://api.groq.com/openai/v1/audio/transcriptions"', backend)
+        self.assertIn('"whisper-large-v3"', backend)
         self.assertNotIn('AGENT_HUB_TELEGRAM_CONFIG", "/etc/agent-hub/telegram.env"', backend)
+
+    def test_groq_transcription_uses_compatible_endpoint_and_multipart(self):
+        backend = backend_transcription_functions()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"text":"  idea trascritta  "}'
+        with tempfile.TemporaryDirectory() as tempdir:
+            audio = Path(tempdir) / "nota.ogg"
+            audio.write_bytes(b"fake-ogg-audio")
+            with mock.patch.object(urllib.request, "urlopen",
+                                   return_value=response) as opened:
+                result = backend["_groq_transcribe"](
+                    str(audio), "gsk-test", "whisper-large-v3")
+        self.assertEqual(result, "idea trascritta")
+        request = opened.call_args.args[0]
+        self.assertEqual(request.full_url,
+                         "https://api.groq.com/openai/v1/audio/transcriptions")
+        self.assertEqual(request.get_header("Authorization"), "Bearer gsk-test")
+        self.assertEqual(request.get_header("User-agent"), "AgentHub/1.0")
+        self.assertIn(b'name="model"\r\n\r\nwhisper-large-v3', request.data)
+        self.assertIn(b'name="language"\r\n\r\nit', request.data)
+        self.assertIn(b'filename="nota.ogg"', request.data)
 
     def test_unit_is_unprivileged_and_has_narrow_writes(self):
         unit = (ROOT / "roles/agent_hub/templates/agent-hub-backlog-telegram.service.j2"

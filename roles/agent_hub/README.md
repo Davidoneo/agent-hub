@@ -100,11 +100,16 @@ On first deployment the role creates the root-owned
 pairing code. Complete `AGENT_HUB_BACKLOG_TG_TOKEN`, restart
 `agent-hub-backlog-telegram`, then send `/start <pairing-code>` to that bot.
 The default `AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER=local` uses
-`faster-whisper` and cannot incur API charges. OpenAI transcription is an
-explicit opt-in: set the provider to `openai` and add the dedicated API key;
-merely inserting a key does not switch provider. Title, description and the
-private launch prompt are prepared by an ephemeral read-only Codex run, with a
-deterministic fallback if Codex is temporarily unavailable.
+`faster-whisper` and cannot incur API charges. For fast cloud transcription,
+the recommended option is Groq's Free plan: set the provider to `groq`, add
+`AGENT_HUB_BACKLOG_GROQ_API_KEY` and keep
+`AGENT_HUB_BACKLOG_GROQ_MODEL=whisper-large-v3`. OpenAI remains an explicit
+opt-in with provider `openai` and its dedicated key; merely inserting any key
+does not switch provider. A cloud failure leaves the audio available for an
+explicit retry and never silently invokes the slower local model. Title,
+description and the private launch prompt are prepared by an ephemeral
+read-only Codex run, with a deterministic fallback if Codex is temporarily
+unavailable.
 
 Standards-based Web Push is also opt-in. The role generates the VAPID private
 key directly on the host; do not put that key in inventory:

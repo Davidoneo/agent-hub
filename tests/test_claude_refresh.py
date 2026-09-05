@@ -61,6 +61,16 @@ class ClaudeRefreshTests(unittest.TestCase):
             self.assertIn("token locale scaduto", error)
             refresh.assert_not_called()
 
+    def test_successful_older_refresh_does_not_block_the_next_expiry(self):
+        # Il tentativo che ha creato il token corrente precede per definizione
+        # la sua scadenza: non e' un fallimento recente da limitare.
+        self.assertFalse(session_ctl._claude_refresh_throttled(
+            last_attempt=1000, current_expiry=2000 * 1000, moment=2100))
+
+    def test_recent_attempt_after_expiry_is_throttled(self):
+        self.assertTrue(session_ctl._claude_refresh_throttled(
+            last_attempt=2100, current_expiry=2000 * 1000, moment=2200))
+
 
 if __name__ == "__main__":
     unittest.main()

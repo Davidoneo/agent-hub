@@ -56,7 +56,8 @@ def log(message):
 def load_config():
     cfg = {
         "token": "", "chat_id": "", "pairing_code": "", "origin": "",
-        "poll_timeout": "25",
+        "poll_timeout": "25", "transcribe_provider": "local",
+        "groq_model": "whisper-large-v3", "openai_model": "gpt-transcribe",
     }
     keys = {
         "AGENT_HUB_BACKLOG_TG_TOKEN": "token",
@@ -64,6 +65,9 @@ def load_config():
         "AGENT_HUB_BACKLOG_TG_PAIRING_CODE": "pairing_code",
         "AGENT_HUB_BACKLOG_TG_ORIGIN": "origin",
         "AGENT_HUB_BACKLOG_TG_POLL_TIMEOUT": "poll_timeout",
+        "AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER": "transcribe_provider",
+        "AGENT_HUB_BACKLOG_GROQ_MODEL": "groq_model",
+        "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL": "openai_model",
     }
     try:
         for line in Path(CONFIG_FILE).read_text(encoding="utf-8").splitlines():
@@ -106,8 +110,10 @@ def init_config():
         f"AGENT_HUB_BACKLOG_TG_ORIGIN={origin}",
         "AGENT_HUB_BACKLOG_TG_POLL_TIMEOUT=25",
         "",
-        "# Gratis e locale per default. OpenAI è opzionale e a consumo.",
+        "# Locale per default. Groq Free e' il cloud consigliato; OpenAI e' opzionale.",
         "AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER=local",
+        "AGENT_HUB_BACKLOG_GROQ_API_KEY=",
+        "AGENT_HUB_BACKLOG_GROQ_MODEL=whisper-large-v3",
         "AGENT_HUB_BACKLOG_OPENAI_API_KEY=",
         "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL=gpt-transcribe",
         "",
@@ -422,12 +428,17 @@ def run():
 
 def check():
     cfg, state = load_config(), load_state()
+    provider = cfg.get("transcribe_provider", "local").lower()
+    transcription = {
+        "groq": f"Groq ({cfg.get('groq_model') or 'whisper-large-v3'})",
+        "openai": f"OpenAI ({cfg.get('openai_model') or 'gpt-transcribe'})",
+    }.get(provider, "locale (faster-whisper)")
     result = {
         "config_file": CONFIG_FILE,
         "token_presente": bool(cfg.get("token")),
         "chat_id": chat_id_of(cfg, state) or "(non associata)",
         "pairing_code": "presente" if cfg.get("pairing_code") else "assente",
-        "trascrizione": "locale (faster-whisper)",
+        "trascrizione": transcription,
     }
     if cfg.get("token"):
         try:

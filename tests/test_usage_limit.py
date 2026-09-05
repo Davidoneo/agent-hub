@@ -94,6 +94,21 @@ class BlockedState(unittest.TestCase):
         self.assertEqual(usage_limit.blocked_state(both, screen), "AUTH_REQUIRED")
 
 
+class UsageCohort(unittest.TestCase):
+    def test_half_completed_refresh_keeps_only_the_fresh_reading(self):
+        old = {"last_checked": "2026-09-05T18:20:00+00:00", "percent": 20}
+        new = {"last_checked": "2026-09-05T18:25:00+00:00", "percent": 21}
+        self.assertEqual(usage_limit.freshest_usage_cohort([old, new]), [new])
+
+    def test_coeval_different_accounts_remain_visible(self):
+        first = {"last_checked": "2026-09-05T18:25:00+00:00", "percent": 20}
+        second = {"last_checked": "2026-09-05T18:25:02+00:00", "percent": 70}
+        self.assertEqual(
+            usage_limit.freshest_usage_cohort([first, second]),
+            [first, second],
+        )
+
+
 class NextReset(unittest.TestCase):
     def test_windows_without_an_instant_say_nothing(self):
         self.assertEqual(usage_limit.next_reset(

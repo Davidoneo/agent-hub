@@ -2069,6 +2069,22 @@ def _claude_oauth_data(path):
         return {}
 
 
+def _claude_refresh_throttled(last_attempt, current_expiry, moment=None):
+    """Limita soltanto i tentativi falliti per la credenziale gia' scaduta.
+
+    Un rinnovo riuscito avviene prima della nuova scadenza che produce la
+    chiamata successiva. Il suo timestamp non deve quindi bloccare il rinnovo
+    del token seguente, che Claude emette tipicamente per poche ore.
+    """
+    moment = time.time() if moment is None else moment
+    try:
+        last = float(last_attempt or 0)
+        expired_at = float(current_expiry or 0) / 1000.0
+    except (TypeError, ValueError):
+        return False
+    return last >= expired_at and moment - last < CLAUDE_REFRESH_INTERVAL
+
+
 def _refresh_claude_oauth(path, previous_expiry):
     """Avvia solo il bootstrap auth di Claude e lo termina appena rinnova.
 
@@ -2092,7 +2108,7 @@ def _refresh_claude_oauth(path, previous_expiry):
             last = float((lock.read() or "0").strip())
         except (OSError, ValueError):
             last = 0
-        if time.time() - last < CLAUDE_REFRESH_INTERVAL:
+        if _claude_refresh_throttled(last, previous_expiry):
             return False
         current = _claude_oauth_data(path)
         current_expiry = float(current.get("expiresAt") or 0)

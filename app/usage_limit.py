@@ -1,4 +1,4 @@
-"""Decisioni sul limite d'uso di una harness: riconoscerlo e sapere quando riprovare.
+"""Decisioni sul limite d'uso e sulla coerenza dei dati di consumo.
 
 Modulo senza dipendenze esterne, come `tui_state` e `delivery_queue`: la logica
 che *decide* deve poter essere provata senza montare il backend.
@@ -18,10 +18,36 @@ divergere, e alcune finestre non dichiarano alcun istante. Quindi si attende il
 momento atteso, si lascia un margine e poi si prova; la verifica vera e' il
 tentativo stesso, che riesce solo se la TUI apre davvero un turno.
 """
+from datetime import datetime
 
 # Ordine di valutazione: un login scaduto e' una condizione piu' specifica di
 # un limite d'uso e va riconosciuto per primo.
 STATES = ("AUTH_REQUIRED", "USAGE_LIMIT")
+
+
+def freshest_usage_cohort(items, max_skew_seconds: int = 120):
+    """Scarta letture vecchie mentre il refresh multiutente e' a meta'.
+
+    Il backend interroga in sequenza le due home Unix. Se la prima lettura e'
+    gia' nuova e la seconda appartiene ancora al giro precedente, confrontare
+    i numeri produrrebbe per pochi secondi due schede dello stesso provider.
+    Letture coeve restano invece entrambe: possono rappresentare davvero due
+    account diversi.
+    """
+    stamped = []
+    for item in items:
+        try:
+            stamp = datetime.fromisoformat(
+                str(item.get("last_checked") or "")).timestamp()
+        except (TypeError, ValueError):
+            stamp = 0.0
+        stamped.append((stamp, item))
+    newest = max((stamp for stamp, _ in stamped), default=0.0)
+    if not newest:
+        return list(items)
+    cohort = [item for stamp, item in stamped
+              if stamp and newest - stamp <= max_skew_seconds]
+    return cohort or list(items)
 
 
 def blocked_state(compiled: dict, screen: str) -> str:

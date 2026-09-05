@@ -143,6 +143,8 @@ BACKLOG_TELEGRAM_CONFIG = os.environ.get(
     "AGENT_HUB_BACKLOG_TELEGRAM_CONFIG", "/etc/agent-hub/backlog-telegram.env")
 BACKLOG_TRANSCRIBE_MODEL = os.environ.get(
     "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL", "gpt-transcribe")
+BACKLOG_GROQ_MODEL = os.environ.get(
+    "AGENT_HUB_BACKLOG_GROQ_MODEL", "whisper-large-v3")
 BACKLOG_WORKERS_ENABLED = os.environ.get("AGENT_HUB_BACKLOG_WORKERS", "1") != "0"
 BACKLOG_AUDIO_MAX = int(os.environ.get(
     "AGENT_HUB_BACKLOG_AUDIO_MAX", str(25 * 1024 * 1024)))
@@ -1035,6 +1037,7 @@ USAGE_PROVIDERS = {n: s for n, s in CATALOG_PROVIDERS.items() if s.get("usage", 
 USAGE_TTL = 5 * 60          # ogni quanto rileggere un consumo gia' noto
 USAGE_RETRY_TTL = 60        # riprova piu' spesso dopo una lettura fallita
 USAGE_TICK = 60             # cadenza del giro periodico
+USAGE_REFRESH_COHERENCE = 2 * 60  # nasconde il mezzo giro fra i due utenti
 
 
 def _usage_due(user: str, provider: str, force: bool) -> bool:
@@ -1161,6 +1164,11 @@ def usage_overview() -> list[dict]:
             if latest:
                 out.append(latest)
             continue
+        # Durante un giro una home puo' essere gia' aggiornata e l'altra
+        # ancora ferma al giro precedente. La lettura vecchia non e' una prova
+        # di un secondo account e non deve creare una scheda lampeggiante.
+        good = usage_limit.freshest_usage_cohort(
+            good, USAGE_REFRESH_COHERENCE)
         merged: dict[str, dict] = {}
         for item in good:
             # l'istante di reset non entra nella firma: alcuni provider lo
@@ -1870,11 +1878,17 @@ async def retry_backlog(bid: str):
 
 def _backlog_transcription_config() -> dict[str, str]:
     """Provider esplicito: il default locale non puo' generare costi API."""
-    values = {"provider": "local", "api_key": "", "model": BACKLOG_TRANSCRIBE_MODEL}
+    values = {
+        "provider": "local",
+        "openai_api_key": "", "openai_model": BACKLOG_TRANSCRIBE_MODEL,
+        "groq_api_key": "", "groq_model": BACKLOG_GROQ_MODEL,
+    }
     names = {
         "AGENT_HUB_BACKLOG_TRANSCRIBE_PROVIDER": "provider",
-        "AGENT_HUB_BACKLOG_OPENAI_API_KEY": "api_key",
-        "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL": "model",
+        "AGENT_HUB_BACKLOG_OPENAI_API_KEY": "openai_api_key",
+        "AGENT_HUB_BACKLOG_TRANSCRIBE_MODEL": "openai_model",
+        "AGENT_HUB_BACKLOG_GROQ_API_KEY": "groq_api_key",
+        "AGENT_HUB_BACKLOG_GROQ_MODEL": "groq_model",
     }
     try:
         for line in Path(BACKLOG_TELEGRAM_CONFIG).read_text().splitlines():
@@ -1891,12 +1905,16 @@ def _backlog_transcription_config() -> dict[str, str]:
         if env_name in os.environ:
             values[mapped] = os.environ[env_name].strip()
     values["provider"] = values["provider"].lower()
-    if values["provider"] not in {"local", "openai"}:
-        raise RuntimeError("provider trascrizione non valido: usare local oppure openai")
-    if values["provider"] == "openai" and not values["api_key"]:
+    if values["provider"] not in {"local", "openai", "groq"}:
+        raise RuntimeError("provider trascrizione non valido: usare local, groq oppure openai")
+    if values["provider"] == "openai" and not values["openai_api_key"]:
         raise RuntimeError("provider OpenAI selezionato ma API key assente")
-    if not MODEL_RE.fullmatch(values["model"]):
-        raise RuntimeError("modello trascrizione non valido")
+    if values["provider"] == "groq" and not values["groq_api_key"]:
+        raise RuntimeError("provider Groq selezionato ma API key assente")
+    if not MODEL_RE.fullmatch(values["openai_model"]):
+        raise RuntimeError("modello OpenAI di trascrizione non valido")
+    if not MODEL_RE.fullmatch(values["groq_model"]):
+        raise RuntimeError("modello Groq di trascrizione non valido")
     return values
 
 
@@ -1916,7 +1934,8 @@ def _multipart(fields: dict[str, str], field: str, name: str,
     return bytes(body), boundary
 
 
-def _openai_transcribe(path: str, key: str, model: str) -> str:
+def _cloud_transcribe(path: str, key: str, model: str,
+                      endpoint: str, provider: str) -> str:
     p = Path(path)
     data = p.read_bytes()
     if len(data) > BACKLOG_AUDIO_MAX:
@@ -1930,21 +1949,32 @@ def _openai_transcribe(path: str, key: str, model: str) -> str:
         {"model": model, "language": "it"},
         "file", p.name, data, content_type)
     req = urllib.request.Request(
-        "https://api.openai.com/v1/audio/transcriptions", data=body,
+        endpoint, data=body,
         headers={"Authorization": f"Bearer {key}",
+                 "User-Agent": "AgentHub/1.0",
                  "Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
         with urllib.request.urlopen(req, timeout=180) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
-        raise RuntimeError(f"OpenAI transcription HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"{provider} transcription HTTP {exc.code}: {detail}") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise RuntimeError(f"OpenAI transcription: {exc}") from exc
+        raise RuntimeError(f"{provider} transcription: {exc}") from exc
     text = str(payload.get("text") or "").strip()
     if not text:
-        raise RuntimeError("OpenAI ha restituito una trascrizione vuota")
+        raise RuntimeError(f"{provider} ha restituito una trascrizione vuota")
     return text
+
+
+def _openai_transcribe(path: str, key: str, model: str) -> str:
+    return _cloud_transcribe(
+        path, key, model, "https://api.openai.com/v1/audio/transcriptions", "OpenAI")
+
+
+def _groq_transcribe(path: str, key: str, model: str) -> str:
+    return _cloud_transcribe(
+        path, key, model, "https://api.groq.com/openai/v1/audio/transcriptions", "Groq")
 
 
 def _local_transcribe(path: str) -> str:
@@ -2029,10 +2059,14 @@ def _process_backlog(row: dict) -> None:
             if transcription["provider"] == "local":
                 raw = _local_transcribe(audio)
                 processors.append(f"local-whisper:{MEETING_WHISPER_MODEL}")
-            else:
+            elif transcription["provider"] == "openai":
                 raw = _openai_transcribe(
-                    audio, transcription["api_key"], transcription["model"])
-                processors.append(f"openai:{transcription['model']}")
+                    audio, transcription["openai_api_key"], transcription["openai_model"])
+                processors.append(f"openai:{transcription['openai_model']}")
+            else:
+                raw = _groq_transcribe(
+                    audio, transcription["groq_api_key"], transcription["groq_model"])
+                processors.append(f"groq:{transcription['groq_model']}")
             with db() as conn:
                 conn.execute(
                     "UPDATE backlog_ideas SET raw_text=?,updated_at=? WHERE id=?",

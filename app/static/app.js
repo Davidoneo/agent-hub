@@ -3401,7 +3401,14 @@ const USAGE_STATE = {
 
 function untilText(epoch) {
   const left = epoch * 1000 - Date.now();
-  if (left <= 0) return "a momenti";
+  if (left <= 0) {
+    const ago = Math.max(1, Math.floor(-left / 60000));
+    if (ago < 60) return "previsto " + ago + "m fa";
+    const hours = Math.floor(ago / 60);
+    return hours < 24
+      ? "previsto " + hours + "h fa"
+      : "previsto " + Math.floor(hours / 24) + "g fa";
+  }
   const h = Math.floor(left / 3600000);
   const m = Math.round((left % 3600000) / 60000);
   if (h >= 24) return `fra ${Math.floor(h / 24)}g ${h % 24}h`;

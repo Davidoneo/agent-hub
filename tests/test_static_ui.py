@@ -288,6 +288,8 @@ class StaticUiContracts(unittest.TestCase):
     def test_usage_refresh_explains_expired_claude_oauth(self):
         self.assertIn("non rinnova le credenziali OAuth", self.app)
         self.assertIn("Il rinnovo automatico Claude non è riuscito", self.app)
+        self.assertNotIn('if (left <= 0) return "a momenti"', self.app)
+        self.assertIn('"previsto " + ago + "m fa"', self.app)
 
     def test_kill_and_delete_return_to_dashboard(self):
         self.assertIn(
