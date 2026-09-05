@@ -1049,6 +1049,8 @@ function backlogCard(idea) {
         <h3>${esc(idea.title || "Idea senza titolo")}</h3>
         <div class="muted">${esc(backlogSource(idea.source))} · ${esc(ts(idea.created_at))}</div>
       </div>
+      <span class="tag ${idea.environment === "SERVER" ? "server" : "project"}">${
+        esc(idea.environment === "SERVER" ? "SERVER · hostagent" : "PROJECT · devagent")}</span>
       <span class="tag ${cls}">${esc(label)}</span>
     </div>
     ${idea.description ? `<p class="backlog-description">${esc(idea.description)}</p>` : ""}
@@ -2036,6 +2038,12 @@ async function viewNewSession() {
     const p = profiles.find(x => x.id === profSel.value);
     syncEffort(p, envSel.value === "SERVER" ? serverUser() : projectUser());
   };
+  // Il preparatore del Backlog conosce gia' il confine Unix richiesto. La
+  // scelta resta modificabile, ma il composer parte dall'account corretto e
+  // ne applica subito profilo, modello ed effort predefiniti.
+  if (backlogIdea && ["PROJECT", "SERVER"].includes(backlogIdea.environment)) {
+    envSel.value = backlogIdea.environment;
+  }
   syncEnv();
 
   $("#s-browse").onclick = async () => {

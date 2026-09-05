@@ -609,6 +609,7 @@ def init_db() -> None:
                 title TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '',
                 prepared_prompt TEXT NOT NULL DEFAULT '',
+                environment TEXT NOT NULL DEFAULT 'PROJECT',
                 raw_text TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT 'telegram',
                 source_ref TEXT NOT NULL DEFAULT '',
@@ -818,6 +819,12 @@ def migrate_db() -> None:
         if "scope" not in have_docs:
             conn.execute("ALTER TABLE documents ADD COLUMN scope TEXT NOT NULL DEFAULT 'private'")
             conn.execute("UPDATE documents SET scope='repository' WHERE path LIKE '/srv/agent-workspace/projects/%'")
+        have_backlog = {r["name"] for r in conn.execute("PRAGMA table_info(backlog_ideas)")}
+        if "environment" not in have_backlog:
+            # Le idee storiche non contengono una classificazione affidabile:
+            # il confine meno privilegiato resta il default corretto.
+            conn.execute(
+                "ALTER TABLE backlog_ideas ADD COLUMN environment TEXT NOT NULL DEFAULT 'PROJECT'")
 
 
 # Il catalogo e' per utente Unix: OpenCode legge le credenziali solo dalla
@@ -1811,9 +1818,13 @@ async def read_notification(request: Request):
 
 def backlog_payload(row: sqlite3.Row | dict, *, include_prompt: bool = False) -> dict:
     item = dict(row)
+    environment = item.get("environment") or "PROJECT"
+    if environment not in UNIX_USERS:
+        environment = "PROJECT"
     payload = {
         "id": item["id"], "title": item.get("title") or "Idea senza titolo",
         "description": item.get("description") or "",
+        "environment": environment,
         "source": item.get("source") or "telegram", "status": item.get("status") or "pending",
         "processor": item.get("processor") or "", "error": item.get("error") or "",
         "created_at": item.get("created_at") or "", "updated_at": item.get("updated_at") or "",
@@ -2005,6 +2016,9 @@ def _fallback_backlog_metadata(text: str) -> dict:
     return {
         "title": title,
         "description": compact[:1200],
+        # Se il preparatore non e' disponibile non eleviamo privilegi sulla
+        # base di euristiche testuali: l'operatore puo' ancora scegliere SERVER.
+        "environment": "PROJECT",
         "prepared_prompt": (
             "Valuta e implementa, se appropriato, la seguente idea. Prima verifica il "
             "contesto esistente, chiarisci le ambiguita' che cambiano materialmente il risultato, "
@@ -2022,9 +2036,11 @@ def _prepare_backlog_metadata(text: str) -> tuple[dict, str, str]:
                                "preparatore Codex non riuscito")
         payload = json.loads(result.stdout)
         values = {k: str(payload.get(k) or "").strip()
-                  for k in ("title", "description", "prepared_prompt")}
+                  for k in ("title", "description", "prepared_prompt", "environment")}
         if not all(values.values()):
             raise RuntimeError("il preparatore ha restituito campi incompleti")
+        if values["environment"] not in UNIX_USERS:
+            raise RuntimeError("il preparatore ha restituito un environment non valido")
         values["title"] = values["title"][:200]
         values["description"] = values["description"][:4000]
         values["prepared_prompt"] = values["prepared_prompt"][:20_000]
@@ -2076,10 +2092,10 @@ def _process_backlog(row: dict) -> None:
         status = "ready_fallback" if warning else "ready"
         with db() as conn:
             conn.execute(
-                "UPDATE backlog_ideas SET title=?,description=?,prepared_prompt=?,"
+                "UPDATE backlog_ideas SET title=?,description=?,prepared_prompt=?,environment=?,"
                 "status=?,processor=?,error=?,audio_path='',updated_at=? WHERE id=?",
                 (metadata["title"], metadata["description"], metadata["prepared_prompt"],
-                 status, "+".join(processors), warning, now(), bid))
+                 metadata["environment"], status, "+".join(processors), warning, now(), bid))
         remove_backlog_audio(row.get("audio_path") or "")
     except Exception as exc:
         with db() as conn:
