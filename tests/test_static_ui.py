@@ -578,20 +578,52 @@ process.stdout.write(JSON.stringify({observations, mixed: {
         self.assertIn('life = "COMPLETED"', lifecycle)
         self.assertIn('life = "FAILED"', lifecycle)
 
+    def run_draft_probe(self, probe):
+        source = self.app[:self.app.index("(async function boot()")]
+        prelude = """
+const assert = require('node:assert/strict');
+const stored = new Map();
+globalThis.localStorage = {
+  getItem: key => stored.get(key),
+  setItem: (key, value) => stored.set(key, value),
+  removeItem: key => stored.delete(key),
+};
+BOOT = {user: 'first-user'};
+"""
+        subprocess.run(["node"], input=source + prelude + probe,
+                       text=True, capture_output=True, check=True)
+
     def test_new_session_prompt_draft_survives_navigation_until_persisted(self):
-        self.assertIn("function newSessionPromptDraftKey()", self.app)
-        self.assertIn('localStorage.getItem(newSessionPromptDraftKey())', self.app)
-        self.assertIn('promptEl.oninput = () => writeNewSessionPromptDraft(promptEl.value)', self.app)
-        self.assertIn('promptEl.value = readNewSessionPromptDraft()', self.app)
-        self.assertEqual(self.app.count('writeNewSessionPromptDraft("")'), 2)
-        launch_failed = self.app.index('e.code === "launch_failed"')
-        self.assertIn('writeNewSessionPromptDraft("")', self.app[launch_failed:launch_failed + 300])
+        self.run_draft_probe("""
+writeNewSessionPromptDraft('line one\\nline two');
+assert.equal(readNewSessionPromptDraft(), 'line one\\nline two');
+BOOT.user = 'second-user';
+assert.equal(readNewSessionPromptDraft(), '');
+BOOT.user = 'first-user';
+assert.equal(readNewSessionPromptDraft(), 'line one\\nline two');
+writeNewSessionPromptDraft('');
+assert.equal(readNewSessionPromptDraft(), '');
+assert.equal(stored.size, 0);
+localStorage.getItem = localStorage.setItem = localStorage.removeItem = () => {throw Error('blocked');};
+assert.equal(readNewSessionPromptDraft(), '');
+writeNewSessionPromptDraft('still usable');
+writeNewSessionPromptDraft('');
+""")
 
     def test_session_composer_survives_background_and_socket_reconnect(self):
-        self.assertIn("function sessionMessageDraftKey(sid)", self.app)
-        self.assertIn("msgEl.value = readSessionMessageDraft(sid)", self.app)
-        self.assertIn("msgEl.oninput = () => writeSessionMessageDraft(sid, msgEl.value)", self.app)
-        self.assertIn('writeSessionMessageDraft(sid, "")', self.app)
+        self.run_draft_probe("""
+writeNewSessionPromptDraft('new-session');
+writeSessionMessageDraft('s1', 'first');
+writeSessionMessageDraft('s2', 'second');
+assert.equal(readSessionMessageDraft('s1'), 'first');
+assert.equal(readSessionMessageDraft('s2'), 'second');
+writeSessionMessageDraft('s1', '');
+assert.equal(readSessionMessageDraft('s1'), '');
+assert.equal(readSessionMessageDraft('s2'), 'second');
+assert.equal(readNewSessionPromptDraft(), 'new-session');
+BOOT.user = 'second-user';
+assert.equal(readSessionMessageDraft('s2'), '');
+""")
         self.assertIn("function connectTerminal()", self.app)
         self.assertIn("if (document.hidden) return;", self.app)
         visibility = self.app.index("const onVisibility = () =>", self.app.index("async function viewSession"))

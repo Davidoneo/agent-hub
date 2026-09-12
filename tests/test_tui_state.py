@@ -87,7 +87,7 @@ class CapacityLifecycleTests(unittest.TestCase):
                                           resume_max_attempts=8),
             LIFECYCLE_LABEL={}, PUSH_LIFECYCLES=("NEEDS_INPUT",),
             dismiss_webpush_session_async=mock.Mock(),
-            add_message=mock.Mock(), deliver_async=mock.Mock(),
+            add_message=mock.Mock(), wake_session_delivery=mock.Mock(),
             nudge_already_sent=lambda *args: False, SENT="sent", RESENT="resent",
             FAILED="failed",
         )
@@ -111,7 +111,7 @@ class CapacityLifecycleTests(unittest.TestCase):
         self.assertFalse(self.env["maybe_nudge"](self.row, last))
         self.assertFalse(self.env["maybe_resume_after_reset"](self.row))
         self.env["add_message"].assert_not_called()
-        self.env["deliver_async"].assert_not_called()
+        self.env["wake_session_delivery"].assert_not_called()
         self.screen = CAPACITY + "\n• Working (2s • esc to interrupt)" + COMPOSER
         self.assertEqual(self.env["apply_lifecycle"](self.row, last), "RUNNING")
         self.env["dismiss_webpush_session_async"].assert_called_once_with("example")

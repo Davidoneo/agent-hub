@@ -474,6 +474,11 @@ function effortLevelsFor(profile, unixUser, model) {
 
 // Menu a tendina dei modelli, con l'ultima voce che riapre il campo libero:
 // il catalogo copre i casi normali senza impedire un id che non contiene.
+function selectedModelValue(select, other) {
+  if (!select || !select.value) return "";
+  return select.value === "__other__" ? other.value.trim() : select.value;
+}
+
 function modelOptions(unixUser, profileId, current) {
   const models = catalogModels(unixUser, profileId);
   const known = models.some(m => m.model_id === current);
@@ -1633,89 +1638,6 @@ async function uploadFiles(files, slug, onProgress, scope = "private") {
   }
 }
 
-async function viewDocuments() {
-  const [d, pj] = await Promise.all([
-    api("/api/documents", {}, "elenco documenti"),
-    api("/api/projects", {}, "elenco progetti"),
-  ]);
-  const free = d.documents.filter(x => !x.project_slug);
-  const docsById = {};
-  d.documents.forEach(x => { docsById[x.id] = x; });
-
-  // Albero: radice per destinazione, poi un ramo per progetto.
-  const branch = (key, title, docs) => {
-    const slugs = [...new Set(docs.map(x => x.project_slug))].sort();
-    return `<details class="tree-root" open>
-      <summary><b>${esc(title)}</b> <span class="muted">${docs.length}</span></summary>
-      ${slugs.map(s => {
-        const items = docs.filter(x => x.project_slug === s);
-        const gid = `${key}:${s}`;
-        return `<details class="tree-node" open>
-          <summary><label class="doc-pick" onclick="event.stopPropagation()">
-              <input type="checkbox" data-pick-all="${esc(gid)}"></label>
-            <b>${esc(s)}</b> <span class="muted">${items.length}</span></summary>
-          ${items.map(x => docRow(x, { assign: true, select: true })
-                            .replace('data-pick="', `data-group="${esc(gid)}" data-pick="`)).join("")}
-        </details>`;
-      }).join("") || '<div class="muted tree-empty">Nessun documento.</div>'}
-    </details>`;
-  };
-
-  view().innerHTML = `<h2>Documenti</h2>
-    ${help("I file non assegnati restano nell'area upload. " +
-           "Associando a un progetto scegli la destinazione: knowledge privata (fuori da Git) " +
-           "oppure repository (<progetto>/docs/input/, versionabile), come devagent:agentprojects. " +
-           "Limite " + Math.round(d.max_upload / 1048576) + " MiB per file. Estensioni ammesse: " + d.allowed_ext.join(" "))}
-    <div class="card">
-      <div class="dropzone" id="up-drop">Trascina qui i file oppure
-        <input type="file" id="up-files" multiple style="margin-top:8px"></div>
-      <label>Progetto di destinazione (facoltativo)</label>
-      <select id="up-project">
-        <option value="">— nessuno: resta fra i documenti liberi —</option>
-        ${pj.projects.map(p => `<option value="${esc(p.slug)}">${esc(p.slug)}</option>`).join("")}
-      </select>
-      <div class="row" style="margin-top:10px"><button class="primary" id="up-go">Carica</button></div>
-      <div class="progress" style="margin-top:10px"><div id="up-bar"></div></div>
-    </div>
-
-    <div class="card bulk-bar" id="doc-bulk" style="display:none">
-      <span class="grow"><b id="doc-bulk-n"></b></span>
-      <button class="small primary" id="doc-assign-sel">Associa a progetto…</button>
-      <button class="small danger" id="doc-del-sel">Elimina</button>
-    </div>
-
-    <div class="card tree">
-      ${branch("repo", "Progetti",
-               d.documents.filter(x => x.project_slug && x.scope === "repository"))}
-      ${branch("priv", "Knowledge privata",
-               d.documents.filter(x => x.project_slug && x.scope !== "repository"))}
-      <details class="tree-root" open>
-        <summary><b>Documenti liberi</b> <span class="muted">${free.length}</span></summary>
-        ${free.length ? `<details class="tree-node" open>
-            <summary><label class="doc-pick" onclick="event.stopPropagation()">
-                <input type="checkbox" data-pick-all="free:-"></label>
-              <b>non assegnati</b> <span class="muted">${free.length}</span></summary>
-            ${free.map(x => docRow(x, { assign: true, select: true })
-                             .replace('data-pick="', 'data-group="free:-" data-pick="')).join("")}
-          </details>` : '<div class="muted tree-empty">Nessun documento libero.</div>'}
-      </details>
-    </div>`;
-
-  setupDrop($("#up-drop"), $("#up-files"));
-  wireDocActions(view(), pj.projects, docsById);
-  $("#up-go").onclick = async () => {
-    const files = $("#up-files").files;
-    if (!files || !files.length) { toast("Seleziona almeno un file", "err"); return; }
-    $("#up-go").disabled = true;
-    try {
-      const r = await uploadFiles(files, $("#up-project").value, p => { $("#up-bar").style.width = (p * 100) + "%"; });
-      if (r.errors && r.errors.length) toast("Alcuni file non caricati: " + r.errors.join("; "), "err");
-      else toast(`Caricati ${r.documents.length} documenti`);
-      route();
-    } catch (e) { showError(e); $("#up-go").disabled = false; }
-  };
-}
-
 // ----------------------------------------------------- selettore directory
 
 async function dirPicker(el, environment, initial, onPick) {
@@ -1758,32 +1680,29 @@ function newSessionPromptDraftKey() {
   return `agenthub-new-session-prompt:${(BOOT && BOOT.user) || "local"}`;
 }
 
-function readNewSessionPromptDraft() {
-  try { return localStorage.getItem(newSessionPromptDraftKey()) || ""; }
+function readStoredDraft(key) {
+  try { return localStorage.getItem(key) || ""; }
   catch (e) { return ""; }
 }
 
-function writeNewSessionPromptDraft(value) {
+function writeStoredDraft(key, value) {
   try {
-    if (value) localStorage.setItem(newSessionPromptDraftKey(), value);
-    else localStorage.removeItem(newSessionPromptDraftKey());
-  } catch (e) { /* storage privato/disabilitato: il form continua a funzionare */ }
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch (e) { /* il compositore resta utilizzabile anche senza storage */ }
 }
 
+function readNewSessionPromptDraft() { return readStoredDraft(newSessionPromptDraftKey()); }
+function writeNewSessionPromptDraft(value) { writeStoredDraft(newSessionPromptDraftKey(), value); }
 function sessionMessageDraftKey(sid) {
   return `agenthub-session-message:${(BOOT && BOOT.user) || "local"}:${sid}`;
 }
+function readSessionMessageDraft(sid) { return readStoredDraft(sessionMessageDraftKey(sid)); }
+function writeSessionMessageDraft(sid, value) { writeStoredDraft(sessionMessageDraftKey(sid), value); }
 
-function readSessionMessageDraft(sid) {
-  try { return localStorage.getItem(sessionMessageDraftKey(sid)) || ""; }
-  catch (e) { return ""; }
-}
-
-function writeSessionMessageDraft(sid, value) {
-  try {
-    if (value) localStorage.setItem(sessionMessageDraftKey(sid), value);
-    else localStorage.removeItem(sessionMessageDraftKey(sid));
-  } catch (e) { /* il composer resta utilizzabile anche senza storage */ }
+function bindPromptDraft(element, read, write) {
+  element.value = read();
+  element.oninput = () => write(element.value);
 }
 
 async function viewNewSession() {
@@ -1941,16 +1860,13 @@ async function viewNewSession() {
       $("#s-prompt-wrap").style.display = $("#s-use-backlog-prompt").checked ? "" : "none";
     };
   } else {
-    promptEl.value = readNewSessionPromptDraft();
-    promptEl.oninput = () => writeNewSessionPromptDraft(promptEl.value);
+    bindPromptDraft(promptEl, readNewSessionPromptDraft, writeNewSessionPromptDraft);
   }
 
   // Il valore effettivo del modello: la tendina, oppure il campo libero
   // quando è stata scelta la voce «altro…».
   function selectedModel() {
-    const sel = $("#s-model");
-    if (!sel || !sel.value) return "";
-    return sel.value === "__other__" ? $("#s-model-other").value.trim() : sel.value;
+    return selectedModelValue($("#s-model"), $("#s-model-other"));
   }
 
   // Stato del catalogo accanto alla scelta: se il provider non è utilizzabile
@@ -2484,14 +2400,8 @@ function runtimeBody(rt) {
   // il catalogo è per utente Unix: la sessione dice quale
   const user = rt.unix_user || "";
   const profileId = cap.profile_id || "";
-  const catEntry = catalogModels(user, profileId).find(m => m.model_id === cur);
-  // livelli offribili: quelli dell'harness ristretti a quelli del modello in
-  // uso; un alias non li dichiara, quindi non restringe nulla
-  const levels = (!catEntry || catEntry.kind === "alias")
-    ? (cap.effort_levels || [])
-    : (catEntry.efforts && catEntry.efforts.length
-        ? (cap.effort_levels || []).filter(l => catEntry.efforts.includes(l))
-        : []);
+  // Il form runtime offre i livelli del modello attualmente osservato.
+  const levels = effortLevelsFor({ ...cap, id: profileId }, user, cur).levels;
   const st = catalogState(user, profileId);
 
   const rows = [
@@ -2807,8 +2717,7 @@ async function viewSession(sid) {
     $("#diag-copy").onclick = () => copyText((d.diagnostics.argv || []).join(" "), "Comando copiato");
   }
   const msgEl = $("#msg");
-  msgEl.value = readSessionMessageDraft(sid);
-  msgEl.oninput = () => writeSessionMessageDraft(sid, msgEl.value);
+  bindPromptDraft(msgEl, () => readSessionMessageDraft(sid), value => writeSessionMessageDraft(sid, value));
 
   let currentLifecycle = s.lifecycle;
   function paintEscalation(st) {
@@ -3070,9 +2979,7 @@ async function viewSession(sid) {
     const btn = $("#rt-apply");
     if (!btn) return;
     btn.onclick = async () => {
-      const sel = $("#rt-model");
-      const model = !sel ? ""
-        : (sel.value === "__other__" ? $("#rt-model-other").value.trim() : sel.value);
+      const model = selectedModelValue($("#rt-model"), $("#rt-model-other"));
       const effort = $("#rt-effort") ? $("#rt-effort").value : "";
       const mode = $("#rt-mode") ? $("#rt-mode").value : "";
       const goalEl = $("#rt-goal");
@@ -3448,7 +3355,7 @@ function renderAccounts(d) {
     const model = $("[data-default-model]", card);
     const other = $("[data-default-model-other]", card);
     const effort = $("[data-default-effort]", card);
-    const chosenModel = () => model.value === "__other__" ? other.value.trim() : model.value;
+    const chosenModel = () => selectedModelValue(model, other);
     const chosenProfile = () => d.profiles.find(p => p.id === profile.value);
 
     function syncDefaultEffort(preferred = "") {

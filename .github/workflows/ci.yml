@@ -41,8 +41,8 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-      - name: Install Ansible
-        run: pip install -r requirements-dev.txt
+      - name: Install Ansible and application test dependencies
+        run: pip install -r requirements-dev.txt -r requirements-test.txt
       - name: Install collections
         run: ansible-galaxy collection install -r requirements.yml
       - name: Check playbook and inventory syntax
@@ -51,8 +51,12 @@ jobs:
         run: ansible-playbook -i localhost, -c local tests/safety.yml
       - name: Agent Hub least-privilege defaults
         run: ansible-playbook -i localhost, -c local tests/agent_hub_safety.yml
-      - name: Application and wrapper syntax
-        run: ./scripts/check-source.sh
+      - name: Install browser for UI regression tests
+        run: python -m playwright install --with-deps chromium
+      - name: Application and wrapper regression tests
+        run: |
+          export CHROMIUM_PATH="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+          ./scripts/check-source.sh
 
   secrets:
     name: Secret scan

@@ -406,20 +406,24 @@ def check_doc_name(name):
     return name
 
 
+def document_source(path):
+    src = os.path.realpath(path)
+    allowed = (os.path.realpath(UPLOAD_ROOT), os.path.realpath(PROJECT_ROOT),
+               os.path.realpath("/srv/agent-workspace/knowledge"))
+    if not any(src.startswith(root + os.sep) for root in allowed):
+        die("sorgente non consentita")
+    if not os.path.isfile(src):
+        die("file sorgente inesistente")
+    return src
+
+
 def cmd_doc_import(argv):
     """doc-import <slug> <file-sorgente> <nome-destinazione> [sottocartella]"""
     if len(argv) not in (3, 4):
         die("uso: doc-import <slug> <src> <nome> [sottocartella]")
     subdir = argv[3] if len(argv) == 4 else ""
     slug = check_slug(argv[0])
-    src = os.path.realpath(argv[1])
-    root = os.path.realpath(UPLOAD_ROOT)
-    if not (src.startswith(root + os.sep)
-            or src.startswith(os.path.realpath(PROJECT_ROOT) + os.sep)
-            or src.startswith(os.path.realpath("/srv/agent-workspace/knowledge") + os.sep)):
-        die("sorgente non consentita")
-    if not os.path.isfile(src):
-        die("file sorgente inesistente")
+    src = document_source(argv[1])
     name = check_doc_name(argv[2])
     target = docs_dir(slug, subdir)
     dest = os.path.join(target, name)
@@ -456,13 +460,7 @@ def cmd_knowledge_import(argv):
     if len(argv) != 3:
         die("uso: knowledge-import <slug> <src> <nome>")
     slug = check_slug(argv[0])
-    src = os.path.realpath(argv[1])
-    allowed = (os.path.realpath(UPLOAD_ROOT), os.path.realpath(PROJECT_ROOT),
-               os.path.realpath("/srv/agent-workspace/knowledge"))
-    if not any(src.startswith(root + os.sep) for root in allowed):
-        die("sorgente non consentita")
-    if not os.path.isfile(src):
-        die("file sorgente inesistente")
+    src = document_source(argv[1])
     name = check_doc_name(argv[2])
     dest = os.path.join(knowledge_dir(slug), name)
     if os.path.realpath(src) == os.path.realpath(dest):

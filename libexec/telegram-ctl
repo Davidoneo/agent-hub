@@ -45,15 +45,9 @@ DB = "/var/lib/agent-hub/agent-hub.sqlite3"
 STATE_DIR = "/var/lib/agent-hub/telegram"
 STATE = os.path.join(STATE_DIR, "state.json")
 HEALTH_LAST = "/var/lib/agent-hub/health/last.json"
-HEALTH_HISTORY = "/var/lib/agent-hub/health/history.jsonl"
 PRESENCE_FILE = "/var/lib/agent-hub/ui-activity.json"
 API = "https://api.telegram.org"
 CHANNEL = "telegram"
-
-# Stati dedotti dal controller che meritano un avviso. Gli stati dichiarati
-# dall'agente si notificano tutti, perche' e' l'agente ad averlo chiesto.
-ALERT_LIFECYCLES = ("NEEDS_INPUT", "CRASHED", "ENDED_UNREPORTED", "AUTH_REQUIRED",
-                    "USAGE_LIMIT", "DELIVERY_FAILED", "POSSIBLY_STALLED")
 
 ICON = {
     "COMPLETED": "✅", "NEEDS_INPUT": "❓", "WAITING_SESSION": "⏸",
@@ -406,115 +400,13 @@ def session_line(row):
     return " · ".join(b for b in bits if b)
 
 
-def lifecycle_event_key(row):
-    """Identita' stabile dell'occorrenza; le domande possono ripetersi."""
-    base = f"{row['id']}:{row['lifecycle']}"
-    recurrent = {"NEEDS_INPUT", "DELIVERY_FAILED"}
-    return f"{base}:{row['lifecycle_at']}" if row["lifecycle"] in recurrent else base
-
-
 # --------------------------------------------------------------- notifiche
-
-def pending_reports(conn):
-    """Stati finali registrati dagli agenti e non ancora notificati."""
-    rows = conn.execute(
-        "SELECT r.rowid AS rid, r.session_id, r.status, r.summary, r.reported_at, "
-        "r.unix_user, s.name, s.environment, s.profile_id, s.project_slug "
-        "FROM session_reports r LEFT JOIN sessions s ON s.id = r.session_id "
-        "ORDER BY r.reported_at, r.rowid").fetchall()
-    return [r for r in rows if not already_sent(conn, "report", f"{r['session_id']}:{r['rid']}")]
-
 
 def clip(text, limit):
     """Riepilogo accorciato: sul telefono conta il primo colpo d'occhio, il
     testo intero resta su /sessione e nella pagina web."""
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[:limit - 1].rstrip(" ,;:.") + "…"
-
-
-def report_message(cfg, r):
-    """In compact notifica soltanto stato e titolo della richiesta.
-
-    Il riepilogo e' output dell'agente: resta disponibile su richiesta con i
-    comandi del bot o aprendo la sessione. La modalita' full e' mantenuta per
-    diagnostica e configurazioni che desiderano esplicitamente l'anteprima."""
-    icon = ICON.get(r["status"], "•")
-    label = LABEL.get(r["status"], r["status"])
-    lines = [f"{icon} {label} · {r['name'] or '(sessione eliminata)'}"]
-    if cfg["verbosity"] == "full":
-        if r["name"]:
-            lines.append(session_line(r))
-        lines.append(clip(r["summary"], 700) or "(nessun riepilogo)")
-    return "\n".join(lines)
-
-
-def pending_lifecycles(conn):
-    """Stati dedotti che richiedono attenzione, uno per (sessione, stato)."""
-    rows = conn.execute(
-        "SELECT id, name, lifecycle, lifecycle_at, exit_code, environment, "
-        "profile_id, project_slug, report_status FROM sessions "
-        f"WHERE lifecycle IN ({','.join('?' * len(ALERT_LIFECYCLES))})",
-        ALERT_LIFECYCLES).fetchall()
-    out = []
-    for r in rows:
-        # se l'agente ha dichiarato uno stato, quello e' gia' stato notificato
-        if r["report_status"] and r["lifecycle"] == r["report_status"]:
-            continue
-        # Domande e consegne fallite possono ricorrere piu' volte nella stessa
-        # sessione. La data distingue le occorrenze senza duplicare i poll.
-        key = lifecycle_event_key(r)
-        if not already_sent(conn, "lifecycle", key):
-            out.append(r)
-    return out
-
-
-def lifecycle_message(cfg, r):
-    icon = ICON.get(r["lifecycle"], "•")
-    label = LABEL.get(r["lifecycle"], r["lifecycle"])
-    lines = [f"{icon} {label} · {r['name']}"]
-    hint = {
-        "NEEDS_INPUT": "La TUI mostra una domanda interattiva e attende una risposta.",
-        "DELIVERY_FAILED": "Il testo è salvo in Agent Hub ma non è arrivato alla sessione.",
-        "CRASHED": f"Processo uscito con codice {r['exit_code'] or '?'}, nessuno stato finale.",
-        "ENDED_UNREPORTED": "Terminata senza agent-report: esito da verificare nella trascrizione.",
-        "AUTH_REQUIRED": "Login scaduto: rifallo dalla pagina Accounts.",
-        "USAGE_LIMIT": "Limite d'uso raggiunto.",
-        "POSSIBLY_STALLED": "Ferma e senza stato finale anche dopo il sollecito. Non è stata terminata.",
-    }.get(r["lifecycle"], "")
-    if cfg["verbosity"] == "full":
-        if hint:
-            lines.append(clip(hint, 700))
-        lines.append(session_line(r))
-    return "\n".join(lines)
-
-
-def pending_health(conn):
-    """Cambi di stato del controllo di salute, gia' deduplicati alla fonte."""
-    try:
-        with open(HEALTH_HISTORY) as fh:
-            entries = [json.loads(l) for l in fh.read().splitlines()[-30:] if l.strip()]
-    except (OSError, ValueError):
-        return []
-    return [e for e in entries if not already_sent(conn, "health", e.get("at", ""))]
-
-
-def health_message(cfg, entry):
-    overall = entry.get("overall", "?")
-    icon = ICON.get(overall, "•")
-    head = f"{icon} Server {overall}"
-    if entry.get("previous"):
-        head += f" (prima: {entry['previous']})"
-    lines = [head]
-    problems = entry.get("problems", [])
-    if not problems:
-        return head + " — tutti i controlli OK."
-    show = 8 if cfg["verbosity"] == "full" else 1
-    for p in problems[:show]:
-        limit = 120 if cfg["verbosity"] == "full" else 90
-        lines.append(f"• {p.get('name')}: {clip(p.get('detail', ''), limit)}")
-    if len(problems) > show:
-        lines.append(f"…e altri {len(problems) - show}. Dettagli: /salute")
-    return "\n".join(lines)
 
 
 def pending_escalations(conn):

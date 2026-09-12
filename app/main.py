@@ -2012,6 +2012,17 @@ def _groq_transcribe(path: str, key: str, model: str) -> str:
         path, key, model, "https://api.groq.com/openai/v1/audio/transcriptions", "Groq")
 
 
+def local_transcription_model(model_class, cache: str):
+    """Share lazy construction; callers retain formatting and failure policies."""
+    global _WHISPER_MODEL
+    with _WHISPER_MODEL_LOCK:
+        if _WHISPER_MODEL is None:
+            _WHISPER_MODEL = model_class(
+                MEETING_WHISPER_MODEL, device="cpu", compute_type="int8",
+                download_root=cache)
+        return _WHISPER_MODEL
+
+
 def _local_transcribe(path: str) -> str:
     try:
         from faster_whisper import WhisperModel
@@ -2019,13 +2030,7 @@ def _local_transcribe(path: str) -> str:
         raise RuntimeError("fallback locale faster_whisper non installato") from exc
     cache = Path(MEETING_WHISPER_CACHE)
     cache.mkdir(parents=True, exist_ok=True)
-    global _WHISPER_MODEL
-    with _WHISPER_MODEL_LOCK:
-        if _WHISPER_MODEL is None:
-            _WHISPER_MODEL = WhisperModel(
-                MEETING_WHISPER_MODEL, device="cpu", compute_type="int8",
-                download_root=str(cache))
-        model = _WHISPER_MODEL
+    model = local_transcription_model(WhisperModel, str(cache))
     segments, _info = model.transcribe(path, language="it", vad_filter=True, beam_size=5)
     text = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
     if not text:
@@ -2461,8 +2466,8 @@ def maybe_nudge(row: dict, last: dict) -> bool:
     if nudge_already_sent(row["id"], last):
         return False               # uno solo per turno, anche se il log si muove
     text = nudge_text(row)
-    mid = add_message(row["id"], text, kind=NUDGE_KIND)
-    deliver_async(row, mid, text, wait_ready=False)
+    add_message(row["id"], text, kind=NUDGE_KIND)
+    wake_session_delivery(row["id"])
     return True
 
 
@@ -2521,8 +2526,8 @@ def release_dependency(row: dict, sessions: dict[str, dict]) -> bool:
     text = (f"La sessione da cui dipendevi, {blocker.get('name') or blocker_id} "
             f"({blocker_id}), ha raggiunto lo stato {outcome}.\n\n"
             f"Riepilogo: {summary}\n\nRiprendi ora il lavoro rimasto in sospeso.")
-    mid = add_message(row["id"], text, kind="dependency")
-    deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
+    add_message(row["id"], text, kind="dependency")
+    wake_session_delivery(row["id"])
     return True
 
 
@@ -2688,14 +2693,6 @@ def sweep_loop() -> None:
             controller_sweep()
         except Exception:  # noqa: BLE001
             pass  # un errore transitorio non deve fermare il controller
-
-
-def last_report_of(sid: str) -> dict:
-    with db() as conn:
-        r = conn.execute("SELECT status, summary, waiting_for_session, reported_at, source, unix_user "
-                         "FROM session_reports WHERE session_id=? "
-                         "ORDER BY reported_at DESC, rowid DESC LIMIT 1", (sid,)).fetchone()
-    return dict(r) if r else {}
 
 
 def session_reports(sid: str) -> list[dict]:
@@ -2898,8 +2895,7 @@ async def session_state(sid: str):
 # divergere legittimamente (un `/model` digitato a mano nel terminale, un
 # fallback del provider, una sessione ripresa).
 
-MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,79}$")
-EXECUTOR_MODEL_RE = MODEL_NAME_RE
+EXECUTOR_MODEL_RE = MODEL_RE
 EXECUTOR_DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 EXECUTOR_MAX_LIMIT = 4
 # I sub agent passano sempre da `agent-executor`, che gira come devagent e
@@ -3054,7 +3050,7 @@ async def set_session_runtime(sid: str, request: Request):
     model = str(body.get("model") or "").strip()
     if model and not prof.get("supports_model"):
         raise HTTPException(400, f"il profilo {prof['id']} non supporta la selezione del modello")
-    if model and not MODEL_NAME_RE.match(model):
+    if model and not MODEL_RE.match(model):
         raise HTTPException(400, f"nome modello non valido: {model}")
     effort = validate_effort(prof, body.get("effort"))
     mode = validate_mode(prof, body.get("mode"))
@@ -3668,18 +3664,9 @@ def delivery_loop() -> None:
         _DELIVERY_WAKE.clear()
 
 
-def deliver_async(row: dict, mid: str, text: str, *, wait_ready: bool = True,
-                  count_attempt: bool = False) -> None:
-    """Accoda una consegna persistente e ritorna subito.
-
-    La richiesta HTTP termina appena il testo e' al sicuro in SQLite: la pagina
-    conferma subito la registrazione e segue lo stato di consegna dal
-    successivo aggiornamento di stato. `text`, `wait_ready` e `count_attempt`
-    restano nella firma per compatibilita' interna; payload e tentativi vengono
-    ricostruiti dalla riga persistita, cosi' un restart non perde il lavoro.
-    """
-    del text, wait_ready, count_attempt
-    queue_session_delivery(row["id"])
+def wake_session_delivery(sid: str) -> None:
+    """Wake the ordered worker; its payload comes from the persisted messages."""
+    queue_session_delivery(sid)
     _DELIVERY_WAKE.set()
 
 
@@ -4014,7 +4001,7 @@ def register_initial_prompt(row: dict, prompt: str, started: dict) -> str:
         set_message(mid, status=LAUNCHING, method="cli-arg")
         confirm_argv_async(row, mid)
     else:
-        deliver_async(row, mid, with_contract(row, prompt, initial=True))
+        wake_session_delivery(row["id"])
     return mid
 
 
@@ -4243,7 +4230,7 @@ async def post_message(sid: str, request: Request):
         text = ((text.rstrip() + "\n\n") if text.strip() else "") + documents_block(docs)
     # il testo e' salvato prima del tentativo: un errore di tmux non lo perde
     mid = add_message(sid, text, kind="user")
-    deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
+    wake_session_delivery(row["id"])
     return {"ok": True, "registered": True, "message": message_row(mid),
             "detail": "Messaggio registrato: la consegna è in corso."}
 
@@ -4695,11 +4682,6 @@ def materialize_document(doc: dict, slug: str) -> dict:
     return get_document(doc["id"])
 
 
-def promote_document(doc: dict, slug: str) -> dict:
-    """Compatibilità interna: i vecchi chiamanti usano la nuova destinazione."""
-    return materialize_document(doc, slug)
-
-
 def attach_docs_to_session(row: dict, ids: list[str]) -> list[dict]:
     """Associa documenti a una sessione.
 
@@ -4776,6 +4758,16 @@ async def upload_documents(request: Request):
     return {"documents": saved, "errors": errors}
 
 
+def insert_document(doc: dict) -> dict:
+    """Persist the common catalog record, regardless of the file's producer."""
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO documents (id,name,original_name,path,project_slug,scope,size,sha256,"
+            "content_type,created_at) VALUES (:id,:name,:original_name,:path,:project_slug,:scope,"
+            ":size,:sha256,:content_type,:created_at)", doc)
+    return doc
+
+
 def store_upload(up, slug: str, scope: str = "private") -> dict:
     name = safe_name(up.filename)
     ext = doc_ext(name)
@@ -4823,12 +4815,7 @@ def store_upload(up, slug: str, scope: str = "private") -> dict:
         "content_type": ALLOWED_DOC_EXT.get(ext, "application/octet-stream"),
         "created_at": now(),
     }
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO documents (id,name,original_name,path,project_slug,scope,size,sha256,"
-            "content_type,created_at) VALUES (:id,:name,:original_name,:path,:project_slug,:scope,"
-            ":size,:sha256,:content_type,:created_at)", doc)
-    return doc
+    return insert_document(doc)
 
 
 def get_document(did: str) -> dict:
@@ -4921,7 +4908,7 @@ async def attach_documents(sid: str, request: Request):
     note = (body.get("note") or "").strip()
     text = (note + "\n\n" if note else "") + documents_block(docs)
     mid = add_message(sid, text, kind="user")
-    deliver_async(row, mid, with_contract(row, text, initial=False), wait_ready=False)
+    wake_session_delivery(row["id"])
     return {"ok": True, "registered": True, "documents": docs, "message": message_row(mid),
             "detail": "Percorsi registrati: la consegna è in corso."}
 
@@ -6631,14 +6618,8 @@ def _transcribe_audio(m: dict) -> bool:
         os.chmod(cache, 0o755)
     except OSError:
         pass
-    global _WHISPER_MODEL
     try:
-        with _WHISPER_MODEL_LOCK:
-            if _WHISPER_MODEL is None:
-                _WHISPER_MODEL = WhisperModel(
-                    MEETING_WHISPER_MODEL, device="cpu", compute_type="int8",
-                    download_root=cache)
-            model = _WHISPER_MODEL
+        model = local_transcription_model(WhisperModel, cache)
     except Exception as exc:
         _meeting_error(mid, f"caricamento modello whisper fallito: {exc}")
         return False
@@ -6704,12 +6685,7 @@ def _transcript_document(m: dict) -> dict | None:
         "size": size, "sha256": sha.hexdigest(), "content_type": "text/plain",
         "created_at": now(),
     }
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO documents (id,name,original_name,path,project_slug,scope,size,sha256,"
-            "content_type,created_at) VALUES (:id,:name,:original_name,:path,:project_slug,:scope,"
-            ":size,:sha256,:content_type,:created_at)", doc)
-    return doc
+    return insert_document(doc)
 
 
 def _meeting_report_prompt(m: dict, *, feedback: str = "",

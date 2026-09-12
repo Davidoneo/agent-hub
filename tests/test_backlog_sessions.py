@@ -63,7 +63,7 @@ class BacklogSessionTests(unittest.TestCase):
             "documents_by_ids": lambda ids: [],
             "with_contract": lambda row, prompt, **kwargs: prompt,
             "start_tmux_session": mock.Mock(return_value={}),
-            "deliver_async": mock.Mock(), "confirm_argv_async": mock.Mock(),
+            "wake_session_delivery": mock.Mock(), "confirm_argv_async": mock.Mock(),
             "launch_extras_async": mock.Mock(), "GOAL_CONTRACT_RESERVE": 0,
         }
         for name in ("model", "effort", "mode", "goal"):

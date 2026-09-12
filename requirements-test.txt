@@ -1,0 +1,11 @@
+# Application regression tests; separate from Ansible tooling and live packages.
+fastapi==0.141.1
+uvicorn==0.52.4
+httpx==0.28.1
+python-multipart==0.0.32
+pywebpush==2.4.0
+pyte==0.8.2
+websockets==17.1
+playwright==1.62.0
+Pillow==12.3.0
+PyYAML==6.0.3
