@@ -24,13 +24,6 @@ done < <(find scripts libexec packaging/github-audit -type f \
   -exec grep -Il '^#!/usr/bin/env bash' {} +)
 
 node --check app/static/app.js
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
-  tests/test_report_ctl.py tests/test_meeting_report_ctl.py tests/test_static_ui.py \
-  tests/test_health_ctl.py tests/test_tui_state.py tests/test_telegram_ctl.py \
-  tests/test_telegram_outbox_ctl.py \
-  tests/test_claude_refresh.py tests/test_session_ctl_delivery.py \
-  tests/test_delivery_queue.py tests/test_harness_update_ctl.py \
-  tests/test_session_ctl_conversation.py tests/test_usage_limit.py \
-  tests/test_backlog_ctl.py tests/test_backlog_telegram_ctl.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -v -s tests -p 'test_*.py'
 git diff --check
 echo "Source checks: OK"

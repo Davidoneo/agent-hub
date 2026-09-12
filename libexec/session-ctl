@@ -117,8 +117,42 @@ def check_session(name):
 
 # ------------------------------------------------------------ server tmux
 
-def tmux(*args, env=None, check=False, capture=True):
+def _reset_menu_visible(screen):
+    """Riconosce il flusso /usage di Codex, non il semplice avviso di crediti.
+
+    Le stringhe sono quelle della CLI installata. L'automazione non deve mai
+    scegliere o confermare un reset: quel passaggio resta ai tasti inviati
+    esplicitamente dall'utente nel terminale.
+    """
+    return bool(re.search(
+        r"(?m)^[ \t]*(?:›[ \t]*)?(?:\d+\.[ \t]*)?"
+        r"(?:Usage limit resets|Redeem usage limit reset|"
+        r"Reset your current usage limits\.|"
+        r"View account usage or redeem an earned reset\.)[ \t]*$",
+        screen or ""))
+
+
+def _tmux_sends_tui_input(args):
+    """Distingue l'input alla TUI dai comandi tmux per il copy-mode."""
+    return bool(args and (args[0] == "paste-buffer"
+                          or (args[0] == "send-keys" and "-X" not in args)))
+
+
+def tmux(*args, env=None, check=False, capture=True, user_input=False):
     cmd = ["tmux", "-L", TMUX_SOCKET, *args]
+    # Il controllo avviene immediatamente prima di ogni input automatico,
+    # compresi paste, retry del submit, comandi slash e scelte di menu. Il
+    # popup puo' infatti comparire durante una delle attese fra questi passi.
+    # _screen_text usa subprocess direttamente, quindi non c'e' ricorsione.
+    if (_tmux_sends_tui_input(args) and "-t" in args and not user_input):
+        name = args[args.index("-t") + 1]
+        if _reset_menu_visible(_screen_text(name, env or base_env())):
+            error = ("Codex attende il consenso esplicito per un reset dei limiti. "
+                     "Conferma o annulla il menu con i tasti del terminale; "
+                     "nessun input automatico e' stato inviato.")
+            if check:
+                raise subprocess.CalledProcessError(4, cmd, output="", stderr=error)
+            return subprocess.CompletedProcess(cmd, 4, "", error)
     return subprocess.run(cmd, env=env or base_env(), check=check,
                           capture_output=capture, text=True)
 
@@ -863,7 +897,9 @@ def cmd_keys(argv):
     mapping = {"interrupt": "C-c", "escape": "Escape", "enter": "Enter",
                "up": "Up", "down": "Down"}
     key = mapping.get(argv[1]) or die("tasto non consentito")
-    tmux("send-keys", "-t", name, key)
+    result = tmux("send-keys", "-t", name, key, user_input=True)
+    if result.returncode != 0:
+        die((result.stderr or "invio tasto fallito").strip(), 4)
     print("ok")
 
 
@@ -1580,7 +1616,11 @@ def cmd_command(argv):
         hit = next((r.pattern for r in confirm_rx if r.search(pane)), "")
         if not hit:
             break
-        tmux("send-keys", "-t", name, rt.get("confirm_key", "Enter"), env=env)
+        result = tmux("send-keys", "-t", name, rt.get("confirm_key", "Enter"), env=env)
+        if result.returncode != 0:
+            print(json.dumps({"ok": False,
+                              "error": (result.stderr or "conferma fallita").strip()}))
+            sys.exit(5)
         confirmed.append(hit)
         time.sleep(1.5)
 
@@ -1830,7 +1870,11 @@ def cmd_mode(argv):
     if current != target and key:
         # un giro completo e' il massimo utile: oltre, il ciclo si ripete
         for step in range(1, len(options) + 6):
-            tmux("send-keys", "-t", name, key, env=env)
+            result = tmux("send-keys", "-t", name, key, env=env)
+            if result.returncode != 0:
+                print(json.dumps({"ok": False, "mode": current,
+                                  "error": (result.stderr or "invio tasto fallito").strip()}))
+                sys.exit(5)
             time.sleep(0.6)
             current = _detect_mode(name, prof, env, perm)
             if current == target:
@@ -2388,17 +2432,24 @@ def _usage_codex():
                                     blk.get("used_percent"), blk.get("reset_at"))
                 if win:
                     windows.append(win)
-    # limiti per singolo modello: il nome arriva dal provider e va ripulito
+    # Limiti per singolo modello: come il limite principale possono avere una
+    # finestra breve e una lunga. La TUI le mostra entrambe; includere la
+    # durata nell'etichetta le rende distinguibili nel pannello dell'Hub.
     for extra in (data.get("additional_rate_limits") or [])[:12]:
         if not isinstance(extra, dict):
             continue
-        blk = (extra.get("rate_limit") or {}).get("primary_window")
-        if not isinstance(blk, dict):
-            continue
-        win = _usage_window(extra.get("limit_name") or "limite aggiuntivo",
-                            blk.get("used_percent"), blk.get("reset_at"))
-        if win:
-            windows.append(win)
+        limit = extra.get("rate_limit") or {}
+        name = extra.get("limit_name") or "limite aggiuntivo"
+        for key, fallback in (("primary_window", "finestra principale"),
+                              ("secondary_window", "finestra secondaria")):
+            blk = limit.get(key)
+            if not isinstance(blk, dict):
+                continue
+            duration = _window_label(blk.get("limit_window_seconds"), fallback)
+            win = _usage_window(f"{name} ({duration})", blk.get("used_percent"),
+                                blk.get("reset_at"))
+            if win:
+                windows.append(win)
     plan = re.sub(r"[^\w .-]", "", str(data.get("plan_type") or "")).strip()[:40]
     return {"windows": windows, "plan": plan, "configured": True}
 

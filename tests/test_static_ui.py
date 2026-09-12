@@ -43,6 +43,30 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn('tabLink("meetings",', self.app)
         self.assertIn("?tab=meetings", self.app)
 
+    def test_single_top_bar_keeps_work_destinations_primary(self):
+        parser = NavParser()
+        parser.feed(self.index)
+        self.assertEqual(parser.hrefs, ["#/", "#/projects", "#/backlog", "#/new"])
+        self.assertEqual(self.index.count("<header>"), 1)
+        self.assertEqual(self.index.count('<nav id="nav"'), 1)
+        header = self.index[self.index.index("<header>"):self.index.index("</header>")]
+        self.assertIn('<nav id="nav"', header)
+        self.assertIn('id="settings-menu"', header)
+
+    def test_settings_collect_secondary_navigation_and_preferences(self):
+        menu = self.index[self.index.index('id="settings-menu"'):
+                          self.index.index("</details>", self.index.index('id="settings-menu"'))]
+        for value in ('href="#/accounts"', 'href="#/status"', 'id="push-toggle"',
+                      'id="usage-toggle"', 'id="help-toggle"', 'id="theme-toggle"',
+                      'id="who"'):
+            self.assertIn(value, menu)
+        self.assertIn('settingsMenu.removeAttribute("open")', self.app)
+        self.assertIn('settingsMenu.classList.toggle("active"', self.app)
+        self.assertIn('!menu.contains(e.target)', self.app)
+        self.assertIn('if (e.currentTarget.open) closeAttention()', self.app)
+        self.assertIn("function applyHelp(on)", self.app)
+        self.assertIn("Consumo: visibile", self.app)
+
     def test_documents_are_nested_under_projects(self):
         parser = NavParser()
         parser.feed(self.index)
@@ -99,10 +123,34 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn("Dettagli tecnici (${last.checks.length} controlli)", self.app)
         self.assertIn('class="card more status-details"', self.app)
 
+    def test_harness_update_card_shows_ghost_result_and_escapes_output(self):
+        source = self.app[:self.app.index("(async function boot()")]
+        probe = r'''
+const assert = require("node:assert/strict");
+const html = harnessUpdateCard({last: {
+  started_at: "2026-09-11T03:20:00+00:00",
+  finished_at: "2026-09-11T03:21:00+00:00",
+  changed: true,
+  errors: [],
+  after: {devagent: {codex: "1", claude: "2", opencode: "3"}},
+  audit: {status: "COMPLETED", summary: "compatibile <script>",
+          mode: "codex exec --ephemeral"},
+  updates: [{target: "codex", ok: true, output: "updated"}],
+}, timer: "ActiveState=active"});
+assert.ok(html.includes("Audit fantasma"));
+assert.ok(html.includes("codex exec --ephemeral"));
+assert.ok(html.includes("compatibile &lt;script&gt;"));
+assert.ok(!html.includes("compatibile <script>"));
+assert.ok(html.includes("ActiveState=active"));
+'''
+        result = subprocess.run(["node"], input=source + probe,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_session_actions_expose_pause_and_order_by_impact(self):
         pause = '<button class="key" id="a-pause"'
         restart = '<button class="small" id="a-restart">Restart</button>'
-        kill = '<button class="small danger" id="a-kill">${escalationHost ? "Chiudi solo host" : "Kill"}</button>'
+        kill = '<button class="small danger" id="a-kill">${escalationHost ? "Chiudi solo escalation" : "Kill"}</button>'
         delete = '<button class="small danger" id="a-delete">Elimina</button>'
         self.assertIn(pause, self.app)
         self.assertIn(">Esc / Pausa</button>", self.app)
@@ -118,6 +166,90 @@ class StaticUiContracts(unittest.TestCase):
         self.assertIn('id="a-kill-pair"', self.app)
         self.assertIn("Chiudi entrambe", self.app)
         self.assertIn("Sessioni collegate", self.app)
+
+    def test_usage_omits_only_codex_spark_details_without_mutating_data(self):
+        source = self.app[:self.app.index("(async function boot()")]
+        probe = r'''
+const assert = require("node:assert/strict");
+const windows = [
+  {label: "5 ore", percent: 10, resets_at: 4102444800},
+  {label: "7 giorni", percent: 20},
+  {label: "GPT-Spark (5 ore)", percent: 30},
+  {label: "GPT-Spark (7 giorni)", percent: 40},
+  {label: "for spark", percent: 50},
+  {label: "Altro modello (5 ore)", percent: 60},
+];
+const items = [{provider: "codex", status: "ok", windows},
+  {provider: "claude", status: "ok", windows: [windows[4]]},
+  {provider: "deepseek", status: "ok", balance: {amount: 12.34, currency: "USD"}}];
+const before = JSON.stringify(items);
+const rendered = usagePanel(items);
+for (const index of [0, 1, 5]) assert.ok(rendered.includes(usageWindow(windows[index])));
+for (const index of [2, 3]) assert.ok(!rendered.includes(usageWindow(windows[index])));
+assert.equal(rendered.split(usageWindow(windows[4])).length - 1, 1);
+assert.ok(rendered.includes("12.34"));
+assert.ok(rendered.includes("USD residui"));
+assert.equal(JSON.stringify(items), before);
+assert.ok(usagePanel([{provider: "codex", status: "never_checked"}]).includes("mai letto"));
+'''
+        result = subprocess.run(["node"], input=source + probe,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_session_submit_carries_backlog_origin_even_without_prepared_prompt(self):
+        start = self.app.index('  $("#s-go").onclick = async () => {')
+        end = self.app.index("\n}\n", start)
+        handler = self.app[start:end]
+        probe = r'''
+const assert = require("node:assert/strict");
+class ApiError extends Error {}
+const elements = new Map();
+const $ = key => {
+  if (!elements.has(key)) elements.set(key, {value: "", files: [], checked: true});
+  return elements.get(key);
+};
+const $$ = () => [];
+const envSel = {value: "PROJECT"}, profSel = {value: "test"};
+const selectedModel = () => "";
+const supportsSubagents = () => false;
+const writeNewSessionPromptDraft = () => {};
+const toast = () => {};
+const showError = () => {};
+const location = {hash: "#/new?backlog=chosen"};
+let backlogIdea = {id: "chosen"}, failure = false;
+const calls = [];
+const post = async (path, body) => {
+  calls.push({path, body});
+  if (failure) throw Object.assign(new ApiError(), {code: "launch_failed", sessionId: "failed"});
+  return {session: {id: "launched"}, delivery: "paste"};
+};
+'''
+        checks = r'''
+(async () => {
+  assert.equal(calls.length, 0); // Installing the handler is preparation only.
+  $("#s-prompt").value = "edited prompt";
+  await $("#s-go").onclick();
+  assert.equal(calls[0].body.backlog_id, "chosen");
+  assert.equal(calls[0].body.prompt, "edited prompt");
+  assert.equal(location.hash, "#/session/launched");
+  $("#s-use-backlog-prompt").checked = false;
+  await $("#s-go").onclick();
+  assert.equal(calls[1].body.backlog_id, "chosen");
+  assert.equal(calls[1].body.prompt, "");
+  failure = true;
+  await $("#s-go").onclick();
+  assert.equal(location.hash, "#/session/failed");
+  failure = false;
+  backlogIdea = null;
+  await $("#s-go").onclick();
+  assert.equal(calls[3].body.backlog_id, "");
+  assert.equal(calls[3].body.prompt, "edited prompt");
+  assert.equal(calls.length, 4);
+  assert(calls.every(call => call.path === "/api/sessions"));
+})().catch(error => { console.error(error); process.exit(1); });
+'''
+        subprocess.run(["node", "-e", probe + handler + checks], check=True,
+                       capture_output=True, text=True)
 
     def test_failed_escalation_launch_is_not_marked_granted(self):
         backend = (ROOT / "app/main.py").read_text(encoding="utf-8")
@@ -193,6 +325,7 @@ function viewMeetings() {} function viewMeeting() {}
 function viewProjects() {} function viewProject() {}
 function viewBacklog() {} function viewNewSession() {}
 function viewAccounts() {} function viewStatus() {} function viewSession() {}
+function viewTranscript() {}
 """
         probe = r'''
 let renders = 0;
@@ -230,19 +363,69 @@ dashboardStateVersion = dashboardSnapshotVersion(running.sessions);
         self.assertEqual(observed["renders"], 1)
         self.assertIn("Turno completato", observed["tag"])
 
+    def test_delivery_wait_failure_and_retry_update_all_indicators(self):
+        # Run the real frontend functions; no DOM or live backend is needed.
+        source = self.app[:self.app.index("(async function boot()")]
+        probe = r"""
+const button = {textContent: "", classList: {toggle: (_name, on) => button.danger = on}};
+const base = {id: "s1", alive: true, status: "running", lifecycle: "RUNNING", messages_total: 1};
+const observations = [];
+for (const [status, undelivered, delivery_failed] of [
+  ["pending", 1, 0], ["launching", 1, 0], ["sent", 0, 0],
+  ["delivery_failed", 1, 1], ["pending", 1, 0], ["manually_resent", 0, 0],
+]) {
+  const s = {...base, undelivered, delivery_failed, last_message: {status}};
+  paintMessageToggle(button, s);
+  observations.push({status, danger: button.danger, text: button.textContent,
+    tags: stateTags(s), strip: statusStrip(s), card: msgCard(s.last_message)});
+}
+const mixed = {...base, messages_total: 2, undelivered: 2, delivery_failed: 1,
+  last_message: {status: "pending"}};
+paintMessageToggle(button, mixed);
+const pending = {...base, undelivered: 1, delivery_failed: 0};
+const failed = {...pending, delivery_failed: 1};
+process.stdout.write(JSON.stringify({observations, mixed: {
+  danger: button.danger, text: button.textContent, strip: statusStrip(mixed)},
+  changed: dashboardSnapshotVersion([pending]) !== dashboardSnapshotVersion([failed]),
+  reserved: msgCard({status: "sent", note: "Verificare la lettura"})}));
+"""
+        result = subprocess.run(["node"], input=source + probe, check=True,
+                                capture_output=True, text=True)
+        observed = json.loads(result.stdout)
+        for row in observed["observations"]:
+            with self.subTest(status=row["status"]):
+                failed = row["status"] == "delivery_failed"
+                waiting = row["status"] in ("pending", "launching")
+                self.assertEqual(row["danger"], failed)
+                for field in ("text", "tags", "strip"):
+                    self.assertEqual("non consegnat" in row[field], failed)
+                self.assertEqual("in attesa" in row["text"], waiting)
+                self.assertEqual('role="status"' in row["strip"], waiting)
+                self.assertEqual('class="tag delivery_failed"' in row["card"], failed)
+        self.assertTrue(observed["changed"])
+        self.assertTrue(observed["mixed"]["danger"])
+        self.assertIn("1 in attesa", observed["mixed"]["text"])
+        self.assertIn("1 non consegnati", observed["mixed"]["text"])
+        self.assertIn('role="status"', observed["mixed"]["strip"])
+        self.assertIn('class="errbox compact"', observed["mixed"]["strip"])
+        self.assertIn("consegnato con riserva", observed["reserved"])
+        self.assertNotIn("delivery_failed", observed["reserved"])
+
     def test_attention_overlays_the_page_and_can_be_reopened(self):
         # Gli avvisi non stanno piu' nel flusso della pagina: scendono
         # dall'alto in sovraimpressione, si ritirano da soli e si riaprono
         # dal pulsante in testata o dal contatore accanto a «Dashboard».
         self.assertIn('id="notice-stack"', self.index)
         self.assertIn('id="attention-toggle"', self.index)
+        self.assertIn('id="settings-attention-count"', self.index)
         self.assertIn("#notice-stack {", self.css)
         notice_rule = self.css.split("#notice-stack {", 1)[1].split("}", 1)[0]
         self.assertIn("position: fixed", notice_rule)
         self.assertIn("#notice-stack > .shown", self.css)
         self.assertIn("ATTENTION_AUTOHIDE_MS", self.app)
         self.assertIn("function toggleAttention()", self.app)
-        self.assertIn('$("#attention-toggle").onclick = toggleAttention', self.app)
+        self.assertIn('$("#settings-menu").removeAttribute("open")', self.app)
+        self.assertIn("toggleAttention();", self.app)
         self.assertIn('$("#nav-notice").onclick', self.app)
 
     def test_delivery_failure_is_visible_in_web_attention_only(self):
@@ -338,7 +521,8 @@ dashboardStateVersion = dashboardSnapshotVersion(running.sessions);
         self.assertIn("lineHeight: mobileTerminal ? 1.1 : 1", self.app)
         self.assertIn("Il blocco arriva a oltre 400 px", self.css)
         self.assertIn("position: static; margin: 12px -10px 0", self.css)
-        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", self.css)
+        self.assertIn("#nav { flex: 1 1 auto", self.css)
+        self.assertIn(".wide-label { display: none; }", self.css)
         self.assertIn('btn.dataset.pushState = pushSubscription ? "on" : "off"', self.app)
 
     def test_usage_refresh_explains_expired_claude_oauth(self):

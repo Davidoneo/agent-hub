@@ -36,6 +36,14 @@
       acknowledge that privilege boundary.
   when: agent_hub_server_admin | bool
 
+- name: Agent Hub | notification caller is explicit when the private bridge is enabled
+  ansible.builtin.assert:
+    that:
+      - agent_hub_service_notification_user is match('^[a-z_][a-z0-9_-]{0,31}$')
+      - agent_hub_service_notification_user not in [agent_hub_project_user, agent_hub_server_user, agent_hub_service_user, 'root']
+    fail_msg: Configure a dedicated application account and install its private notification wrapper first.
+  when: agent_hub_service_notifications_enabled | bool
+
 - name: Agent Hub | packages
   ansible.builtin.apt:
     name: [python3, python3-venv, tmux, sudo, git, curl, openssl]

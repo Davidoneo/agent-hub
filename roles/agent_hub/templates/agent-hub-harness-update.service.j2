@@ -6,11 +6,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart={{ agent_hub_libexec }}/harness-update-ctl --project {{ agent_hub_harness_audit_project }} --model {{ agent_hub_harness_audit_model }} --effort {{ agent_hub_harness_audit_effort }}
-TimeoutStartSec=30min
+Group={{ agent_hub_service_user }}
+ExecStart={{ agent_hub_libexec }}/harness-update-ctl --project {{ agent_hub_harness_audit_project }} --model {{ agent_hub_harness_audit_model }} --effort {{ agent_hub_harness_audit_effort }} --audit-timeout {{ agent_hub_harness_audit_timeout }}
+TimeoutStartSec=45min
 # npm deve installare i binari globali leggibili/eseguibili dagli account
-# PROJECT e SERVER. Il report di stato applica comunque mode 0600 in modo
-# esplicito prima del rename atomico.
+# PROJECT e SERVER. Il gruppo del processo permette al solo servizio Agent Hub
+# di leggere il report 0640 e mostrarlo nella pagina Status.
 UMask=0022
 Nice=10
 StandardOutput=journal

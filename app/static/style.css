@@ -76,27 +76,36 @@ body {
   padding-top: env(safe-area-inset-top);
 }
 header {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 10px calc(12px + env(safe-area-inset-right)) 10px
+  display: flex; align-items: center; gap: 10px;
+  min-height: 52px;
+  padding: 6px calc(10px + env(safe-area-inset-right)) 6px
     calc(12px + env(safe-area-inset-left));
   background: var(--panel); border-bottom: 1px solid var(--line);
 }
-.brand { font-weight: 700; letter-spacing: .5px; }
-.header-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-.who { color: var(--muted); font-size: 12px; max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.brand {
+  flex: 0 0 auto; color: var(--fg); font-weight: 700; letter-spacing: .5px;
+  text-decoration: none; white-space: nowrap;
+}
+.header-right {
+  display: flex; flex: 0 0 auto; align-items: center; gap: 6px;
+  justify-content: flex-end; margin-left: auto;
+}
+.who {
+  display: block; color: var(--muted); font-size: 12px; padding: 7px 10px 2px;
+  max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 #nav {
-  display: flex; gap: 4px; overflow-x: auto;
-  padding: 8px calc(10px + env(safe-area-inset-right)) 8px
-    calc(10px + env(safe-area-inset-left));
-  background: var(--panel); border-bottom: 1px solid var(--line);
-  -webkit-overflow-scrolling: touch;
+  display: flex; min-width: 0; gap: 3px; overflow-x: auto;
+  -webkit-overflow-scrolling: touch; scrollbar-width: none;
 }
+#nav::-webkit-scrollbar { display: none; }
 #nav a {
-  color: var(--muted); text-decoration: none; padding: 7px 12px;
+  color: var(--muted); text-decoration: none; padding: 7px 10px;
   border-radius: 8px; white-space: nowrap; font-size: 14px;
 }
 #nav a.active { background: var(--panel2); color: var(--fg); font-weight: 600; }
+.short-label, .dashboard-short { display: none; }
 #nav-notice {
   display: none; min-width: 17px; height: 17px; padding: 0 5px; margin-left: 3px;
   border-radius: 999px; align-items: center; justify-content: center;
@@ -104,6 +113,34 @@ header {
   line-height: 17px;
 }
 #nav-notice.visible { display: inline-flex; }
+
+.settings-menu { position: relative; }
+.settings-menu > summary {
+  list-style: none; cursor: pointer; user-select: none; white-space: nowrap;
+  min-height: 34px; padding: 6px 10px; border: 1px solid var(--line);
+  border-radius: 8px; color: var(--fg); font-size: 13px;
+}
+.settings-menu > summary::-webkit-details-marker { display: none; }
+.settings-menu > summary::after { content: " ▾"; color: var(--muted); }
+.settings-menu[open] > summary, .settings-menu.active > summary {
+  background: var(--panel2); border-color: var(--accent);
+}
+.settings-menu[open] > summary::after { content: " ▴"; }
+.settings-panel {
+  position: absolute; z-index: 20; top: calc(100% + 7px); right: 0;
+  width: min(260px, calc(100vw - 20px)); padding: 7px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0,0,0,.22);
+}
+.settings-item {
+  display: block; width: 100%; min-height: 38px; margin: 0; padding: 8px 10px;
+  border: 0; border-radius: 7px; background: transparent; color: var(--fg);
+  font: inherit; font-size: 14px; line-height: 22px; text-align: left;
+  text-decoration: none; white-space: nowrap;
+}
+.settings-item:hover { background: var(--panel2); }
+.settings-item.active { background: var(--panel2); color: var(--accent); font-weight: 600; }
+.settings-divider { height: 1px; margin: 6px 4px; background: var(--line); }
 
 main { padding: 14px; max-width: 1100px; margin: 0 auto; }
 
@@ -258,6 +295,7 @@ pre {
   font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
 }
 pre.transcript { max-height: 460px; white-space: pre; word-break: normal; overflow-x: auto; }
+#transcript-page { max-height: none; }
 /* Prompt operativo e architettura target: testo lungo dell'agente, a capo
    conservati e nessuna barra orizzontale. */
 .proposal-text {
@@ -319,7 +357,7 @@ details.more .kv { margin-top: 6px; }
    Toast e pannello «Novità e richieste» condividono la stessa pila: scendono
    dal bordo superiore, restano sopra la pagina qualche secondo e si ritirano
    fuori schermo. Nessuno dei due occupa spazio nel flusso, così la barra
-   superiore resta compatta; il pulsante «avvisi» li riapre quando servono. */
+   superiore resta compatta; la voce «Avvisi» in Impostazioni li riapre. */
 #notice-stack {
   /* Sotto la barra superiore (z-index 10) e sopra la pagina: gli avvisi
      sembrano scendere da dietro l'intestazione e rientrarci, senza mai
@@ -385,6 +423,14 @@ details.more .kv { margin-top: 6px; }
   font-size: 10px; font-weight: 800;
 }
 #attention-toggle-count.visible { display: inline-block; }
+#settings-attention-count {
+  display: none; position: absolute; top: -5px; right: -5px;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px; align-items: center; justify-content: center;
+  background: var(--danger); color: white; font-size: 10px; font-weight: 800;
+  line-height: 16px;
+}
+#settings-attention-count.visible { display: inline-flex; }
 
 #banner { max-width: 1100px; margin: 0 auto; padding: 0 14px; }
 .errbox {
@@ -504,30 +550,26 @@ body.help-on .help { display: block; }
 .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .2s; }
 
 @media (max-width: 520px) {
-  /* Sul telefono tutti i comandi globali devono essere visibili senza una
-     terza riga di intestazione, e le sezioni non devono sembrare troncate. */
+  /* Sul telefono la barra resta una sola riga: le quattro destinazioni di
+     lavoro scorrono se serve, mentre Impostazioni resta sempre raggiungibile. */
   header {
-    padding-top: 6px; padding-bottom: 6px;
+    gap: 4px; min-height: 48px; padding-left: calc(6px + env(safe-area-inset-left));
+    padding-right: calc(6px + env(safe-area-inset-right));
   }
-  .header-right { flex-wrap: nowrap; gap: 4px; }
-  .header-right button.small {
+  .brand { display: none; }
+  #nav { flex: 1 1 auto; gap: 1px; }
+  #nav a { padding: 7px 6px; font-size: 12.5px; }
+  .wide-label { display: none; }
+  .short-label { display: inline; }
+  .header-right { gap: 3px; margin-left: 0; }
+  .header-right > button.small {
     min-height: 34px; padding: 5px 7px; font-size: 12px; white-space: nowrap;
   }
-  .who { display: none; }
-  #push-toggle {
-    width: 52px; justify-content: center; font-size: 0;
-  }
-  #push-toggle::after { content: "N: off"; font-size: 12px; }
-  #push-toggle[data-push-state="on"]::after { content: "N: on"; }
-  #push-toggle[data-push-state="blocked"]::after { content: "N: !"; }
-  #nav {
-    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-    overflow: visible; gap: 3px; padding-top: 6px; padding-bottom: 6px;
-  }
-  #nav a {
-    min-width: 0; padding: 7px 3px; text-align: center; font-size: 13px;
-    overflow: hidden; text-overflow: ellipsis;
-  }
+  .settings-menu > summary { padding: 6px 8px; font-size: 12px; }
+  .settings-panel { position: fixed; top: calc(var(--chrome-h, 48px) + 6px); right: 6px; }
+  /* Lo stesso conteggio resta sul pulsante Impostazioni: il secondo badge
+     accanto a Dashboard toglierebbe spazio a una destinazione primaria. */
+  #nav-notice.visible { display: none; }
   main { padding: 10px; }
   .muted { font-size: 14px; }
   .mono { font-size: 13px; }
@@ -555,6 +597,12 @@ body.help-on .help { display: block; }
   .dpad .arrow-key { min-height: 40px; padding: 0; }
   .key-row { gap: 4px; }
   .attention-item .tag { max-width: 38vw; overflow: hidden; text-overflow: ellipsis; }
+}
+
+@media (max-width: 360px) {
+  .dashboard-wide { display: none; }
+  .dashboard-short { display: inline; }
+  #nav a { padding-left: 3px; padding-right: 3px; font-size: 11.5px; }
 }
 
 /* ---------------------------------------------- dialoghi applicativi

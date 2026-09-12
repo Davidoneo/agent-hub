@@ -45,9 +45,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
@@ -80,6 +82,8 @@ CONFIG = {
     "logs": os.environ.get("AGENT_HUB_LOGS", "/srv/agent-workspace/logs"),
     "projects": os.environ.get("AGENT_HUB_PROJECTS", "/srv/agent-workspace/projects"),
     "uploads": os.environ.get("AGENT_HUB_UPLOADS", "/srv/agent-workspace/uploads"),
+    "harness_update_state": os.environ.get(
+        "AGENT_HUB_HARNESS_UPDATE_STATE", "/var/lib/agent-hub/harness-update.json"),
     "knowledge": os.environ.get("AGENT_HUB_KNOWLEDGE", "/srv/agent-workspace/knowledge"),
     "max_upload": int(os.environ.get("AGENT_HUB_MAX_UPLOAD", str(50 * 1024 * 1024))),
     "controller": os.environ.get("AGENT_HUB_CONTROLLER", "/etc/agent-hub/controller.json"),
@@ -601,6 +605,24 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_telegram_outbox_status
                 ON telegram_outbox(status, created_at);
+            -- Eventi a vocabolario chiuso da applicazioni isolate. Il wrapper
+            -- autorizzato costruisce il testo: il chiamante non puo' inviarne uno libero.
+            CREATE TABLE IF NOT EXISTS service_notifications (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                event TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                requested_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                sent_at TEXT NOT NULL DEFAULT '',
+                UNIQUE(source,event_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_service_notifications_status
+                ON service_notifications(status, created_at);
             -- Raccolta di idee separata dalle sessioni. Il prompt e' preparato
             -- in anticipo ma resta invisibile finche' l'operatore non apre il
             -- composer di una nuova sessione partendo dall'idea.
@@ -1770,16 +1792,18 @@ async def list_sessions(request: Request):
     with db() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM sessions ORDER BY (status='running') DESC, created_at DESC")]
-        pend = {r["session_id"]: r["n"] for r in conn.execute(
-            "SELECT session_id, COUNT(*) AS n FROM messages "
+        pend = {r["session_id"]: dict(r) for r in conn.execute(
+            "SELECT session_id, COUNT(*) AS n, SUM(status=?) AS failed FROM messages "
             "WHERE kind != 'control' AND status IN (?,?,?) GROUP BY session_id",
-            (PENDING, LAUNCHING, FAILED))}
+            (FAILED, PENDING, LAUNCHING, FAILED))}
         total = {r["session_id"]: r["n"] for r in conn.execute(
             "SELECT session_id, COUNT(*) AS n FROM messages "
             "WHERE kind != 'control' GROUP BY session_id")}
     for r in rows:
         decorate(r, live.get(r["tmux_name"]))
-        r["undelivered"] = pend.get(r["id"], 0)
+        counts = pend.get(r["id"], {})
+        r["undelivered"] = counts.get("n", 0)
+        r["delivery_failed"] = counts.get("failed", 0)
         r["messages_total"] = total.get(r["id"], 0)
     login = identity(request)
     ensure_notification_identity(login, rows)
@@ -2803,12 +2827,13 @@ def session_relations(sid: str) -> dict:
 
 def message_counters(sid: str) -> dict:
     with db() as conn:
-        tot = conn.execute("SELECT COUNT(*) FROM messages "
-                           "WHERE session_id=? AND kind != 'control'", (sid,)).fetchone()[0]
-        und = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id=? "
-                           "AND kind != 'control' AND status IN (?,?,?)",
-                           (sid, PENDING, LAUNCHING, FAILED)).fetchone()[0]
-    return {"messages_total": tot, "undelivered": und}
+        counts = conn.execute(
+            "SELECT COUNT(*) AS messages_total, "
+            "COALESCE(SUM(status IN (?,?,?)),0) AS undelivered, "
+            "COALESCE(SUM(status=?),0) AS delivery_failed FROM messages "
+            "WHERE session_id=? AND kind != 'control'",
+            (PENDING, LAUNCHING, FAILED, FAILED, sid)).fetchone()
+    return dict(counts)
 
 
 @app.get("/api/sessions/{sid}")
@@ -4018,6 +4043,10 @@ def validate_workdir(path: str, environment: str) -> str:
 
 
 def _create_session(body: dict) -> dict:
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    backlog_idea = get_backlog_idea(backlog_id) if backlog_id else None
+    if backlog_idea and backlog_idea["status"] not in {"ready", "ready_fallback"}:
+        raise HTTPException(409, "idea non ancora pronta per una sessione")
     name = (body.get("name") or "").strip() or "sessione"
     environment = body.get("environment", "PROJECT")
     if environment not in UNIX_USERS:
@@ -4146,6 +4175,13 @@ def _create_session(body: dict) -> dict:
         ) from exc
     with db() as conn:
         conn.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
+        # Consuma l'idea solo dopo l'avvio confermato dal wrapper, nella stessa
+        # transazione dello stato running. Preparazione ed errori la conservano;
+        # il prompt e' gia' persistito, anche se la consegna successiva fallisce.
+        if backlog_idea:
+            conn.execute("DELETE FROM backlog_ideas WHERE id=?", (backlog_id,))
+    if backlog_idea:
+        remove_backlog_audio(backlog_idea.get("audio_path") or "")
     row["status"] = "running"
     save_launch_info(sid, started, row)
 
@@ -4525,6 +4561,42 @@ async def session_transcript(sid: str, source: str = "auto", tail: int = DEFAULT
     })
 
 
+class RawLogResponse(StreamingResponse):
+    """Stream only the bytes present when the append-only PTY log is opened."""
+
+    def __init__(self, path: Path, filename: str):
+        self.path = path
+        quoted = quote(filename)
+        disposition = (f"attachment; filename*=utf-8''{quoted}" if quoted != filename
+                       else f'attachment; filename="{filename}"')
+        super().__init__(content=(), media_type="application/octet-stream", headers={
+            "Content-Disposition": disposition,
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    async def __call__(self, scope, receive, send):
+        try:
+            file = await anyio.open_file(self.path, "rb")
+        except FileNotFoundError:
+            raise HTTPException(404, "nessun log raw per questa sessione")
+        # Keep the descriptor alive for the response, including disconnects.
+        async with file:
+            remaining = os.fstat(file.fileno()).st_size
+            self.headers["Content-Length"] = str(remaining)
+
+            async def chunks():
+                nonlocal remaining
+                while remaining:
+                    chunk = await file.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+            self.body_iterator = chunks()
+            await super().__call__(scope, receive, send)
+
+
 @app.get("/api/sessions/{sid}/log/raw")
 async def session_log_raw(sid: str):
     """Log PTY integrale, servito come allegato: mai renderizzato in pagina."""
@@ -4532,9 +4604,7 @@ async def session_log_raw(sid: str):
     path = log_path(row)
     if not path.exists():
         raise HTTPException(404, "nessun log raw per questa sessione")
-    return FileResponse(path, media_type="application/octet-stream",
-                        filename=f"{row['tmux_name']}.log",
-                        headers={"X-Content-Type-Options": "nosniff"})
+    return RawLogResponse(path, filename=f"{row['tmux_name']}.log")
 
 
 @app.get("/api/sessions/{sid}/log", response_class=PlainTextResponse)
@@ -5545,6 +5615,27 @@ async def refresh_usage_now():
     for user in AGENT_UNIX_USERS:
         await asyncio.to_thread(refresh_usage, user, None, True)
     return {"usage": usage_overview()}
+
+
+# ------------------------------------------ aggiornamento notturno harness
+
+def harness_update_last() -> dict:
+    """Ultimo report del oneshot root, leggibile ma non mutabile dal servizio."""
+    try:
+        data = json.loads(Path(CONFIG["harness_update_state"]).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+@app.get("/api/harness-update")
+async def harness_update():
+    return {
+        "last": harness_update_last(),
+        "timer": sh(["systemctl", "show", "agent-hub-harness-update.timer", "-p",
+                     "ActiveState,LastTriggerUSec,NextElapseUSecRealtime"]),
+        "timer_active": sh(["systemctl", "is-active", "agent-hub-harness-update.timer"]),
+    }
 
 
 # ------------------------------------------------- controllo di salute host

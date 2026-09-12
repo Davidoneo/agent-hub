@@ -26,7 +26,7 @@ agent_hub_install: true
 | `agent-hub-telegram.service` | Optional status/approval/share bot, the only component reaching the internet |
 | `agent-hub-backlog-telegram.service` | Optional dedicated collector for text and voice ideas |
 | `agent-hub-health.timer` | Deterministic host health snapshot every 30 minutes |
-| `agent-hub-harness-update.timer` | Nightly harness updates followed by a Codex compatibility audit |
+| `agent-hub-harness-update.timer` | Nightly stable harness updates; changed/error cycles get an ephemeral read-only Codex audit |
 | `/usr/local/libexec/agent-hub/*-ctl` | Root-owned wrappers, the privilege boundary |
 | `/usr/local/bin/agent-*` | Stable report, Telegram share, meeting and document commands for sessions |
 | Three Unix accounts | Service account plus two agent accounts, deliberately separated |
@@ -88,6 +88,19 @@ and meeting approvals, and delivers `agent-telegram` text/link/file shares. It
 does not collect ideas and does not push routine report, lifecycle, or health
 messages.
 
+An optional instance overlay can install a root-owned
+`service-notification-ctl` wrapper that validates the caller and renders a fixed
+vocabulary of application alerts. Application-specific wrappers and tests belong
+in the private operations repository. Install and review that wrapper before
+enabling its narrowly scoped sudo rule; the public role provides only the queue
+and delivery support, without granting the caller the generic `agent-telegram`
+interface or access to the bot token:
+
+```yaml
+agent_hub_service_notifications_enabled: true
+agent_hub_service_notification_user: example-app
+```
+
 The Backlog collector is a second, dedicated bot. It accepts free text, Telegram
 voice notes, audio and audio documents only from its paired chat:
 
@@ -131,16 +144,35 @@ changes, and never sends a model prompt.
 See `defaults/main.yml` for the full list.
 
 Harness updates are enabled with the Agent Hub role and run nightly at 03:20
-(with a randomized delay). Codex and OpenCode use their global installation;
-Claude Code is updated independently for the PROJECT and SERVER accounts. An
-Agent Hub session using `gpt-5.6-sol` with `high` effort is created after every
-cycle; identical reruns on the same day do not create duplicates. Override or
-disable this policy with:
+(with a randomized delay). Codex and OpenCode follow the stable npm `latest`
+tag in their global installation; Claude Code installs the explicit `stable`
+channel independently for the PROJECT and SERVER accounts. Update steps have a
+five-minute timeout and continue independently so one failure cannot hide the
+other results.
+
+No LLM runs when every installed version remains unchanged and all updaters
+succeed. A change or error starts `codex exec --ephemeral` as the PROJECT
+account with read-only sandbox, no approval prompts and a bounded runtime. Its
+prompt permits only official release-note/CLI compatibility checks: no file or
+settings changes, tests/builds, package installs, TUI sessions, login, push,
+deploy, restart, rollback or escalation. The process exits after its one turn,
+so it never appears among Agent Hub sessions and cannot wait for daily manual
+attention. An identical successful rerun on the same day is skipped.
+
+The root oneshot writes one atomic, group-readable report to
+`/var/lib/agent-hub/harness-update.json`. The Status page shows versions,
+per-updater output, audit summary, omitted checks, errors and timer state. No
+Telegram or Web Push notification is emitted. Updater or audit failures make
+the systemd unit fail after the report has been saved; there is deliberately no
+automatic rollback or repository fix. Override or disable this policy with:
 
 ```yaml
 agent_hub_harness_updates_enabled: false
 agent_hub_harness_update_calendar: "*-*-* 03:20:00"
 agent_hub_harness_audit_project: agent-hub
+agent_hub_harness_audit_model: gpt-5.6-sol
+agent_hub_harness_audit_effort: high
+agent_hub_harness_audit_timeout: 1200
 ```
 
 ## Blocking states and automatic resume

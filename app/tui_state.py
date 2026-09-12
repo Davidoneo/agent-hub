@@ -12,6 +12,31 @@ def _flat(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+def capacity_stopped(profile_id: str, screen: str) -> bool:
+    """Il warning Codex chiude il turno e precede direttamente il composer.
+
+    Un errore citato da un tool, seguito da altro output o da uno spinner di
+    retry non dimostra un arresto. Non cercare questa firma nello scrollback.
+    """
+    if "codex" not in (profile_id or "").lower():
+        return False
+    warnings = list(re.finditer(
+        r"(?m)^[ \t]*⚠ Selected model is at capacity\. Please\s+"
+        r"try a different model\.[ \t]*$", screen or ""))
+    if not warnings:
+        return False
+    tail = screen[warnings[-1].end():]
+    # La prima riga successiva deve essere il prompt. Nel resto della
+    # schermata non devono esserci nuovi messaggi o un turno in elaborazione.
+    return bool(
+        re.match(r"\s*›[^\n]*\n", tail)
+        and not re.search(r"(?m)^[ \t]*[•■⚠]", tail)
+        and len(re.findall(r"(?m)^[ \t]*›", tail)) == 1
+        and "esc to interrupt" not in _flat(tail)
+        and re.search(r"(?m)^[ \t]*gpt-[\w.-]+\s+[^\n]* · ", tail)
+    )
+
+
 def needs_input(profile_id: str, screen: str) -> bool:
     """True quando lo schermo corrente mostra una richiesta interattiva nota."""
     text = _flat(screen)
@@ -20,6 +45,8 @@ def needs_input(profile_id: str, screen: str) -> bool:
         return False
 
     if "codex" in profile:
+        if capacity_stopped(profile_id, screen):
+            return True
         question = re.search(r"question\s+\d+/\d+\s+\(\d+\s+unanswered\)", text)
         controls = (
             "tab to add notes" in text

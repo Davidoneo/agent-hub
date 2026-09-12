@@ -21,6 +21,8 @@
           - not hub.agent_hub_github_audit_enabled | bool
           - not hub.agent_hub_backlog_telegram_enabled | bool
           - hub.agent_hub_service_deploy_profiles | length == 0
+          - not hub.agent_hub_service_notifications_enabled | bool
+          - hub.agent_hub_service_notification_user | length == 0
 
     - name: Confirm canonical source layout
       ansible.builtin.stat:

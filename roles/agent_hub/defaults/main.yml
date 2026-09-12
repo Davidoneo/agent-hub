@@ -39,14 +39,16 @@ agent_hub_config_dir: /etc/agent-hub
 agent_hub_state_dir: /var/lib/agent-hub
 agent_hub_workspace: /srv/agent-workspace
 
-# Nightly updates keep the globally installed Codex/OpenCode binaries and the
-# per-user Claude Code installations current. A Codex PROJECT audit is opened
-# after every nightly update cycle (duplicate reruns on the same day are skipped).
+# Nightly updates keep the globally installed stable Codex/OpenCode releases
+# and the per-user Claude Code stable channel current. Only a version change or
+# an error starts an ephemeral, read-only Codex audit; it never creates a UI
+# session. Duplicate successful audits on the same day are skipped.
 agent_hub_harness_updates_enabled: true
 agent_hub_harness_update_calendar: "*-*-* 03:20:00"
 agent_hub_harness_audit_project: agent-hub
 agent_hub_harness_audit_model: gpt-5.6-sol
 agent_hub_harness_audit_effort: high
+agent_hub_harness_audit_timeout: 1200
 
 # Deterministic controller. Thresholds are re-read from controller.json at
 # every access, so tuning one needs no service restart.
@@ -112,6 +114,10 @@ agent_hub_github_log_dir: /var/log/agent-hub
 agent_hub_telegram_enabled: false
 agent_hub_telegram_token: ""
 agent_hub_telegram_chat_ids: []
+
+# Closed-vocabulary Telegram events from one isolated application.
+agent_hub_service_notifications_enabled: false
+agent_hub_service_notification_user: ""
 
 # Bot separato, dedicato esclusivamente alla raccolta di idee testuali e vocali.
 # Il servizio può essere predisposto senza token e resta inerte finché

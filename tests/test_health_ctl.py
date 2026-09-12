@@ -1,5 +1,7 @@
+import ast
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pwd
 import socket
@@ -112,12 +114,44 @@ class ServiceTemplateTests(unittest.TestCase):
         updater = (ROOT / "libexec/harness-update-ctl").read_text()
         self.assertIn("agent-hub-harness-update.timer", tasks)
         self.assertIn("harness-update-ctl --project", service)
+        self.assertIn("Group={{ agent_hub_service_user }}", service)
+        self.assertIn("--audit-timeout {{ agent_hub_harness_audit_timeout }}", service)
         self.assertIn("OnCalendar={{ agent_hub_harness_update_calendar }}", timer)
         self.assertIn('checked_update(["/usr/bin/codex", "update"]', updater)
         self.assertIn('["/usr/bin/opencode", "upgrade", "--method", "npm"]', updater)
-        self.assertIn('as_user(user, ["claude", "update"]', updater)
+        self.assertIn('as_user(user, ["claude", "install", "stable"]', updater)
+        self.assertIn('"--ephemeral", "--sandbox", "read-only"', updater)
+        self.assertIn('"--ask-for-approval", "never"', updater)
         self.assertIn('default="gpt-5.6-sol"', updater)
         self.assertIn('default="high"', updater)
+
+    def test_nightly_harness_result_is_exposed_read_only(self):
+        main = (ROOT / "app/main.py").read_text()
+        static = (ROOT / "app/static/app.js").read_text()
+        config = (ROOT / "roles/agent_hub/templates/config.env.j2").read_text()
+        self.assertIn('@app.get("/api/harness-update")', main)
+        self.assertIn('CONFIG["harness_update_state"]', main)
+        self.assertIn('api("/api/harness-update"', static)
+        self.assertIn("Audit fantasma", static)
+        self.assertIn("AGENT_HUB_HARNESS_UPDATE_STATE=", config)
+
+    def test_harness_result_reader_rejects_invalid_or_non_object_json(self):
+        source = (ROOT / "app/main.py").read_text()
+        tree = ast.parse(source)
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "harness_update_last")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "harness-update.json"
+            namespace = {"json": json, "Path": Path,
+                         "CONFIG": {"harness_update_state": str(path)}}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "app/main.py", "exec"),
+                 namespace)
+            read = namespace["harness_update_last"]
+            self.assertEqual(read(), {})
+            path.write_text("[]", encoding="utf-8")
+            self.assertEqual(read(), {})
+            path.write_text('{"audit":{"status":"COMPLETED"}}', encoding="utf-8")
+            self.assertEqual(read()["audit"]["status"], "COMPLETED")
 
 
 if __name__ == "__main__":

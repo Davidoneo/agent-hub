@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contratti del rinnovo OAuth Claude usato dal lettore usage."""
+"""Contratti dei lettori usage OAuth di Claude e Codex."""
 import importlib.machinery
 import importlib.util
 import json
@@ -70,6 +70,53 @@ class ClaudeRefreshTests(unittest.TestCase):
     def test_recent_attempt_after_expiry_is_throttled(self):
         self.assertTrue(session_ctl._claude_refresh_throttled(
             last_attempt=2100, current_expiry=2000 * 1000, moment=2200))
+
+
+class CodexUsageTests(unittest.TestCase):
+    def test_model_specific_primary_and_secondary_windows_are_preserved(self):
+        with tempfile.TemporaryDirectory() as home:
+            auth = Path(home) / ".codex" / "auth.json"
+            auth.parent.mkdir(parents=True)
+            auth.write_text(json.dumps({"tokens": {
+                "access_token": "token", "account_id": "account",
+            }}), encoding="utf-8")
+            payload = {
+                "rate_limit": {
+                    "primary_window": {
+                        "limit_window_seconds": 18000, "used_percent": 10,
+                        "reset_at": time.time() + 3600,
+                    },
+                    "secondary_window": {
+                        "limit_window_seconds": 604800, "used_percent": 20,
+                        "reset_at": time.time() + 86400,
+                    },
+                },
+                "additional_rate_limits": [{
+                    "limit_name": "GPT-Spark",
+                    "rate_limit": {
+                        "primary_window": {
+                            "limit_window_seconds": 18000, "used_percent": 30,
+                            "reset_at": time.time() + 3600,
+                        },
+                        "secondary_window": {
+                            "limit_window_seconds": 604800, "used_percent": 40,
+                            "reset_at": time.time() + 86400,
+                        },
+                    },
+                }],
+                "plan_type": "pro",
+            }
+            with mock.patch.object(session_ctl, "me",
+                                   return_value=SimpleNamespace(pw_dir=home)), \
+                 mock.patch.object(session_ctl, "_usage_get",
+                                   return_value=(payload, "", True)):
+                result = session_ctl._usage_codex()
+
+        self.assertEqual([w["label"] for w in result["windows"]], [
+            "5 ore", "7 giorni", "GPT-Spark (5 ore)", "GPT-Spark (7 giorni)",
+        ])
+        self.assertEqual([w["percent"] for w in result["windows"]],
+                         [10.0, 20.0, 30.0, 40.0])
 
 
 if __name__ == "__main__":

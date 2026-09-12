@@ -141,6 +141,49 @@ async function api(path, opts = {}, operation) {
 function post(path, body, operation) { return api(path, { method: "POST", body: body || {} }, operation); }
 function del(path, operation) { return api(path, { method: "DELETE" }, operation); }
 
+// I file non devono sostituire la PWA con una risposta API senza navigazione.
+// Prima leggiamo anche gli errori HTTP dentro l'Hub; solo il file riuscito
+// viene passato al browser, conservando la pagina di partenza.
+async function downloadFile(link) {
+  if (link.dataset.downloading) return;
+  clearError();
+  link.dataset.downloading = "1";
+  link.setAttribute("aria-busy", "true");
+  try {
+    const r = await fetch(link.href, { cache: "no-store" });
+    if (!r.ok) {
+      const text = await r.text();
+      let detail = text.slice(0, 300);
+      try { detail = JSON.parse(text).detail || detail; } catch (e) { /* testo semplice */ }
+      throw new ApiError(r.status, detail, "download");
+    }
+    const disposition = r.headers.get("Content-Disposition") || "";
+    const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const plain = disposition.match(/filename="([^"]+)"|filename=([^;]+)/i);
+    let filename = link.download || "download";
+    if (plain) filename = plain[1] || plain[2].trim();
+    if (encoded) {
+      try { filename = decodeURIComponent(encoded[1]); } catch (e) { /* fallback */ }
+    }
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.target = "_blank";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // La consegna al gestore download è asincrona, soprattutto su telefono.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch (e) {
+    showError(e);
+  } finally {
+    delete link.dataset.downloading;
+    link.removeAttribute("aria-busy");
+  }
+}
+
 // Le notifiche Telegram ordinarie non servono mentre l'utente sta gia'
 // lavorando in Agent Hub. Segnaliamo soltanto interazioni reali e al massimo
 // una volta ogni 30 secondi; una scheda lasciata aperta non conta come attiva.
@@ -170,12 +213,12 @@ function paintPushButton() {
   btn.style.display = "inline-flex";
   if (typeof Notification !== "undefined" && Notification.permission === "denied") {
     btn.dataset.pushState = "blocked";
-    btn.textContent = "notifiche: bloccate";
+    btn.textContent = "Notifiche: bloccate";
     btn.title = "Riabilita le notifiche dalle impostazioni del telefono";
     return;
   }
   btn.dataset.pushState = pushSubscription ? "on" : "off";
-  btn.textContent = pushSubscription ? "notifiche: on" : "notifiche: off";
+  btn.textContent = pushSubscription ? "Notifiche: on" : "Notifiche: off";
   btn.title = pushSubscription
     ? "Disattiva le notifiche push su questo dispositivo"
     : "Attiva le notifiche push su questo dispositivo";
@@ -294,6 +337,7 @@ const ROUTES = [
   [/^\/new/, viewNewSession],
   [/^\/accounts$/, viewAccounts],
   [/^\/status$/, viewStatus],
+  [/^\/session\/([^/?]+)\/transcript$/, viewTranscript],
   [/^\/session\/([^/?]+)/, viewSession],
 ];
 
@@ -312,6 +356,14 @@ async function route() {
     const nested = href !== "#/" && navBase.startsWith(href + "/");
     a.classList.toggle("active", href === navBase || nested);
   });
+  $$("#settings-menu a").forEach(a => {
+    a.classList.toggle("active", a.getAttribute("href") === navBase);
+  });
+  const settingsMenu = $("#settings-menu");
+  if (settingsMenu) {
+    settingsMenu.classList.toggle("active", navBase === "#/accounts" || navBase === "#/status");
+    settingsMenu.removeAttribute("open");
+  }
   for (const [re, fn] of ROUTES) {
     const m = hash.split("?")[0].match(re);
     if (m) {
@@ -553,9 +605,24 @@ function sessionOpenTag(s) {
 // vedono, senza esporre il comando tecnico del pane come se fosse uno stato.
 function stateTags(s) {
   const out = [sessionOpenTag(s), lifecycleTag(s)].filter(Boolean);
-  if (s.undelivered) out.push(`<span class="tag delivery_failed">${s.undelivered} testo/i non consegnati</span>`);
+  const { pending, failed } = deliveryCounts(s);
+  if (pending) out.push(`<span class="tag pending">${pending} testo/i · verifica consegna in corso</span>`);
+  if (failed) out.push(`<span class="tag delivery_failed">${failed} testo/i non consegnati</span>`);
   if (s.kind === "login") out.push('<span class="tag login">LOGIN</span>');
   return out.join(" ");
+}
+
+function deliveryCounts(s) {
+  const failed = Number(s.delivery_failed) || 0;
+  return { pending: Math.max(0, (Number(s.undelivered) || 0) - failed), failed };
+}
+
+function paintMessageToggle(b, counters) {
+  const { pending, failed } = deliveryCounts(counters);
+  b.textContent = `Messaggi (${counters.messages_total || 0})` +
+    (pending ? ` · ${pending} in attesa` : "") +
+    (failed ? ` · ${failed} non consegnati` : "");
+  b.classList.toggle("danger", failed > 0);
 }
 
 // Notifiche interne: restano visibili sotto la navigazione finche' la causa
@@ -577,7 +644,7 @@ let attentionSeen = new Set();
 let dashboardStateVersion = "";
 // Il pannello resta a schermo il tempo di leggerlo e poi si ritira: la
 // condizione non sparisce, resta contata sul badge e riapribile dal pulsante
-// «avvisi». `attentionPinned` tiene aperto quello aperto a mano.
+// «Avvisi» in Impostazioni. `attentionPinned` tiene aperto quello aperto a mano.
 const ATTENTION_AUTOHIDE_MS = 7000;
 let attentionPinned = false;
 let attentionHideTimer = null;
@@ -591,6 +658,7 @@ function dashboardSnapshotVersion(sessions) {
     s.id, !!s.alive, s.status || "", s.lifecycle || "", s.lifecycle_at || "",
     !!s.lifecycle_reported, s.report_status || "", s.reported_at || "",
     s.report_summary || "", s.waiting_for_session || "", Number(s.undelivered) || 0,
+    Number(s.delivery_failed) || 0,
   ]));
 }
 
@@ -654,6 +722,11 @@ function syncAttentionToggle(count) {
   if (badge) {
     badge.textContent = count ? String(count) : "";
     badge.classList.toggle("visible", count > 0);
+  }
+  const settingsBadge = $("#settings-attention-count");
+  if (settingsBadge) {
+    settingsBadge.textContent = count ? String(count) : "";
+    settingsBadge.classList.toggle("visible", count > 0);
   }
 }
 
@@ -1735,6 +1808,7 @@ async function viewNewSession() {
         <div class="muted">Dal Backlog</div>
         <b>${esc(backlogIdea.title)}</b>
         <p>${esc(backlogIdea.description)}</p>
+        <div class="muted">L'idea verrà rimossa dal Backlog solo dopo un avvio riuscito.</div>
         <label class="inline"><input type="checkbox" id="s-use-backlog-prompt" checked>
           Inserisci il prompt preparato</label>
         <div class="muted">Se lo deselezioni, la sessione verra' creata senza prompt iniziale.</div>
@@ -2087,6 +2161,7 @@ async function viewNewSession() {
         executor_model: $("#s-executor-model").value,
         executor_max_agents: parseInt($("#s-executor-max").value, 10) || 2,
         prompt: backlogIdea && !$("#s-use-backlog-prompt").checked ? "" : $("#s-prompt").value,
+        backlog_id: backlogIdea ? backlogIdea.id : "",
         document_ids: docIds,
         cols: parseInt($("#s-cols").value, 10) || 100,
         rows: parseInt($("#s-rows").value, 10) || 30,
@@ -2238,6 +2313,7 @@ function msgCard(m) {
 // dettaglio; il comando del pane rimane nella diagnostica tecnica.
 function statusStrip(st) {
   const lm = st.last_message || {};
+  const { pending, failed } = deliveryCounts(st);
   const bits = [
     sessionOpenTag(st),
     lifecycleTag(st),
@@ -2252,9 +2328,11 @@ function statusStrip(st) {
        <div>${esc(lm.last_error || "nessun dettaglio registrato")}</div>
        <div class="hint">Il testo è salvato in SQLite e non è andato perso.</div>
        <div class="row"><button class="small" id="strip-resend">Apri i messaggi e reinvia</button></div></div>`
-    : (st.undelivered ? `<div class="warnbox">${st.undelivered} testo/i in attesa di consegna
+    : (failed ? `<div class="errbox compact">${failed} testo/i non consegnati
        — apri «Messaggi» per vederli.</div>` : "");
-  return `<div class="strip">${bits}</div>${lifecycleNote(st)}${problem}`;
+  const waiting = pending ? `<div class="muted" role="status">${pending} testo/i in attesa
+       — verifica consegna in corso.</div>` : "";
+  return `<div class="strip">${bits}</div>${lifecycleNote(st)}${problem}${waiting}`;
 }
 
 // Gli stati che chiedono un intervento dicono anche quale, senza inventare
@@ -2531,7 +2609,7 @@ async function viewSession(sid) {
     <div class="card ${envCls}">
       <div class="row">
         <span class="tag ${envCls}">${envLabel(s)}</span>
-        ${stateTags(s)}
+        <span id="session-state-tags">${stateTags(s)}</span>
       </div>
       <div class="muted mono" style="margin-top:6px">${esc(s.unix_user)} · ${esc(s.profile_id)} · ${esc(s.workdir)}</div>
       ${s.lifecycle === "CRASHED" ? `<div class="errbox compact"><b>Sessione crashata</b>
@@ -2614,7 +2692,7 @@ async function viewSession(sid) {
       <div class="row session-actions">
         <span class="control-group-label">Azioni sessione</span>
         <button class="small" id="a-restart">Restart</button>
-        <button class="small danger" id="a-kill">${escalationHost ? "Chiudi solo host" : "Kill"}</button>
+        <button class="small danger" id="a-kill">${escalationHost ? "Chiudi solo escalation" : "Kill"}</button>
         ${escalationHost ? '<button class="small danger" id="a-kill-pair">Chiudi entrambe</button>' : ""}
         <button class="small danger" id="a-delete">Elimina</button>
         <button class="small runtime-toggle" id="runtime-toggle" title="Mostra il modello corrente e cambialo">
@@ -2637,21 +2715,6 @@ async function viewSession(sid) {
       ${help("Ogni prompt e ogni messaggio è salvato in SQLite prima del tentativo di consegna: " +
              "resta leggibile anche se l'harness non parte, se tmux termina o se il backend viene riavviato.")}
       <div id="messages"></div>
-    </div>
-
-    <h3>Stati finali registrati dall'agente</h3>
-    <div class="card">
-      ${help("Ogni riga è una chiamata ad agent-report andata a buon fine. Il comando aggiorna SQLite " +
-             "e scrive l'evento JSON in /srv/agent-workspace/reports/. Ripetere lo stesso stato con lo " +
-             "stesso riepilogo non aggiunge righe: la registrazione è idempotente.")}
-      ${(d.reports || []).length ? `<div class="kv">${(d.reports || []).map(r =>
-        `<div><span class="tag ${(LIFECYCLE[r.status] || ["", "ended"])[1]}">${esc(r.status)}</span></div>
-         <div>${esc(ts(r.reported_at))}${r.unix_user ? " · " + esc(r.unix_user) : ""}
-           ${r.waiting_for_session ? `<div>Dipende da <a href="#/session/${encodeURIComponent(
-             r.waiting_for_session)}">${esc(r.waiting_for_session)}</a></div>` : ""}
-           <div>${esc(r.summary || "(nessun riepilogo)")}</div></div>`).join("")}</div>`
-        : '<span class="muted">Nessuno stato finale registrato per questa sessione.</span>'}
-      <div class="muted mono" style="margin-top:8px">agent-report COMPLETED --summary "…" · SESSION_ID ${esc(sid)}</div>
     </div>
 
     <h3>Log</h3>
@@ -2704,6 +2767,21 @@ async function viewSession(sid) {
     <details class="card more session-advanced" id="session-options">
       <summary><b>Opzioni avanzate</b></summary>
       <div class="advanced-body">
+        <h3>Stati finali registrati dall'agente</h3>
+        <div class="card">
+          ${help("Ogni riga è una chiamata ad agent-report andata a buon fine. Il comando aggiorna SQLite " +
+                 "e scrive l'evento JSON in /srv/agent-workspace/reports/. Ripetere lo stesso stato con lo " +
+                 "stesso riepilogo non aggiunge righe: la registrazione è idempotente.")}
+          ${(d.reports || []).length ? `<div class="kv">${(d.reports || []).map(r =>
+            `<div><span class="tag ${(LIFECYCLE[r.status] || ["", "ended"])[1]}">${esc(r.status)}</span></div>
+             <div>${esc(ts(r.reported_at))}${r.unix_user ? " · " + esc(r.unix_user) : ""}
+               ${r.waiting_for_session ? `<div>Dipende da <a href="#/session/${encodeURIComponent(
+                 r.waiting_for_session)}">${esc(r.waiting_for_session)}</a></div>` : ""}
+               <div>${esc(r.summary || "(nessun riepilogo)")}</div></div>`).join("")}</div>`
+            : '<span class="muted">Nessuno stato finale registrato per questa sessione.</span>'}
+          <div class="muted mono" style="margin-top:8px">agent-report COMPLETED --summary "…" · SESSION_ID ${esc(sid)}</div>
+        </div>
+
         <h3>Continuità</h3>
         <label>Continua con altro agente</label>
         <div class="row">
@@ -2847,14 +2925,13 @@ async function viewSession(sid) {
 
   // --- cronologia input: chiusa per default, aperta dal pulsante «Messaggi» --
   let msgOpen = false;
-  let counters = { messages_total: s.messages_total || 0, undelivered: s.undelivered || 0 };
+  let counters = s;
+  let messageVersion = "";
 
   function paintToggle() {
     const b = $("#msg-toggle");
     if (!b) return;
-    b.textContent = `Messaggi (${counters.messages_total})` +
-      (counters.undelivered ? ` · ${counters.undelivered} non consegnati` : "");
-    b.classList.toggle("danger", counters.undelivered > 0);
+    paintMessageToggle(b, counters);
   }
 
   async function reloadMessages() {
@@ -2911,11 +2988,19 @@ async function viewSession(sid) {
     try {
       const st = await api(`/api/sessions/${encodeURIComponent(sid)}/state`, {}, "stato sessione");
       $("#status-strip").innerHTML = statusStrip(st);
+      $("#session-state-tags").innerHTML = stateTags({ ...s, ...st });
       paintEscalation(st);
-      counters = { messages_total: st.messages_total, undelivered: st.undelivered };
+      counters = st;
       paintToggle();
       const rb = $("#strip-resend");
       if (rb) rb.onclick = () => setPanel(true);
+      const nextMessageVersion = JSON.stringify([
+        st.messages_total, st.undelivered, st.delivery_failed, st.last_message,
+      ]);
+      if (nextMessageVersion !== messageVersion) {
+        messageVersion = nextMessageVersion;
+        reloadMessages().catch(e => showError(e, $("#sess-err")));
+      }
       return st;
     } catch (e) {
       // il polling non invade il banner degli errori, ma non resta muto:
@@ -3160,10 +3245,10 @@ async function viewSession(sid) {
     } catch (e) { showError(e, $("#sess-err")); }
   };
   $("#a-kill").onclick = () => act("kill", escalationHost
-    ? "Chiudere soltanto la sessione host? La sessione chiamante resterà aperta."
+    ? "Chiudere soltanto la sessione di escalation? La sessione chiamante resterà aperta."
     : "Terminare la sessione tmux?");
   if ($("#a-kill-pair")) $("#a-kill-pair").onclick = () => act(
-    "kill_pair", "Chiudere sia la sessione host sia la sessione che ha richiesto l'escalation?");
+    "kill_pair", "Chiudere sia la sessione di escalation sia la sessione chiamante?");
   $("#a-restart").onclick = () => act("restart", "Riavviare la sessione con lo stesso profilo e prompt iniziale?");
   $("#a-delete").onclick = () => act("delete", "Eliminare sessione, messaggi e log?");
 
@@ -3227,13 +3312,40 @@ async function viewSession(sid) {
   $("#tr-tail").onchange = () => loadTranscript();
   $("#tr-chrome").onchange = () => loadTranscript();
   $("#tr-detail").onchange = () => loadTranscript();
-  $("#tr-open").onclick = () => window.open(trUrl(), "_blank", "noopener");
+  $("#tr-open").onclick = () => {
+    location.hash = `#/session/${encodeURIComponent(sid)}/transcript?${trUrl().split("?")[1]}`;
+  };
   $("#tr-copy").onclick = () => copyText($("#tr-out").textContent, "Trascrizione copiata");
   $("#tr-auto").onchange = () => {
     clearInterval(trTimer);
     if ($("#tr-auto").checked) { loadTranscript(); trTimer = setInterval(loadTranscript, 5000); }
   };
   loadTranscript();
+}
+
+async function viewTranscript(sid) {
+  const sessionId = encodeURIComponent(decodeURIComponent(sid));
+  const params = qparams();
+  const query = new URLSearchParams();
+  for (const key of ["source", "tail", "chrome", "detail"]) {
+    if (params.has(key)) query.set(key, params.get(key));
+  }
+  view().innerHTML = `<div class="row spread"><h2>Trascrizione</h2>
+    <a href="#/session/${sessionId}">Torna alla sessione</a></div>
+    <div id="transcript-error"></div>
+    <pre id="transcript-page">Caricamento…</pre>`;
+  window.scrollTo(0, 0);
+  const out = $("#transcript-page");
+  const error = $("#transcript-error");
+  try {
+    const text = await api(`/api/sessions/${sessionId}/transcript?${query}`, {}, "trascrizione");
+    if (out.isConnected) out.textContent = text;
+  } catch (e) {
+    if (out.isConnected) {
+      out.textContent = "";
+      showError(e, error);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- accounts
@@ -3469,7 +3581,10 @@ const USAGE_SHORT = { claude: "Claude Code", codex: "Codex", deepseek: "DeepSeek
 function usagePanel(items, meta) {
   const rows = (items || []).map(u => {
     const [label, cls, why] = USAGE_STATE[u.status] || [u.status, "ended", ""];
-    const bars = (u.windows || []).map(usageWindow).join("");
+    // I dettagli Spark restano nei dati di consumo, ma non nella barra laterale.
+    const bars = (u.windows || [])
+      .filter(w => u.provider !== "codex" || !/\bspark\b/i.test(w.label || ""))
+      .map(usageWindow).join("");
     const balance = u.balance
       ? `<div class="mono" style="margin-top:7px">${esc(String(u.balance.amount))}
          ${esc(u.balance.currency)} residui</div>` : "";
@@ -3532,7 +3647,7 @@ function applyUsagePanel(on) {
   document.body.classList.toggle("usage-off", !on);
   localStorage.setItem("agenthub-usage", on ? "1" : "0");
   const b = $("#usage-toggle");
-  if (b) b.textContent = on ? "consumo ◂" : "consumo ▸";
+  if (b) b.textContent = on ? "Consumo: visibile" : "Consumo: nascosto";
   if (on) loadUsagePanel();
   // Il terminale di una sessione si ridimensiona sull'evento `resize`, ma qui
   // cambia la larghezza disponibile senza che la finestra cambi: senza questo
@@ -3637,13 +3752,14 @@ function wireHealth(container, h) {
 
 // Le tre letture sono indipendenti: in fila costavano la somma dei tempi.
 async function fetchStatus() {
-  const [s, dk, health] = await Promise.all([
+  const [s, dk, health, harnessUpdate] = await Promise.all([
     api("/api/status", {}, "stato sistema"),
     api("/api/status/docker", {}, "stato docker"),
     api("/api/health", {}, "salute server").catch(() => ({ last: {}, history: [] })),
+    api("/api/harness-update", {}, "aggiornamento harness").catch(() => ({ last: {} })),
   ]);
   const metas = [s.meta, dk.meta].filter(Boolean);
-  return { s, dk, health, meta: {
+  return { s, dk, health, harnessUpdate, meta: {
     // la pagina è vecchia quanto il suo pezzo più vecchio
     generated_at: metas.map(m => m.generated_at).sort()[0] || "",
     stale: metas.some(m => m.stale),
@@ -3655,13 +3771,50 @@ async function viewStatus() {
   await liveView("status", fetchStatus, renderStatus);
 }
 
-function renderStatus({ s, dk, health, meta }) {
+function harnessUpdateCard(data) {
+  const last = (data || {}).last || {};
+  if (!last.started_at) {
+    return `<div class="card"><div class="row spread"><b>Aggiornamento harness</b>
+      <span class="tag idle">nessun esito leggibile</span></div>
+      <div class="muted">Il primo report della sessione fantasma comparirà dopo il prossimo ciclo notturno.</div>
+      <pre>${esc((data || {}).timer || "timer non disponibile")}</pre></div>`;
+  }
+  const audit = last.audit || {};
+  const failed = (last.errors || []).length || audit.status === "FAILED";
+  const cls = failed ? "failed" : (audit.status === "COMPLETED" ? "done" : "idle");
+  const versions = Object.entries(last.after || {}).map(([user, values]) => {
+    const v = values || {};
+    return `<div>${esc(user)}</div><div class="mono">Codex ${esc(v.codex || "—")} · ` +
+      `Claude ${esc(v.claude || "—")} · OpenCode ${esc(v.opencode || "—")}</div>`;
+  }).join("");
+  const steps = (last.updates || []).map(step => `<div class="status-details-body">
+    <div class="row"><span class="tag ${step.ok ? "done" : "failed"}">${step.ok ? "OK" : "ERRORE"}</span>
+      <b>${esc(step.target || "aggiornamento")}</b></div>
+    <pre>${esc(step.output || "nessun output")}</pre></div>`).join("");
+  const auditText = audit.summary || audit.reason || "nessun dettaglio";
+  return `<div class="card">
+    <div class="row spread"><b>Aggiornamento harness</b>
+      <span class="tag ${cls}">${esc(audit.status || (failed ? "FAILED" : "COMPLETED"))}</span></div>
+    <div class="muted">Ciclo ${esc(ts(last.started_at))} → ${esc(ts(last.finished_at))} · ` +
+      `${last.changed ? "versioni cambiate" : "nessun cambio versione"}</div>
+    <div class="kv" style="margin-top:8px">${versions || '<div class="muted">Versioni non disponibili</div>'}</div>
+    ${(last.errors || []).length ? `<div class="errbox compact"><b>Errori:</b> ${esc(last.errors.join(", "))}</div>` : ""}
+    <div style="margin-top:8px"><b>Audit fantasma</b><pre>${esc(auditText)}</pre></div>
+    <div class="muted mono">${esc(audit.mode || "audit non eseguito")}</div>
+    <details class="more"><summary>Dettagli updater e timer</summary>${steps}
+      ${audit.diagnostics ? `<div class="errbox compact"><pre>${esc(audit.diagnostics)}</pre></div>` : ""}
+      <pre>${esc((data || {}).timer || "timer non disponibile")}</pre></details>
+  </div>`;
+}
+
+function renderStatus({ s, dk, health, harnessUpdate, meta }) {
   const unit = u => {
     const t = (s.tmux_units || {})[u] || {};
     return `${esc(t.ActiveState || t.error || "—")} · ${esc(t.ControlGroup || "")}`;
   };
   view().innerHTML = `<h2>Status</h2>
     ${freshness(meta)}
+    ${harnessUpdateCard(harnessUpdate)}
     <div id="health">${healthCard(health)}</div>
     <details class="card more status-details"><summary>Diagnostica tecnica di servizi e sistema</summary>
     <div class="status-details-body"><b>Agent Hub service</b>
@@ -4181,26 +4334,33 @@ function applyTheme(mode) {
   else root.setAttribute("data-theme", mode);
   localStorage.setItem("agenthub-theme", mode);
   const btn = $("#theme-toggle");
-  if (btn) btn.textContent = mode === "auto" ? "tema: auto" : (mode === "dark" ? "tema: scuro" : "tema: chiaro");
+  if (btn) btn.textContent = mode === "auto" ? "Tema: auto" : (mode === "dark" ? "Tema: scuro" : "Tema: chiaro");
+}
+
+function applyHelp(on) {
+  document.body.classList.toggle("help-on", on);
+  localStorage.setItem("agenthub-help", on ? "1" : "0");
+  const btn = $("#help-toggle");
+  if (btn) btn.textContent = on ? "Aiuti: visibili" : "Aiuti: nascosti";
 }
 
 (async function boot() {
   applyTheme(localStorage.getItem("agenthub-theme") || "auto");
-  if (localStorage.getItem("agenthub-help") === "1") document.body.classList.add("help-on");
+  applyHelp(localStorage.getItem("agenthub-help") === "1");
   $("#theme-toggle").onclick = () => {
     const order = ["auto", "light", "dark"];
     const cur = localStorage.getItem("agenthub-theme") || "auto";
     applyTheme(order[(order.indexOf(cur) + 1) % order.length]);
   };
-  $("#help-toggle").onclick = () => {
-    const on = document.body.classList.toggle("help-on");
-    localStorage.setItem("agenthub-help", on ? "1" : "0");
-  };
+  $("#help-toggle").onclick = () => applyHelp(!document.body.classList.contains("help-on"));
   $("#usage-toggle").onclick = () =>
     applyUsagePanel(document.body.classList.contains("usage-off"));
-  // Riapertura: il pulsante in testata e il contatore accanto a «Dashboard»
+  // Riapertura: la voce in Impostazioni e il contatore accanto a «Dashboard»
   // richiamano il pannello ritirato senza aspettare un nuovo evento.
-  $("#attention-toggle").onclick = toggleAttention;
+  $("#attention-toggle").onclick = () => {
+    $("#settings-menu").removeAttribute("open");
+    toggleAttention();
+  };
   $("#nav-notice").onclick = (e) => {
     if (!attentionHasItems()) return;
     e.preventDefault(); e.stopPropagation();
@@ -4220,7 +4380,22 @@ function applyTheme(mode) {
     if (attentionBox.classList.contains("shown")) openAttention(attentionPinned);
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeAttention();
+    if (e.key === "Escape") {
+      closeAttention();
+      $("#settings-menu").removeAttribute("open");
+    }
+  });
+  // Il menu nativo resta aperto mentre si regolano piu' preferenze, ma si
+  // comporta come un normale menu quando si naviga o si clicca altrove.
+  $("#settings-menu").addEventListener("click", (e) => {
+    if (e.target.closest("a")) $("#settings-menu").removeAttribute("open");
+  });
+  $("#settings-menu").addEventListener("toggle", (e) => {
+    if (e.currentTarget.open) closeAttention();
+  });
+  document.addEventListener("click", (e) => {
+    const menu = $("#settings-menu");
+    if (menu.open && !menu.contains(e.target)) menu.removeAttribute("open");
   });
   try {
     await refreshBoot();
@@ -4246,6 +4421,12 @@ function applyTheme(mode) {
   recordActivity(true);
 
   window.addEventListener("hashchange", route);
+  document.addEventListener("click", event => {
+    const link = event.target.closest('a[download][href^="/api/"]');
+    if (!link) return;
+    event.preventDefault();
+    downloadFile(link);
+  });
   // Una SPA gia' aperta non richiede di nuovo index.html. Il confronto con
   // l'impronta servita dal backend la ricarica dopo il prossimo deploy.
   setInterval(() => refreshBoot().catch(() => {}), 60_000);

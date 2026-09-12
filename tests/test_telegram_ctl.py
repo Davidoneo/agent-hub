@@ -42,6 +42,11 @@ def database():
             file_path TEXT, file_name TEXT, status TEXT, attempts INTEGER,
             last_error TEXT, requested_by TEXT, created_at TEXT, sent_at TEXT
         );
+        CREATE TABLE service_notifications (
+            id TEXT PRIMARY KEY, source TEXT, event TEXT, event_key TEXT, text TEXT,
+            status TEXT, attempts INTEGER, last_error TEXT, requested_by TEXT,
+            created_at TEXT, sent_at TEXT
+        );
         CREATE TABLE messages (
             id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, text TEXT,
             status TEXT, method TEXT, attempts INTEGER, created_at TEXT
@@ -99,6 +104,22 @@ class TelegramFlowTests(unittest.TestCase):
         self.assertIn("testo richiesto", sent[0])
         self.assertEqual(conn.execute(
             "SELECT status FROM telegram_outbox WHERE id='share-1'").fetchone()[0], "sent")
+
+    def test_closed_service_notification_is_delivered_and_marked(self):
+        conn = database()
+        conn.execute("INSERT INTO service_notifications VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+            "svc-1", "example-app", "blocked", "12:blocked",
+            "⚠️ Automazione bloccata", "pending", 0, "", "example-app",
+            "2026-09-11T20:00:00+00:00", ""))
+        sent = []
+        with mock.patch.object(telegram_ctl, "db", return_value=conn), \
+             mock.patch.object(telegram_ctl, "send_long",
+                               side_effect=lambda *a, **k: sent.append(a[2]) or True):
+            count = telegram_ctl.deliver_pending(CFG, "primary")
+        self.assertEqual(count, 1)
+        self.assertEqual(sent, ["⚠️ Automazione bloccata"])
+        self.assertEqual(conn.execute(
+            "SELECT status FROM service_notifications WHERE id='svc-1'").fetchone()[0], "sent")
 
     def test_denial_returns_a_durable_message_to_calling_session(self):
         conn = database()

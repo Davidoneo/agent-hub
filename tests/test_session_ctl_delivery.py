@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -16,7 +17,129 @@ session_ctl = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(session_ctl)
 
 
+# Stringhe della CLI Codex installata; layout sintetico, nessun dato account.
+RESET_MENU = """Usage limit resets
+› 1. Redeem usage limit reset
+  2. Cancel
+Press enter to confirm or esc to go back
+"""
+RESET_CONFIRM = """Redeem usage limit reset
+Reset your current usage limits.
+› 1. Confirm
+  2. Cancel
+"""
+
+
 class SessionDeliveryTests(unittest.TestCase):
+    def test_automatic_transport_never_answers_reset_menus(self):
+        for screen in (RESET_MENU, RESET_CONFIRM):
+            commands = (
+                ("send-keys", "-t", "agenthub-abcdef", "Enter"),
+                ("send-keys", "-t", "agenthub-abcdef", "-l", "1"),
+                ("send-keys", "-t", "agenthub-abcdef", "-l", "/model"),
+                ("paste-buffer", "-d", "-p", "-b", "fixture", "-t",
+                 "agenthub-abcdef"),
+            )
+            for command in commands:
+                with self.subTest(screen=screen, command=command), \
+                     mock.patch.object(session_ctl, "_screen_text", return_value=screen), \
+                     mock.patch.object(session_ctl.subprocess, "run") as run:
+                    result = session_ctl.tmux(*command, env={"TEST": "1"})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("consenso esplicito", result.stderr)
+                    run.assert_not_called()
+
+    def test_availability_notice_and_prose_do_not_block_normal_input(self):
+        harmless = (
+            "• You have 2 usage limit resets available. Run /usage to use one.",
+            "Documented Redeem usage limit reset in the manual.",
+        )
+        for screen in harmless:
+            with self.subTest(screen=screen), \
+                 mock.patch.object(session_ctl, "_screen_text", return_value=screen), \
+                 mock.patch.object(session_ctl.subprocess, "run", return_value=
+                                   subprocess.CompletedProcess([], 0, "", "")) as run:
+                result = session_ctl.tmux(
+                    "send-keys", "-t", "agenthub-abcdef", "Enter", env={"TEST": "1"})
+                self.assertEqual(result.returncode, 0)
+                run.assert_called_once()
+
+    def test_copy_mode_does_not_send_input_to_reset_menu(self):
+        with mock.patch.object(session_ctl, "_screen_text", return_value=RESET_CONFIRM) as screen, \
+             mock.patch.object(session_ctl.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, "", "")) as run:
+            result = session_ctl.tmux(
+                "send-keys", "-X", "-t", "agenthub-abcdef", "page-up", env={"TEST": "1"})
+        self.assertEqual(result.returncode, 0)
+        screen.assert_not_called()
+        run.assert_called_once()
+
+    def test_reset_appearing_during_paste_delay_prevents_first_enter(self):
+        with mock.patch.object(session_ctl, "_screen_text", return_value=RESET_MENU), \
+             mock.patch.object(session_ctl, "_pane_submit_state", return_value=(False, "idle")), \
+             mock.patch.object(session_ctl.time, "sleep"), \
+             mock.patch.object(session_ctl.subprocess, "run") as run:
+            ok, error = session_ctl._submit_after_paste(
+                "agenthub-abcdef", "ignored", {}, {"id": "codex-openai"})
+        self.assertFalse(ok)
+        self.assertIn("consenso esplicito", error)
+        run.assert_not_called()
+
+    def test_reset_appearing_during_retry_delay_prevents_second_enter(self):
+        with mock.patch.object(session_ctl, "_screen_text", side_effect=[
+                "composer", "composer", "composer", RESET_CONFIRM]), \
+             mock.patch.object(session_ctl, "_pane_submit_state", return_value=(False, "idle")), \
+             mock.patch.object(session_ctl, "_observe_submission", return_value=False), \
+             mock.patch.object(session_ctl.time, "sleep"), \
+             mock.patch.object(session_ctl.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, "", "")) as run:
+            ok, error = session_ctl._submit_after_paste(
+                "agenthub-abcdef", "ignored", {}, {"id": "codex-openai"})
+        self.assertFalse(ok)
+        self.assertIn("consenso esplicito", error)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][-1], "Enter")
+
+    def test_followup_and_initial_paste_stop_without_consuming_reset(self):
+        with mock.patch.object(session_ctl, "_screen_text", return_value=RESET_MENU), \
+             mock.patch.object(session_ctl.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, "0", "")) as run:
+            ok, error = session_ctl._paste("agenthub-abcdef", "fixture", {})
+        self.assertFalse(ok)
+        self.assertIn("consenso esplicito", error)
+        self.assertFalse(any("paste-buffer" in c.args[0] or "send-keys" in c.args[0]
+                             for c in run.call_args_list))
+
+    def test_explicit_terminal_confirmation_and_cancel_still_work(self):
+        for key, expected in (("enter", "Enter"), ("escape", "Escape")):
+            with self.subTest(key=key), \
+                 mock.patch.object(session_ctl, "_screen_text", return_value=RESET_CONFIRM) as screen, \
+                 mock.patch.object(session_ctl.subprocess, "run", return_value=
+                                   subprocess.CompletedProcess([], 0, "", "")) as run, \
+                 mock.patch("builtins.print"):
+                session_ctl.cmd_keys(["agenthub-abcdef", key])
+                screen.assert_not_called()
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0][-1], expected)
+
+    def test_command_confirmation_propagates_reset_guard_failure(self):
+        profile = {"id": "codex-openai", "runtime": {"confirm_patterns": ["confirmation"]}}
+        with mock.patch.object(session_ctl, "load_profiles", return_value={profile["id"]: profile}), \
+             mock.patch.object(session_ctl, "_screen_text", side_effect=[
+                 "composer", "composer", RESET_CONFIRM]), \
+             mock.patch.object(session_ctl, "_pane_text", return_value="confirmation"), \
+             mock.patch.object(session_ctl.time, "sleep"), \
+             mock.patch.object(session_ctl.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, "", "")) as run, \
+             mock.patch("builtins.print") as output, \
+             self.assertRaises(SystemExit) as stopped:
+            session_ctl.cmd_command(["agenthub-abcdef", profile["id"], "/model"])
+        self.assertEqual(stopped.exception.code, 5)
+        result = json.loads(output.call_args.args[0])
+        self.assertFalse(result["ok"])
+        self.assertIn("consenso esplicito", result["error"])
+        self.assertEqual(sum(c.args[0][-1] == "Enter" for c in run.call_args_list), 1)
+
     def test_claude_login_uses_direct_auth_command_without_waiting_for_composer(self):
         calls = []
         user = session_ctl.me().pw_name

@@ -591,12 +591,44 @@ def deliver_shares(cfg, chat, conn):
     return sent
 
 
+def pending_service_notifications(conn):
+    try:
+        return conn.execute(
+            "SELECT * FROM service_notifications WHERE status IN ('pending','sending') "
+            "ORDER BY created_at,rowid").fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+
+
+def deliver_service_notifications(cfg, chat, conn):
+    """Deliver application events already rendered by the closed wrapper."""
+    sent = 0
+    for row in pending_service_notifications(conn):
+        conn.execute(
+            "UPDATE service_notifications SET status='sending',attempts=attempts+1,last_error='' "
+            "WHERE id=?", (row["id"],))
+        ok = send_long(cfg, chat, row["text"], silent=(cfg["quiet"] == "1"))
+        if not ok:
+            conn.execute(
+                "UPDATE service_notifications SET status='pending',last_error=? WHERE id=?",
+                ("consegna Telegram non riuscita; nuovo tentativo al prossimo ciclo", row["id"]))
+            break
+        conn.execute(
+            "UPDATE service_notifications SET status='sent',sent_at=?,last_error='' WHERE id=?",
+            (now(), row["id"]))
+        sent += 1
+    return sent
+
+
 def deliver_pending(cfg, chat, first_run=False, state=None):
     """Consegna solo richieste esplicite, escalation e workflow riunioni."""
     sent = 0
     with db() as conn:
         sent += deliver_escalations(cfg, chat, conn)
         sent += deliver_shares(cfg, chat, conn)
+        sent += deliver_service_notifications(cfg, chat, conn)
         # Riunioni: sempre attive, non controllate da notify
         if not first_run and chat:
             try:

@@ -20,29 +20,34 @@
 <body>
 <div id="app-chrome">
 <header>
-  <div class="brand">Agent&nbsp;Hub</div>
+  <a class="brand" href="#/" aria-label="Agent Hub · Dashboard">Agent&nbsp;Hub</a>
+  <nav id="nav" aria-label="Navigazione principale">
+    <a href="#/"><span class="dashboard-wide">Dashboard</span><span class="dashboard-short">Home</span> <span id="nav-notice" aria-label="nuovi aggiornamenti"></span></a>
+    <a href="#/projects">Progetti</a>
+    <a href="#/backlog">Backlog</a>
+    <a href="#/new"><span class="wide-label">Nuova sessione</span><span class="short-label">Nuova</span></a>
+  </nav>
   <div class="header-right">
-    <button class="ghost small" id="attention-toggle" style="display:none" title="Mostra gli avvisi recenti">avvisi <span id="attention-toggle-count"></span></button>
-    <button class="ghost small" id="push-toggle" style="display:none" title="Attiva le notifiche push di Agent Hub">notifiche</button>
-    <button class="ghost small" id="usage-toggle" title="Mostra o nasconde il pannello del consumo">consumo</button>
-    <button class="ghost small" id="help-toggle" title="Mostra o nasconde le spiegazioni">? aiuti</button>
-    <button class="ghost small" id="theme-toggle" title="Tema chiaro / scuro / automatico">tema</button>
-    <span class="who" id="who"></span>
+    <details class="settings-menu" id="settings-menu">
+      <summary>Impostazioni <span id="settings-attention-count" aria-label="avvisi da leggere"></span></summary>
+      <div class="settings-panel">
+        <button class="settings-item" id="attention-toggle" style="display:none" title="Mostra gli avvisi recenti">Avvisi <span id="attention-toggle-count"></span></button>
+        <a class="settings-item" href="#/accounts">Accounts</a>
+        <a class="settings-item" href="#/status">Stato del sistema</a>
+        <div class="settings-divider"></div>
+        <button class="settings-item" id="push-toggle" style="display:none" title="Attiva le notifiche push di Agent Hub">Notifiche: off</button>
+        <button class="settings-item" id="usage-toggle" title="Mostra o nasconde il pannello del consumo">Consumo: visibile</button>
+        <button class="settings-item" id="help-toggle" title="Mostra o nasconde le spiegazioni">Aiuti: nascosti</button>
+        <button class="settings-item" id="theme-toggle" title="Tema chiaro / scuro / automatico">Tema: auto</button>
+        <span class="who" id="who"></span>
+      </div>
+    </details>
   </div>
 </header>
-
-<nav id="nav">
-  <a href="#/">Dashboard <span id="nav-notice" aria-label="nuovi aggiornamenti"></span></a>
-  <a href="#/projects">Progetti</a>
-  <a href="#/backlog">Backlog</a>
-  <a href="#/new">Nuova sessione</a>
-  <a href="#/accounts">Accounts</a>
-  <a href="#/status">Status</a>
-</nav>
-
 </div>
 <!-- Gli avvisi non occupano piu' spazio nella pagina: scendono dall'alto in
-     sovraimpressione, si ritirano da soli e si riaprono dal pulsante «avvisi». -->
+     sovraimpressione, si ritirano da soli e si riaprono da Impostazioni o dal
+     contatore accanto a Dashboard. -->
 <div id="notice-stack">
   <div id="attention" aria-live="polite"></div>
   <div id="toast" role="status"></div>

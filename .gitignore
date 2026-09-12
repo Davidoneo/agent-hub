@@ -13,3 +13,9 @@ vault-password*
 secrets/
 .idea/
 .vscode/
+
+# Local runtime caches and private Agent Hub documents are never public sources.
+__pycache__/
+*.py[cod]
+/docs/input/
+/.agent/backlog-worktrees/
